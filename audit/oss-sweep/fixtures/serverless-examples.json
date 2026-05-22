@@ -1,0 +1,19 @@
+{
+  "repo": "serverless/examples",
+  "files": [
+    "aws-node-dynamic-image-resizer/config/.env.example",
+    "aws-node-github-check/libs/response-lib.js",
+    "aws-node-github-webhook-listener/handler.js",
+    "aws-node-heroku-postgres/handler.js",
+    "aws-node-rest-api-typescript/config/.env.dev",
+    "aws-node-rest-api-typescript/config/.env.pro",
+    "aws-node-rest-api-typescript/config/.env.stg",
+    "aws-node-serverless-gong/handler.js",
+    "aws-node-stripe-integration/handler.js",
+    "aws-node-telegram-echo-bot/handler.js",
+    "aws-python-line-echo-bot/handler.py",
+    "aws-python-telegram-bot/handler.py",
+    "aws-ruby-line-bot/handler.rb",
+    "azure-node-typescript-servicebus-trigger-endpoint/.env.dev"
+  ]
+}

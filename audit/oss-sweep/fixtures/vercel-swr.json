@@ -1,0 +1,22 @@
+{
+  "repo": "vercel/swr",
+  "files": [
+    "e2e/site/pages/api/data.ts",
+    "e2e/site/pages/api/retry.ts",
+    "examples/api-hooks/pages/api/data.js",
+    "examples/autocomplete-suggestions/pages/api/suggestions.js",
+    "examples/axios-typescript/pages/api/data.ts",
+    "examples/axios/pages/api/data.js",
+    "examples/basic-typescript/pages/api/data.ts",
+    "examples/basic/pages/api/data.js",
+    "examples/focus-revalidate/pages/api/user.js",
+    "examples/global-fetcher/pages/api/data.js",
+    "examples/optimistic-ui-immer/pages/api/data.js",
+    "examples/optimistic-ui/pages/api/todos.js",
+    "examples/prefetch-preload/pages/api/data.js",
+    "examples/refetch-interval/pages/api/data.js",
+    "examples/suspense-global/pages/api/data.ts",
+    "examples/suspense-retry/app/api/route.ts",
+    "examples/suspense/pages/api/data.js"
+  ]
+}

@@ -6,10 +6,26 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r --if-present typecheck",
-    "lint": "eslint .",
-    "dev": "pnpm --filter pinnedai dev"
+    "test": "pnpm -r --if-present test",
+    "dev": "pnpm --filter pinnedai dev",
+    "dogfood": "pnpm --filter pinnedai build && node apps/cli/dist/cli.js check --description \"$(cat .dogfood-claims.md 2>/dev/null)\" && node apps/cli/dist/cli.js scan-diff --base HEAD",
+    "dogfood:pins": "pnpm --filter pinnedai build && ./apps/cli/node_modules/.bin/vitest run --config vitest.dogfood.config.ts",
+    "pinned": "node apps/cli/dist/cli.js",
+    "pinned:check": "node apps/cli/dist/cli.js check",
+    "pinned:scan": "node apps/cli/dist/cli.js scan --base origin/master",
+    "pinned:list": "node apps/cli/dist/cli.js list",
+    "pinned:doctor": "node apps/cli/dist/cli.js doctor",
+    "pinned:test": "pnpm dogfood:pins",
+    "preflight": "pnpm --filter pinnedai build && pnpm dogfood:pins",
+    "audit:features": "pnpm --filter pinnedai build && ./apps/cli/node_modules/.bin/vitest run --config audit/vitest.config.ts",
+    "audit:features:templates": "./apps/cli/node_modules/.bin/vitest run --config audit/vitest.config.ts audit/templates",
+    "audit:features:cli": "pnpm --filter pinnedai build && ./apps/cli/node_modules/.bin/vitest run --config audit/vitest.config.ts audit/features",
+    "audit:features:worker": "./apps/cli/node_modules/.bin/vitest run --config audit/vitest.config.ts audit/worker",
+    "audit:features:sticky": "pnpm --filter pinnedai build && ./apps/cli/node_modules/.bin/vitest run --config audit/vitest.config.ts audit/sticky",
+    "audit:oss-sweep": "pnpm --filter pinnedai build && ./apps/cli/node_modules/.bin/vitest run --config audit/vitest.config.ts audit/oss-sweep",
+    "sweep:regenerate": "bash scripts/oss-fp-sweep.sh --regenerate-fixtures"
   },
   "devDependencies": {
-    "typescript": "^5.6.3"
+    "typescript": "5.6.3"
   }
 }

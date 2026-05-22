@@ -1,0 +1,99 @@
+{
+  "name": "pinnedai-vscode",
+  "displayName": "pinnedai — Pin PR claims as permanent CI tests",
+  "description": "Status-bar indicator + command palette integration for the pinnedai CLI. Works in VS Code, Cursor, and any VS Code-family editor.",
+  "version": "0.1.0",
+  "publisher": "pinnedai",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pinnedai/pinnedai"
+  },
+  "homepage": "https://pinnedai.dev",
+  "bugs": {
+    "url": "https://github.com/pinnedai/pinnedai/issues"
+  },
+  "categories": [
+    "Other",
+    "Testing",
+    "AI"
+  ],
+  "keywords": [
+    "ai",
+    "testing",
+    "ci",
+    "regression",
+    "cursor",
+    "copilot",
+    "claude-code"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "workspaceContains:tests/pinned/.registry.json",
+    "workspaceContains:.pinnedai/config.json"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "pinnedai.review",
+        "title": "Pinned: Review now",
+        "category": "Pinned"
+      },
+      {
+        "command": "pinnedai.status",
+        "title": "Pinned: Show status",
+        "category": "Pinned"
+      },
+      {
+        "command": "pinnedai.list",
+        "title": "Pinned: List protected behaviors",
+        "category": "Pinned"
+      },
+      {
+        "command": "pinnedai.openSite",
+        "title": "Pinned: Open pinnedai.dev",
+        "category": "Pinned"
+      }
+    ],
+    "configuration": {
+      "title": "pinnedai",
+      "properties": {
+        "pinnedai.statusBar.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the Pinned status item in the bottom status bar."
+        },
+        "pinnedai.statusBar.refreshIntervalSeconds": {
+          "type": "number",
+          "default": 10,
+          "minimum": 2,
+          "maximum": 300,
+          "description": "How often (in seconds) to refresh the status bar. Defaults to 10s."
+        },
+        "pinnedai.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the pinned binary. Leave empty to use 'pinned' from PATH, the workspace's node_modules/pinnedai, or 'npx pinnedai' as fallback."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsup src/extension.ts --format cjs --target node18 --out-dir dist --shims --clean --external vscode",
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies",
+    "publish:all": "pnpm run publish:ovsx && pnpm run publish:vsce"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.9",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "ovsx": "^0.10.0",
+    "tsup": "8.5.1",
+    "typescript": "5.6.3"
+  }
+}

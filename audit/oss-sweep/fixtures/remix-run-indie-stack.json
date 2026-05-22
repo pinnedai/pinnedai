@@ -1,0 +1,6 @@
+{
+  "repo": "remix-run/indie-stack",
+  "files": [
+    ".env.example"
+  ]
+}

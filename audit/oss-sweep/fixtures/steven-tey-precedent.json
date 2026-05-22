@@ -1,0 +1,7 @@
+{
+  "repo": "steven-tey/precedent",
+  "files": [
+    ".env.example",
+    "app/middleware.ts"
+  ]
+}

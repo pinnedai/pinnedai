@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stripe webhook idempotency test — auto-generated from PR claims</title>
+  <meta name="description" content="A Stripe webhook should be idempotent on event.id. Pinned turns that claim into a CI test that fires duplicate payloads and asserts byte-identical responses. Auto-generated from your PR description." />
+  <link rel="canonical" href="https://pinnedai.dev/seo/stripe-webhook-idempotency-test.html" />
+  <link rel="stylesheet" href="seo.css" />
+</head>
+<body>
+  <div class="container">
+    <nav class="crumbs"><a href="/">pinnedai.dev</a> · stripe-webhook-idempotency-test</nav>
+
+    <span class="tag">STRIPE</span>
+    <h1>Stripe webhook idempotency test — auto-generated from your PR</h1>
+    <p class="lede">A Stripe webhook handler must be idempotent on <code>event.id</code> — Stripe retries up to 3 days on a 5xx, and a non-idempotent handler will charge twice, ship twice, or send duplicate emails. Pinned turns that requirement into a permanent CI test from a single line in your PR description.</p>
+
+    <h2>The claim that becomes the test</h2>
+    <p>Add this line to your PR description:</p>
+    <pre><code>Makes /webhooks/stripe idempotent on event_id.</code></pre>
+    <p>When the PR is opened, Pinned's GitHub Action generates:</p>
+    <pre><code>// tests/pinned/pr-42-idempotent-webhooks-stripe.test.ts
+import { describe, it, expect, beforeAll } from "vitest";
+
+const PREVIEW_URL = process.env.PREVIEW_URL;
+const ROUTE = "/webhooks/stripe";
+const ID_FIELD = "event_id";
+
+describe("pinned: idempotent on " + ROUTE, () =&gt; {
+  beforeAll(() =&gt; {
+    if (!PREVIEW_URL) throw new Error("PREVIEW_URL required");
+  });
+
+  it("returns byte-identical response on duplicate event_id", async () =&gt; {
+    const url = PREVIEW_URL + ROUTE;
+    const payload = {
+      [ID_FIELD]: "pinned-idem-" + Math.random().toString(36).slice(2, 12),
+      // EDIT ME: add any other required fields here.
+    };
+    const fire = () =&gt; fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const first = await fire();
+    const firstBody = await first.text();
+    const second = await fire();
+    const secondBody = await second.text();
+    expect(second.status).toBe(first.status);
+    expect(secondBody).toBe(firstBody);
+  });
+});</code></pre>
+
+    <h2>Why byte-identical?</h2>
+    <p>RFC-7231 idempotency means a retry produces the same observable result. For Stripe-style handlers, that translates to: same response status + same body. Some handlers return <code>200 OK</code> twice (preferred), others return <code>409 Conflict</code> on the duplicate, but the responses must be deterministic across retries.</p>
+    <p>The generated test makes the assertion the strongest universal form: status equality + body equality. If your handler legitimately returns a server-generated timestamp that drifts between calls, narrow the assertion or retire the claim with <code>pinned retire</code>.</p>
+
+    <h2>What this catches in production</h2>
+    <p>Common ways Stripe webhook idempotency silently breaks:</p>
+    <ul>
+      <li>A new code path doesn't check the dedup table before inserting</li>
+      <li>The dedup table TTL expires and old events get reprocessed</li>
+      <li>Database transactions roll back the dedup write but not the side effect</li>
+      <li>A refactor swaps insert-or-update logic from upsert to insert</li>
+    </ul>
+    <p>Without a pinned test, you'd find out via a customer complaint (double charge, duplicate notification). With the pin, CI fails on the breaking commit and points to the original PR.</p>
+
+    <h2>When the test fails, Pinned gives you the fix prompt</h2>
+    <pre><code>═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══
+
+Fix the failing pinned claim:
+  Claim: "Makes /webhooks/stripe idempotent on event_id"
+  Original PR: pr-42
+  Route: /webhooks/stripe (POST)
+  Idempotency key: event_id
+  Expected: two POSTs with the same event_id return byte-identical response
+  Actual: differing body — first=... second=...
+
+Restore idempotency on /webhooks/stripe. The handler should detect duplicate
+event_id values and return the cached response (or 409). Likely candidates:
+  - The route handler for /webhooks/stripe
+  - A request-deduplication middleware
+  - Database upsert vs insert logic
+Preserve all other behavior. Do not modify this pinned test file.</code></pre>
+
+    <h2>Install</h2>
+    <div class="install"><code>npx pinnedai init</code></div>
+    <p>Then open a PR with the claim <code>Makes /webhooks/stripe idempotent on event_id.</code> Pinned does the rest.</p>
+
+    <a class="cta" href="/">See more examples →</a>
+
+    <footer>
+      <a href="/">pinnedai.dev</a> ·
+      <a href="https://github.com/pinnedai/pinnedai">github</a> ·
+      <a href="https://www.npmjs.com/package/pinnedai">npm</a>
+    </footer>
+  </div>
+</body>
+</html>

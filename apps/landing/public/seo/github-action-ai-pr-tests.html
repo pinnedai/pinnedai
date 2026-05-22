@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The GitHub Action that turns AI-coded PR claims into tests — pinnedai</title>
+  <meta name="description" content="A GitHub Action for AI-coded PRs. Parses claims like &quot;rate-limits /api/users to 60 req/min&quot; from PR descriptions and turns them into permanent CI tests that fail when the claim regresses." />
+  <link rel="canonical" href="https://pinnedai.dev/seo/github-action-ai-pr-tests.html" />
+  <link rel="stylesheet" href="seo.css" />
+  <meta property="og:title" content="The GitHub Action that turns AI-coded PR claims into tests" />
+  <meta property="og:description" content="Pinned makes AI agents prove what their PRs claim. Permanent CI tests, not throwaway review comments." />
+</head>
+<body>
+  <div class="container">
+    <nav class="crumbs"><a href="/">pinnedai.dev</a> · github-action-ai-pr-tests</nav>
+
+    <span class="tag">GITHUB ACTION</span>
+    <h1>The GitHub Action that turns AI-coded PR claims into tests</h1>
+    <p class="lede">AI coding agents (Cursor, Claude Code, Aider, Devin) ship PRs at 10× human velocity. Their PR descriptions <em>claim</em> things — auth was added, a route is rate-limited, a webhook is idempotent — but reviewers don't have time to verify every claim. Pinned is a GitHub Action that turns each claim into a permanent CI test.</p>
+
+    <h2>The problem</h2>
+    <p>A typical AI-coded PR description reads:</p>
+    <pre><code>## What this PR does
+
+- Adds auth to the admin export endpoint
+- Rate-limits /api/users to 60 req/min
+- Makes the Stripe webhook idempotent on event_id</code></pre>
+    <p>The reviewer merges it. Six months later, an unrelated refactor breaks the rate limiter. Nobody notices until production gets scraped at 3am. The postmortem traces back to PR #1247 — the one that <em>said</em> it added rate limiting but never had a test to enforce it.</p>
+
+    <h2>How Pinned solves it</h2>
+    <p>The Pinned GitHub Action runs on every PR open and:</p>
+    <ol>
+      <li><strong>Parses claims</strong> from the description (regex first, LLM fallback for natural-language phrasing).</li>
+      <li><strong>Generates a test file</strong> per claim under <code>tests/pinned/</code>.</li>
+      <li><strong>Auto-commits</strong> to the PR branch (Free + Pro both, opt-out with <code>PINNEDAI_AUTOCOMMIT=false</code>).</li>
+      <li><strong>Maintains <code>PINS.md</code></strong> — the human-readable registry of every claim your repo has ever made.</li>
+    </ol>
+
+    <h2>Example: a rate-limit claim becomes this test</h2>
+    <p>The claim in the PR description:</p>
+    <pre><code>Rate-limits /api/users to 60 req/min.</code></pre>
+    <p>Becomes <code>tests/pinned/pr-1247-rate-limit-api-users.test.ts</code>:</p>
+    <pre><code>// Pinned by pinnedai — claim from pr-1247.
+// Original PR claim: "Rate-limits /api/users to 60 req/min"
+// Pinned to fail if this is ever regressed.
+
+import { describe, it, expect, beforeAll } from "vitest";
+
+const PREVIEW_URL = process.env.PREVIEW_URL;
+const ROUTE = "/api/users";
+const RATE = 60;
+const WINDOW = "minute";
+
+describe("pinned: rate-limit on " + ROUTE, () =&gt; {
+  beforeAll(() =&gt; {
+    if (!PREVIEW_URL) throw new Error("PREVIEW_URL required");
+  });
+
+  it("returns 429 after exceeding " + RATE + " requests/" + WINDOW, async () =&gt; {
+    const url = PREVIEW_URL + ROUTE;
+    const statuses = await Promise.all(
+      Array.from({ length: RATE + 1 }, () =&gt;
+        fetch(url, { method: "GET" }).then((r) =&gt; r.status)
+      )
+    );
+    expect(statuses.includes(429)).toBe(true);
+  });
+});</code></pre>
+    <p>That test runs in CI <em>every commit, forever</em>. The first PR to accidentally regress the limiter fails CI with a back-reference to PR #1247 and a paste-ready prompt for Cursor/Claude to fix it.</p>
+
+    <h2>Install — one command</h2>
+    <div class="install"><code>npx pinnedai init</code></div>
+    <p>This scaffolds <code>.github/workflows/pinned.yml</code>, creates <code>tests/pinned/</code> with an empty <code>PINS.md</code> registry, and configures the right Actions permissions (<code>id-token: write</code> for keyless LLM extraction via GitHub OIDC, <code>contents: write</code> for auto-commit).</p>
+    <p>No API key, no account creation — the GitHub OIDC token is the identity. Free tier supports 25 active pins per repo.</p>
+
+    <h2>Why this isn't another AI code reviewer</h2>
+    <table class="compare">
+      <thead><tr><th>CodeRabbit / Greptile / Qodo</th><th>Pinned</th></tr></thead>
+      <tbody>
+        <tr><td>Reviews PRs with comments</td><td>Generates permanent tests in your repo</td></tr>
+        <tr><td>Value disappears after merge</td><td>Value compounds every PR (PINS.md grows)</td></tr>
+        <tr><td>LLM judgment per PR — fragile</td><td>Deterministic template generation — zero hallucination</td></tr>
+        <tr><td>Cancel → nothing carries forward</td><td>Cancel → all your tests stay yours</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Try the demo</h2>
+    <p>The fastest way to see what Pinned generates: run the demo locally, no install needed.</p>
+    <div class="install"><code>npx pinnedai</code></div>
+    <p>It parses a sample PR description and prints the generated test. 10 seconds to value.</p>
+
+    <a class="cta" href="/">See the live demo →</a>
+
+    <footer>
+      <a href="/">pinnedai.dev</a> ·
+      <a href="https://github.com/pinnedai/pinnedai">github</a> ·
+      <a href="https://www.npmjs.com/package/pinnedai">npm</a>
+    </footer>
+  </div>
+</body>
+</html>

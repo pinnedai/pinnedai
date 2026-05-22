@@ -1,0 +1,14 @@
+{
+  "repo": "solidjs/solid-start",
+  "files": [
+    "apps/fixtures/experiments/src/middleware.ts",
+    "apps/fixtures/experiments/src/routes/(group)/endpoint.ts",
+    "apps/fixtures/experiments/src/routes/api.ts",
+    "apps/fixtures/experiments/src/routes/api/hello/[name].ts",
+    "apps/tests/src/routes/api/header-merging.ts",
+    "apps/tests/src/routes/api/multi-set-cookie-redirect.ts",
+    "apps/tests/src/routes/api/text-plain.ts",
+    "apps/tests/src/routes/treeshaking/server-secret-leak.server.test.ts",
+    "apps/tests/src/routes/treeshaking/treeshake.server.test.ts"
+  ]
+}

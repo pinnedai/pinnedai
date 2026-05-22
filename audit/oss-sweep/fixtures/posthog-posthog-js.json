@@ -1,0 +1,22 @@
+{
+  "repo": "posthog/posthog-js",
+  "files": [
+    "examples/example-ai-aws-bedrock/.env.example",
+    "examples/example-ai-convex/.env.example",
+    "examples/example-ai-deepseek/.env.example",
+    "examples/example-ai-fireworks-ai/.env.example",
+    "examples/example-ai-ollama/.env.example",
+    "examples/example-ai-openai/.env.example",
+    "examples/example-ai-perplexity/.env.example",
+    "examples/example-ai-portkey/.env.example",
+    "examples/example-next-app-router/middleware.ts",
+    "examples/example-node/.env.example",
+    "examples/example-nuxt/server/routes/error.ts",
+    "packages/ai/src/vercel/middleware.ts",
+    "packages/types/src/capture.ts",
+    "playground/nextjs/.env.example",
+    "playground/nextjs/pages/api/auth/login.ts",
+    "playground/nextjs/pages/api/auth/logout.ts",
+    "playground/nextjs/pages/api/socket.ts"
+  ]
+}

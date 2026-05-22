@@ -1,0 +1,65 @@
+# Tag-triggered npm publish for the pinnedai CLI.
+#
+# Trigger: push a tag matching v* (e.g. `git tag v0.1.0 && git push --tags`).
+# Steps: install → typecheck → test → build → npm publish.
+#
+# Required secret: NPM_TOKEN (org-scoped automation token).
+# Tag MUST match apps/cli/package.json's "version" field — the workflow
+# refuses to publish if there's a mismatch (catches accidental tag drift).
+
+name: release-npm
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # for npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Verify tag matches package version
+        env:
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG=$(node -p "require('./apps/cli/package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "✗ Tag v$TAG does not match apps/cli/package.json version $PKG" >&2
+            exit 1
+          fi
+          echo "✓ Tag v$TAG matches package version"
+
+      - run: pnpm --filter pinnedai typecheck
+      - run: pnpm --filter pinnedai test
+      - run: pnpm --filter pinnedai build
+
+      # Dogfood gate — pinnedai's own pins must pass before we ship.
+      - run: pnpm dogfood:pins
+
+      # Signal-audit gate — every advertised feature must verifiably
+      # work (pos+neg controls). Catches regressions unit tests miss.
+      - run: pnpm audit:features
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd apps/cli
+          # --provenance: GitHub Actions OIDC -> npm-side attestation
+          npm publish --access public --provenance

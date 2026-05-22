@@ -1,0 +1,16 @@
+{
+  "repo": "sst/sst",
+  "files": [
+    "examples/aws-analog/src/server/routes/v1/hello.ts",
+    "examples/aws-auth-nextjs/app/api/callback/route.ts",
+    "examples/aws-svelte-container/src/routes/+page.server.ts",
+    "examples/aws-svelte-kit-remote-functions/src/routes/home.remote.ts",
+    "examples/aws-svelte-kit/src/routes/+page.server.ts",
+    "examples/aws-svelte-redis/src/routes/+page.server.ts",
+    "examples/aws-t3/src/app/api/trpc/[trpc]/route.ts",
+    "examples/aws-tanstack-start/src/routes/demo/api.names.ts",
+    "examples/aws-tanstack-start/src/routes/demo/api.tq-todos.ts",
+    "platform/src/components/aws/router.ts",
+    "platform/src/components/aws/ssr-site.ts"
+  ]
+}

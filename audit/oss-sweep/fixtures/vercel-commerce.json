@@ -1,0 +1,8 @@
+{
+  "repo": "vercel/commerce",
+  "files": [
+    ".env.example",
+    "app/api/revalidate/route.ts",
+    "lib/shopify/index.ts"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "repo": "t3-oss/create-t3-app",
+  "files": [
+    "cli/template/extras/src/app/api/auth/[...all]/route.ts",
+    "cli/template/extras/src/app/api/auth/[...nextauth]/route.ts",
+    "cli/template/extras/src/app/api/trpc/[trpc]/route.ts",
+    "cli/template/extras/src/pages/api/auth/[...all].ts",
+    "cli/template/extras/src/pages/api/trpc/[trpc].ts",
+    "www/.env.example"
+  ]
+}

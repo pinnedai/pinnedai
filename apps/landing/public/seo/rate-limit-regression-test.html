@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rate limit regression test — generated from a PR claim, runs forever in CI</title>
+  <meta name="description" content="A new rate limiter is added in a PR. Six months later, an unrelated refactor breaks it. Pinned generates a permanent CI test from the original PR claim and catches the regression with a back-reference." />
+  <link rel="canonical" href="https://pinnedai.dev/seo/rate-limit-regression-test.html" />
+  <link rel="stylesheet" href="seo.css" />
+</head>
+<body>
+  <div class="container">
+    <nav class="crumbs"><a href="/">pinnedai.dev</a> · rate-limit-regression-test</nav>
+
+    <span class="tag">RATE LIMIT</span>
+    <h1>Rate-limit regression test from a PR claim</h1>
+    <p class="lede">Rate limiters are the most commonly-broken-silently security feature in production codebases. They're added in response to abuse, work for six months, then quietly break during an unrelated refactor — usually noticed only when the abuse returns. Pinned catches it.</p>
+
+    <h2>The scenario every backend engineer has seen</h2>
+    <p>A user-search endpoint gets scraped at 5000 req/min. Your team adds a rate limiter at 60 req/min and ships PR #1247 with this description:</p>
+    <pre><code>Rate-limits /api/users to 60 req/min to stop the scraping abuse from last week.</code></pre>
+    <p>The PR is approved and merged. The scraping stops. Everyone moves on.</p>
+    <p>Six months later, a different engineer refactors the middleware to use a new library. The library has a slightly different matcher syntax, and the rate-limit rule for <code>/api/users</code> is silently dropped. The scraping resumes immediately, but you don't notice until the API gets DDoSed two weeks later.</p>
+
+    <h2>What Pinned generates from the claim</h2>
+    <p>When PR #1247 is opened, Pinned commits this test:</p>
+    <pre><code>// tests/pinned/pr-1247-rate-limit-api-users.test.ts
+import { describe, it, expect, beforeAll } from "vitest";
+
+const PREVIEW_URL = process.env.PREVIEW_URL;
+const ROUTE = "/api/users";
+const RATE = 60;
+const WINDOW = "minute";
+
+describe("pinned: rate-limit on " + ROUTE + " (60/minute)", () =&gt; {
+  beforeAll(() =&gt; {
+    if (!PREVIEW_URL) throw new Error("PREVIEW_URL required");
+  });
+
+  it("returns 429 after exceeding 60 requests/minute", async () =&gt; {
+    const url = PREVIEW_URL + ROUTE;
+    // Burst-parallel: fire RATE + 1 requests at once so we exceed
+    // the limiter regardless of how its bucket refills.
+    const statuses = await Promise.all(
+      Array.from({ length: RATE + 1 }, () =&gt;
+        fetch(url, { method: "GET" }).then((r) =&gt; r.status)
+      )
+    );
+    expect(statuses.includes(429)).toBe(true);
+  });
+});</code></pre>
+
+    <h2>Why burst-parallel?</h2>
+    <p>The test fires <code>RATE + 1 = 61</code> requests <em>in parallel</em>, not sequentially. This guarantees we exceed the rate limit regardless of how the bucket refills (token bucket, sliding window, leaky bucket — all are exceeded by a parallel burst of N+1 requests when the cap is N).</p>
+    <p>If we fired sequentially, a 60/min limit might refill enough between requests that 61 sequential requests don't hit 429. Parallel removes that ambiguity.</p>
+
+    <h2>What variations are supported?</h2>
+    <p>Pinned's parser handles several phrasings of the same claim:</p>
+    <ul>
+      <li><code>Rate-limits /api/users to 60 req/min.</code></li>
+      <li><code>Rate-limit /api/users to 60 requests per minute</code></li>
+      <li><code>Rate-limited /api/users to 60 calls/sec</code></li>
+      <li><code>Rate-limits /api/users to 60 rpm</code> (rpm / rps / rph also accepted)</li>
+    </ul>
+    <p>Plus the LLM fallback (in CI, keyless via OIDC) handles natural-language phrasings like "the user search endpoint should throttle at 60 per minute."</p>
+
+    <h2>Six months later, when the regression hits</h2>
+    <p>When the middleware refactor drops the rate-limit rule, CI fails on the next push:</p>
+    <pre><code>FAIL  tests/pinned/pr-1247-rate-limit-api-users.test.ts
+  AssertionError: expected at least one 429 across 61 parallel requests, got 200,200,200,...
+
+═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══
+
+Fix the failing pinned claim:
+  Claim: "Rate-limits /api/users to 60 req/min"
+  Original PR: pr-1247
+  Route: /api/users
+  Expected: 61 parallel requests should yield at least one 429
+  Actual: got statuses 200,200,200,...
+
+Find where /api requests are rate-limited (middleware, route handler,
+or upstream proxy) and restore enforcement for /api/users at 60/minute.</code></pre>
+    <p>The fix gets done in 5 minutes. The pin stays in place. The next regression also gets caught.</p>
+
+    <h2>Install</h2>
+    <div class="install"><code>npx pinnedai init</code></div>
+    <p>Free tier protects 25 active pins per repo. Pro tier ($19/mo) unlocks unlimited pins.</p>
+
+    <a class="cta" href="/">Try the live demo →</a>
+
+    <footer>
+      <a href="/">pinnedai.dev</a> ·
+      <a href="https://github.com/pinnedai/pinnedai">github</a> ·
+      <a href="https://www.npmjs.com/package/pinnedai">npm</a>
+    </footer>
+  </div>
+</body>
+</html>

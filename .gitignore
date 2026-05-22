@@ -8,3 +8,20 @@ dist
 .vercel
 coverage
 .pnpm-store
+
+# Local Claude Code state + local agent state — never commit
+.claude/
+.playwright-mcp/
+
+# Pinnedai's own dogfood install artifacts on this repo — generated
+# by running `pinned init` on the pinnedai repo itself for testing.
+.pinnedai/
+
+# OSS-sweep clone cache — symlinks to /tmp clones; regeneratable via
+# scripts/oss-fp-sweep.sh --regenerate-fixtures. The committed JSON
+# fixtures in audit/oss-sweep/fixtures/ are what the audit actually
+# uses; the clones are throw-away.
+audit/oss-sweep/.clones/
+
+# Local dogfood notes
+.dogfood-claims.md

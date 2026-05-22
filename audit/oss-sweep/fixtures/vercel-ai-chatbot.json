@@ -1,0 +1,6 @@
+{
+  "repo": "vercel/ai-chatbot",
+  "files": [
+    ".env.example"
+  ]
+}

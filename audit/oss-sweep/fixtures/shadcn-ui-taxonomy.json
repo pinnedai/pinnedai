@@ -1,0 +1,14 @@
+{
+  "repo": "shadcn-ui/taxonomy",
+  "files": [
+    ".env.example",
+    "app/api/og/route.tsx",
+    "app/api/posts/[postId]/route.ts",
+    "app/api/posts/route.ts",
+    "app/api/users/[userId]/route.ts",
+    "app/api/users/stripe/route.ts",
+    "app/api/webhooks/stripe/route.ts",
+    "middleware.ts",
+    "pages/api/auth/[...nextauth].ts"
+  ]
+}

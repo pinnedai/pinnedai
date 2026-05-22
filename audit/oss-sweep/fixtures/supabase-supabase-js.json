@@ -1,0 +1,13 @@
+{
+  "repo": "supabase/supabase-js",
+  "files": [
+    "packages/core/auth-js/example/react/.env.local.ci",
+    "packages/core/auth-js/example/react/.env.local.example",
+    "packages/core/realtime-js/example/.env.example",
+    "packages/core/realtime-js/example/.env.local.ci",
+    "packages/core/supabase-js/test/integration/next/.env.example",
+    "packages/core/supabase-js/test/integration/next/lib/supabase/middleware.ts",
+    "packages/core/supabase-js/test/integration/next/middleware.ts",
+    "test-tracing/.env.example"
+  ]
+}

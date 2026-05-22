@@ -1,0 +1,56 @@
+# Cloudflare Worker config for pinnedai-edge.
+#
+# Bindings:
+#   - QUOTA  — D1 database for per-repo monthly call counters
+#   - OPENAI_API_KEY — secret, set via `wrangler secret put OPENAI_API_KEY`
+#
+# Deploy:
+#   1. wrangler d1 create pinnedai-quota   (one-time; copy the id below)
+#   2. wrangler d1 execute pinnedai-quota --file=./schema.sql   (apply schema)
+#   3. wrangler secret put OPENAI_API_KEY
+#   4. wrangler deploy
+
+name = "pinnedai-edge"
+main = "src/index.ts"
+compatibility_date = "2026-05-19"
+
+# Public route under the apex domain. Update once pinnedai.dev DNS is live.
+# routes = [{ pattern = "api.pinnedai.dev", custom_domain = true }]
+
+[[d1_databases]]
+binding = "QUOTA"
+database_name = "pinnedai-quota"
+database_id = "REPLACE_ME_AFTER_wrangler_d1_create"
+
+[vars]
+# Free-tier monthly LLM-call caps per org. Pin count is unlimited at
+# every tier — these caps bound only the LLM API cost we eat for free
+# users. Customers hitting these caps are the Pro-conversion funnel.
+#
+# Public-repo cap is intentionally 10× the private cap to match the
+# CodeRabbit/Snyk launch pattern (generous to OSS, modest for private).
+# Pro/Team/Enterprise caps are stored in the subscriptions table
+# (fair_use_cap column) and apply regardless of repo visibility.
+# Per-org free-tier caps. Generous enough that real users rarely hit
+# them; primary backstop is FREE_BUDGET_TOTAL_PER_MONTH below.
+FREE_QUOTA_PUBLIC_PER_MONTH = "500"
+FREE_QUOTA_PRIVATE_PER_MONTH = "100"
+# Back-compat alias — older code paths read FREE_QUOTA_PER_MONTH.
+FREE_QUOTA_PER_MONTH = "100"
+
+# AGGREGATE hard cap across the entire free tier per month. This is
+# the cost ceiling that bounds OpenAI spend regardless of how many
+# orgs sign up. Default 100,000 calls/mo = ~$10/mo OpenAI worst case.
+# Adjust as runway grows — no code change needed, just bump this number
+# and `wrangler deploy`. When the aggregate cap is hit, free-tier
+# requests return 429 with "free tier at capacity" until next month.
+# Paid orgs (Pro/Team/Enterprise) bypass this cap entirely.
+FREE_BUDGET_TOTAL_PER_MONTH = "100000"
+# GitHub's OIDC JWKS endpoint — never changes, hard-coded.
+GITHUB_JWKS_URL = "https://token.actions.githubusercontent.com/.well-known/jwks"
+# OIDC audience claim we require — see `pinned-action` workflow.
+OIDC_AUDIENCE = "pinnedai"
+
+# Secrets (set via `wrangler secret put`):
+#   - OPENAI_API_KEY   — OpenAI API key for gpt-4o-mini
+#   - ADMIN_KEY        — bearer token for /admin/stats endpoint

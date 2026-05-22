@@ -1,17 +1,29 @@
 # GitHub Action wrapper around the pinnedai CLI.
 #
+# This composite action mirrors the pull_request job from the workflow
+# emitted by `pinned init`. Customers can EITHER:
+#   (a) Run `npx pinnedai init` once to generate a workflow file directly
+#       in their repo (recommended — gives them the @pinned add: comment
+#       trigger + concurrency controls), OR
+#   (b) Use this Marketplace action as a single drop-in step.
+#
 # Usage in customer repos:
+#
+#   name: pinned
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, edited]
 #   permissions:
 #     pull-requests: write
 #     contents: write
-#   steps:
-#     - uses: mzon7/pinnedai-action@v1
-#       with:
-#         mode: comment   # or 'commit' to push the generated test
-#
-# Implementation: this is a composite action — runs `npx pinnedai`
-# inside the workflow. Keeps the action deployable without a separate
-# Docker image / Node bundling step.
+#     id-token: write
+#   jobs:
+#     pin:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v4
+#           with: { fetch-depth: 0, ref: ${{ github.event.pull_request.head.ref }} }
+#         - uses: pinnedai/pinnedai-action@v1
 
 name: "pinnedai"
 description: "Pin PR description claims as permanent CI tests"
@@ -19,23 +31,119 @@ author: "Michael Zon"
 branding:
   icon: "lock"
   color: "blue"
+
 inputs:
-  mode:
-    description: "Output mode — 'comment' (default, paste the generated test in a PR comment) or 'commit' (push it to the PR branch)"
-    required: false
-    default: "comment"
   cli-version:
-    description: "pinnedai npm version to use. Default 'latest'."
+    description: "pinnedai npm version to use (default: latest)"
     required: false
     default: "latest"
+  auto-commit:
+    description: "Auto-commit generated tests to the PR branch (default: true). Set to 'false' to use paste-mode only."
+    required: false
+    default: "true"
+  byok:
+    description: |
+      Bring-your-own-key provider. Set to "anthropic" or "openai" to route LLM
+      extraction through your own provider key instead of pinnedai's hosted Worker.
+      Requires a paid plan AND the matching secret: PINNEDAI_ANTHROPIC_KEY or
+      PINNEDAI_OPENAI_KEY. Leave empty (default) to use the hosted Worker.
+    required: false
+    default: ""
+
 runs:
   using: "composite"
   steps:
-    - name: Run pinnedai
+    # Preflight — fail fast with a clear error if the caller forgot to
+    # checkout the repo with fetch-depth: 0 + the PR's head ref. Without
+    # the checkout, scan-diff has no history and auto-commit has nowhere
+    # to push.
+    - name: Preflight (verify checkout)
+      shell: bash
+      env:
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+      run: |
+        if [ ! -d ".git" ]; then
+          echo "✗ pinnedai-action requires actions/checkout BEFORE this step." >&2
+          echo "  Add to your workflow:" >&2
+          echo "    - uses: actions/checkout@v4" >&2
+          echo "      with: { fetch-depth: 0, ref: \${{ github.event.pull_request.head.ref }} }" >&2
+          exit 1
+        fi
+        if ! git rev-parse --verify "origin/$BASE_REF" >/dev/null 2>&1; then
+          echo "✗ scan-diff needs the PR base ref (origin/$BASE_REF) — set fetch-depth: 0 on actions/checkout." >&2
+          exit 1
+        fi
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Parse claims from PR description
       shell: bash
       env:
         GITHUB_PR_BODY: ${{ github.event.pull_request.body }}
-        GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
-        PINNEDAI_MODE: ${{ inputs.mode }}
+        GITHUB_PR_TITLE: ${{ github.event.pull_request.title }}
+        PINNEDAI_BYOK: ${{ inputs.byok }}
+        PINNEDAI_ANTHROPIC_KEY: ${{ env.PINNEDAI_ANTHROPIC_KEY }}
+        PINNEDAI_OPENAI_KEY: ${{ env.PINNEDAI_OPENAI_KEY }}
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: npx --yes "pinnedai@$CLI_VERSION" check
+
+    - name: Scan diff for unpinned risk surfaces
+      id: scan
+      shell: bash
+      env:
+        GITHUB_PR_BODY: ${{ github.event.pull_request.body }}
+        GITHUB_PR_TITLE: ${{ github.event.pull_request.title }}
+        PINNEDAI_BYOK: ${{ inputs.byok }}
+        PINNEDAI_ANTHROPIC_KEY: ${{ env.PINNEDAI_ANTHROPIC_KEY }}
+        PINNEDAI_OPENAI_KEY: ${{ env.PINNEDAI_OPENAI_KEY }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        RUN_ID: ${{ github.run_id }}
+        CLI_VERSION: ${{ inputs.cli-version }}
       run: |
-        npx --yes pinnedai@${{ inputs.cli-version }} check
+        BODY=$(npx --yes "pinnedai@$CLI_VERSION" scan-diff --base "origin/$BASE_REF" --markdown)
+        DELIM="PINNED_EOF_$(openssl rand -hex 16 2>/dev/null || echo "${RUN_ID}_$RANDOM")"
+        {
+          echo "body<<$DELIM"
+          echo "$BODY"
+          echo "$DELIM"
+        } >> "$GITHUB_OUTPUT"
+        echo "$BODY"
+
+    - name: Comment on PR with pin suggestions
+      if: ${{ !contains(steps.scan.outputs.body, 'No risk surfaces detected') }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUM: ${{ github.event.pull_request.number }}
+        COMMENT_BODY: ${{ steps.scan.outputs.body }}
+      run: gh pr comment "$PR_NUM" --body "$COMMENT_BODY"
+
+    - name: Auto-commit pinned tests
+      if: ${{ inputs.auto-commit != 'false' }}
+      shell: bash
+      env:
+        GITHUB_PR_BODY: ${{ github.event.pull_request.body }}
+        GITHUB_PR_TITLE: ${{ github.event.pull_request.title }}
+        PINNEDAI_BYOK: ${{ inputs.byok }}
+        PINNEDAI_ANTHROPIC_KEY: ${{ env.PINNEDAI_ANTHROPIC_KEY }}
+        PINNEDAI_OPENAI_KEY: ${{ env.PINNEDAI_OPENAI_KEY }}
+        PR_NUM: ${{ github.event.pull_request.number }}
+        HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        npx --yes "pinnedai@$CLI_VERSION" generate \
+          --pr-id "pr-$PR_NUM" \
+          --description "$GITHUB_PR_BODY"
+
+        if ! git diff --quiet -- tests/pinned/ 2>/dev/null; then
+          git config user.name "pinned[bot]"
+          git config user.email "bot@pinnedai.dev"
+          git add tests/pinned/
+          git commit -m "Pin claims from PR #$PR_NUM"
+          git push origin "HEAD:$HEAD_REF"
+        else
+          echo "No new pins to commit."
+        fi

@@ -1,0 +1,531 @@
+{
+  "version": 1,
+  "claims": [
+    {
+      "claimId": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-version-1o1gxj",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-output-contains",
+        "route": "node ./apps/cli/dist/cli.js --version",
+        "text": "0.0.1",
+        "raw": "`node ./apps/cli/dist/cli.js --version` outputs `0.0.1`"
+      },
+      "filename": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-version-1o1gxj.test.ts",
+      "pinnedAt": "2026-05-20T03:06:38.275Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-output-contains",
+        "route": "node ./apps/cli/dist/cli.js check --description \"Rate-limits /api/users to 60 req/min.\"",
+        "text": "Found 1 claim(s)",
+        "raw": "`node ./apps/cli/dist/cli.js check --description \"Rate-limits /api/users to 60 req/min.\"` outputs `Found 1 claim(s)`"
+      },
+      "filename": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2.test.ts",
+      "pinnedAt": "2026-05-20T03:06:38.275Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-x-1f36y4",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-output-contains",
+        "route": "node ./apps/cli/dist/cli.js check --description \"x\"",
+        "text": "No claims found",
+        "raw": "`node ./apps/cli/dist/cli.js check --description \"x\"` outputs `No claims found`"
+      },
+      "filename": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-x-1f36y4.test.ts",
+      "pinnedAt": "2026-05-20T03:06:38.276Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-exits-zero-node-apps-cli-dist-cli-js-version-pnybqr",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js --version",
+        "raw": "`node ./apps/cli/dist/cli.js --version` exits 0"
+      },
+      "filename": "v0-1-1-cli-exits-zero-node-apps-cli-dist-cli-js-version-pnybqr.test.ts",
+      "pinnedAt": "2026-05-20T03:06:38.276Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-exits-zero-node-apps-cli-dist-cli-js-try-4p7f5i",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js try",
+        "raw": "`node ./apps/cli/dist/cli.js try` exits 0"
+      },
+      "filename": "v0-1-1-cli-exits-zero-node-apps-cli-dist-cli-js-try-4p7f5i.test.ts",
+      "pinnedAt": "2026-05-20T03:06:38.276Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-flag-supported-node-apps-cli-dist-cli-js-check-ew5tlq",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-flag-supported",
+        "route": "node ./apps/cli/dist/cli.js check",
+        "flag": "--json",
+        "raw": "`node ./apps/cli/dist/cli.js check` supports `--json`"
+      },
+      "filename": "v0-1-1-cli-flag-supported-node-apps-cli-dist-cli-js-check-ew5tlq.test.ts",
+      "pinnedAt": "2026-05-20T03:06:38.276Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-flag-supported-node-apps-cli-dist-cli-js-generate-3nztls",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-flag-supported",
+        "route": "node ./apps/cli/dist/cli.js generate",
+        "flag": "--dry-run",
+        "raw": "`node ./apps/cli/dist/cli.js generate` supports `--dry-run`"
+      },
+      "filename": "v0-1-1-cli-flag-supported-node-apps-cli-dist-cli-js-generate-3nztls.test.ts",
+      "pinnedAt": "2026-05-20T03:06:38.276Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-flag-supported-node-apps-cli-dist-cli-js-list-ly8f1m",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-flag-supported",
+        "route": "node ./apps/cli/dist/cli.js list",
+        "flag": "--include-retired",
+        "raw": "`node ./apps/cli/dist/cli.js list` supports `--include-retired`"
+      },
+      "filename": "v0-1-1-cli-flag-supported-node-apps-cli-dist-cli-js-list-ly8f1m.test.ts",
+      "pinnedAt": "2026-05-20T03:06:38.276Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-output-contains-pinned-statusline-dzngcj",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-output-contains",
+        "route": "pinned statusline",
+        "text": "◆ pinned",
+        "raw": "`pinned statusline` outputs `◆ pinned`"
+      },
+      "filename": "v0-1-1-cli-output-contains-pinned-statusline-dzngcj.test.ts",
+      "pinnedAt": "2026-05-20T16:37:52.199Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-output-contains-pinned-safety-uxvfyu",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-output-contains",
+        "route": "pinned safety",
+        "text": "Safety Pass",
+        "raw": "`pinned safety` outputs `Safety Pass`"
+      },
+      "filename": "v0-1-1-cli-output-contains-pinned-safety-uxvfyu.test.ts",
+      "pinnedAt": "2026-05-20T16:37:52.205Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-cli-output-contains-pinned-status-15hnup",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "cli-output-contains",
+        "route": "pinned status",
+        "text": "Pinned status",
+        "raw": "`pinned status` outputs `Pinned status`"
+      },
+      "filename": "v0-1-1-cli-output-contains-pinned-status-15hnup.test.ts",
+      "pinnedAt": "2026-05-20T16:37:52.205Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-auth-required-api-admin-export-rw7ne7",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "auth-required",
+        "route": "/api/admin/export",
+        "raw": "/api/admin/export requires admin role"
+      },
+      "filename": "v0-1-1-auth-required-api-admin-export-rw7ne7.test.ts",
+      "pinnedAt": "2026-05-21T03:07:08.675Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-returns-status-api-signup-15x1ys",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "returns-status",
+        "route": "/api/signup",
+        "method": "POST",
+        "status": 400,
+        "condition": "missing email",
+        "conditionKind": "missing",
+        "field": "email",
+        "raw": "POST /api/signup returns 400 on missing email"
+      },
+      "filename": "v0-1-1-returns-status-api-signup-15x1ys.test.ts",
+      "pinnedAt": "2026-05-21T03:07:08.676Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-returns-status-api-users-12hl5q",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "returns-status",
+        "route": "/api/users",
+        "method": "POST",
+        "status": 422,
+        "condition": "invalid email",
+        "conditionKind": "invalid",
+        "field": "email",
+        "raw": "/api/users returns 422 on invalid email"
+      },
+      "filename": "v0-1-1-returns-status-api-users-12hl5q.test.ts",
+      "pinnedAt": "2026-05-21T03:07:08.676Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "v0-1-1-returns-status-api-users-um7t93",
+      "prId": "v0-1-1",
+      "claim": {
+        "template": "returns-status",
+        "route": "/api/users",
+        "method": "POST",
+        "status": 401,
+        "condition": "missing token",
+        "conditionKind": "missing",
+        "field": "token",
+        "raw": "/api/users returns 401 on missing token"
+      },
+      "filename": "v0-1-1-returns-status-api-users-um7t93.test.ts",
+      "pinnedAt": "2026-05-21T03:12:24.682Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-try-help-12ta9k",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js try --help",
+        "raw": "`node ./apps/cli/dist/cli.js try --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-try-help-12ta9k.test.ts",
+      "pinnedAt": "2026-05-21T03:54:43.629Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-init-help-1dqswx",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js init --help",
+        "raw": "`node ./apps/cli/dist/cli.js init --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-init-help-1dqswx.test.ts",
+      "pinnedAt": "2026-05-21T03:54:43.630Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-ai-rules-help-c8p4zk",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js ai-rules --help",
+        "raw": "`node ./apps/cli/dist/cli.js ai-rules --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-ai-rules-help-c8p4zk.test.ts",
+      "pinnedAt": "2026-05-21T03:54:43.630Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-show-help-1pbzqd",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js show --help",
+        "raw": "`node ./apps/cli/dist/cli.js show --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-show-help-1pbzqd.test.ts",
+      "pinnedAt": "2026-05-21T03:54:43.630Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-catches-help-6a1qfn",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js catches --help",
+        "raw": "`node ./apps/cli/dist/cli.js catches --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-catches-help-6a1qfn.test.ts",
+      "pinnedAt": "2026-05-21T03:54:43.630Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-scan-help-s20m5j",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js scan --help",
+        "raw": "`node ./apps/cli/dist/cli.js scan --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-scan-help-s20m5j.test.ts",
+      "pinnedAt": "2026-05-21T03:58:53.980Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-pr-comment-help-g5kctg",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js pr-comment --help",
+        "raw": "`node ./apps/cli/dist/cli.js pr-comment --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-pr-comment-help-g5kctg.test.ts",
+      "pinnedAt": "2026-05-21T03:58:53.981Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-baseline-help-1jva0h",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js baseline --help",
+        "raw": "`node ./apps/cli/dist/cli.js baseline --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-baseline-help-1jva0h.test.ts",
+      "pinnedAt": "2026-05-21T03:58:53.981Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-doctor-help-mc1zax",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js doctor --help",
+        "raw": "`node ./apps/cli/dist/cli.js doctor --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-doctor-help-mc1zax.test.ts",
+      "pinnedAt": "2026-05-21T03:58:53.981Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-protect-help-1rdeu8",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js protect --help",
+        "raw": "`node ./apps/cli/dist/cli.js protect --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-protect-help-1rdeu8.test.ts",
+      "pinnedAt": "2026-05-21T03:58:53.981Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-auto-protect-help-eg6d5d",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js auto-protect --help",
+        "raw": "`node ./apps/cli/dist/cli.js auto-protect --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-auto-protect-help-eg6d5d.test.ts",
+      "pinnedAt": "2026-05-21T03:59:00.440Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-watch-help-9nlbn5",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js watch --help",
+        "raw": "`node ./apps/cli/dist/cli.js watch --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-watch-help-9nlbn5.test.ts",
+      "pinnedAt": "2026-05-21T03:59:00.440Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-safety-help-t3zskk",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js safety --help",
+        "raw": "`node ./apps/cli/dist/cli.js safety --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-safety-help-t3zskk.test.ts",
+      "pinnedAt": "2026-05-21T03:59:00.440Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-status-help-1n73o3",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js status --help",
+        "raw": "`node ./apps/cli/dist/cli.js status --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-status-help-1n73o3.test.ts",
+      "pinnedAt": "2026-05-21T03:59:00.440Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-fix-prompt-help-1b8o8y",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js fix-prompt --help",
+        "raw": "`node ./apps/cli/dist/cli.js fix-prompt --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-fix-prompt-help-1b8o8y.test.ts",
+      "pinnedAt": "2026-05-21T03:59:00.440Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-statusline-help-1n17an",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js statusline --help",
+        "raw": "`node ./apps/cli/dist/cli.js statusline --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-statusline-help-1n17an.test.ts",
+      "pinnedAt": "2026-05-21T04:03:18.007Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-hook-failure-help-8qhpyu",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js hook-failure --help",
+        "raw": "`node ./apps/cli/dist/cli.js hook-failure --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-hook-failure-help-8qhpyu.test.ts",
+      "pinnedAt": "2026-05-21T04:03:18.008Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-test-help-5347ji",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js test --help",
+        "raw": "`node ./apps/cli/dist/cli.js test --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-test-help-5347ji.test.ts",
+      "pinnedAt": "2026-05-21T04:03:18.008Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-retire-help-1nukma",
+      "prId": "auto-20260521",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js retire --help",
+        "raw": "`node ./apps/cli/dist/cli.js retire --help` exits 0"
+      },
+      "filename": "auto-20260521-cli-exits-zero-node-apps-cli-dist-cli-js-retire-help-1nukma.test.ts",
+      "pinnedAt": "2026-05-21T04:03:18.008Z",
+      "pinnedBy": "michaelzon",
+      "status": "active"
+    },
+    {
+      "claimId": "auto-20260522-cli-exits-zero-node-apps-cli-dist-cli-js-list-help-xpn7wa",
+      "prId": "auto-20260522",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js list --help",
+        "raw": "`node ./apps/cli/dist/cli.js list --help` exits 0"
+      },
+      "filename": "auto-20260522-cli-exits-zero-node-apps-cli-dist-cli-js-list-help-xpn7wa.test.ts",
+      "pinnedAt": "2026-05-22T20:38:32.133Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js list --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260522-cli-exits-zero-node-apps-cli-dist-cli-js-scan-pr-help-r9mk4o",
+      "prId": "auto-20260522",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js scan-pr --help",
+        "raw": "`node ./apps/cli/dist/cli.js scan-pr --help` exits 0"
+      },
+      "filename": "auto-20260522-cli-exits-zero-node-apps-cli-dist-cli-js-scan-pr-help-r9mk4o.test.ts",
+      "pinnedAt": "2026-05-22T20:38:32.133Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js scan-pr --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260522-cli-exits-zero-node-apps-cli-dist-cli-js-guard-help-pxi47x",
+      "prId": "auto-20260522",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js guard --help",
+        "raw": "`node ./apps/cli/dist/cli.js guard --help` exits 0"
+      },
+      "filename": "auto-20260522-cli-exits-zero-node-apps-cli-dist-cli-js-guard-help-pxi47x.test.ts",
+      "pinnedAt": "2026-05-22T20:38:32.134Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js guard --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260522-cli-exits-zero-node-apps-cli-dist-cli-js-review-help-rcmt2a",
+      "prId": "auto-20260522",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js review --help",
+        "raw": "`node ./apps/cli/dist/cli.js review --help` exits 0"
+      },
+      "filename": "auto-20260522-cli-exits-zero-node-apps-cli-dist-cli-js-review-help-rcmt2a.test.ts",
+      "pinnedAt": "2026-05-22T20:38:32.134Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js review --help` exited with non-zero status (command broken)"
+    }
+  ]
+}

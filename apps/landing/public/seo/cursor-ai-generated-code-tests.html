@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tests for Cursor-generated code — turn AI PRs into permanent CI proofs</title>
+  <meta name="description" content="Cursor ships PRs that claim to fix bugs and add features. Pinned makes the claims testable. Every PR description gets parsed into a CI test that runs forever." />
+  <link rel="canonical" href="https://pinnedai.dev/seo/cursor-ai-generated-code-tests.html" />
+  <link rel="stylesheet" href="seo.css" />
+</head>
+<body>
+  <div class="container">
+    <nav class="crumbs"><a href="/">pinnedai.dev</a> · cursor-ai-generated-code-tests</nav>
+
+    <span class="tag">CURSOR</span>
+    <h1>Tests for Cursor-generated code</h1>
+    <p class="lede">Cursor ships PRs at 10× human velocity. Reviewers can't verify every behavioral claim against the diff — they trust Cursor's summary and merge. Pinned turns the trust step into a permanent test.</p>
+
+    <h2>The Cursor-coding pain pattern</h2>
+    <p>You give Cursor a task. It writes a PR with a description like:</p>
+    <pre><code>Adds rate limiting to /api/users (60 req/min) to stop scraping abuse.
+Adds auth check to /api/admin/billing.
+Makes /webhooks/stripe idempotent on event_id.</code></pre>
+    <p>The diff is 200+ lines across 8 files. Manually verifying each claim against the diff would take 30 minutes — too long, you merge. Six months later, an unrelated refactor by a teammate breaks one of the claims. Nobody notices until production.</p>
+
+    <h2>What Pinned does on the Cursor PR</h2>
+    <p>The Pinned GitHub Action runs the moment the PR is opened. For Cursor's three claims above, it:</p>
+    <ol>
+      <li>Parses each claim from the PR description (regex + LLM)</li>
+      <li>Generates 3 Vitest files under <code>tests/pinned/</code></li>
+      <li>Auto-commits them to the Cursor branch</li>
+      <li>Posts a PR comment listing the new pins + any unpinned risk surfaces</li>
+    </ol>
+    <p>Now the Cursor PR isn't just a claim — it's a claim <em>plus</em> a test that enforces the claim forever.</p>
+
+    <h2>What happens when a Cursor PR breaks an old claim</h2>
+    <p>This is the killer scenario. Cursor refactors something six months after PR #1247, and inadvertently breaks the rate limiter on <code>/api/users</code>. The pinned test fails in CI with:</p>
+    <pre><code>FAIL  tests/pinned/pr-1247-rate-limit-api-users.test.ts
+  AssertionError: expected at least one 429 across 61 parallel requests, got 200,200,200,...
+
+═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══
+
+Fix the failing pinned claim in this test file:
+  Claim: "Rate-limits /api/users to 60 req/min"
+  Original PR: pr-1247
+  Route: /api/users
+  Expected: 61 parallel requests should yield at least one 429
+  Actual: got statuses 200,200,200,...
+
+Find where /api requests are rate-limited (middleware, route handler,
+or upstream proxy) and restore enforcement for /api/users at 60/minute.
+Preserve all other behavior. Do not modify this pinned test file.
+
+After fixing, re-run: npx vitest run tests/pinned/pr-1247-rate-limit-api-users.test.ts
+═══════════════════════════════════════════════════════════════</code></pre>
+    <p>The failure message <em>is</em> a Cursor-ready prompt. You paste it back into Cursor, it generates the fix, you commit, CI passes. The pinned test stays in your repo, ready to catch the next regression.</p>
+
+    <h2>Pinned is the "second AI agent" workflow you already use</h2>
+    <p>Many Cursor users already use a manual second-AI pattern: one AI writes the code, a second AI reviews it for bugs. Pinned automates the durable half — instead of throwaway reviews, it produces tests that stay in your repo and detect regressions automatically forever.</p>
+
+    <h2>Install in your Cursor-driven repo</h2>
+    <div class="install"><code>npx pinnedai init</code></div>
+    <p>Free tier protects 25 active pins per repo. No API key required — GitHub OIDC handles auth.</p>
+
+    <a class="cta" href="/">See it in action →</a>
+
+    <footer>
+      <a href="/">pinnedai.dev</a> ·
+      <a href="https://github.com/pinnedai/pinnedai">github</a> ·
+      <a href="https://www.npmjs.com/package/pinnedai">npm</a>
+    </footer>
+  </div>
+</body>
+</html>

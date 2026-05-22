@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GitHub Action: turn PR claims into permanent tests — pinnedai</title>
+  <meta name="description" content="A GitHub Action that turns PR description claims like 'auth required on /api/X' into permanent CI tests that fail if the claim regresses. Built for AI-coded PRs from Cursor, Claude Code, Aider." />
+  <link rel="canonical" href="https://pinnedai.dev/seo/github-action-pr-claims-to-tests.html" />
+  <link rel="stylesheet" href="seo.css" />
+</head>
+<body>
+  <div class="container">
+    <nav class="crumbs"><a href="/">pinnedai.dev</a> · github-action-pr-claims-to-tests</nav>
+
+    <span class="tag">CONCEPT</span>
+    <h1>The GitHub Action that turns PR claims into permanent tests</h1>
+    <p class="lede">A PR description says: <em>"Adds auth to /api/admin/export. Rate-limits /api/users to 60 req/min. Makes the Stripe webhook idempotent."</em> Without verification, those are just claims. Pinned makes them testable forever.</p>
+
+    <h2>The category in one line</h2>
+    <p><strong>Claim-based regression testing for AI-coded PRs.</strong> Not an AI code reviewer. Not a test generator. A registry of behavioral promises tied to permanent CI tests.</p>
+
+    <h2>How the workflow works</h2>
+    <ol>
+      <li>You open a PR. The description contains one or more <em>claims</em> — testable behavioral promises.</li>
+      <li>The Pinned GitHub Action parses each claim (regex first, LLM fallback via OIDC — no API key required).</li>
+      <li>For each claim, it generates a Vitest file in <code>tests/pinned/</code>.</li>
+      <li>It auto-commits the test to the PR branch (opt-out via <code>PINNEDAI_AUTOCOMMIT=false</code> in repo variables).</li>
+      <li>It posts a PR comment showing the new pins, plus any <em>unpinned risk surfaces</em> the diff touched (new public routes, webhook handlers, env-file changes).</li>
+      <li>You merge. The tests join your suite permanently.</li>
+      <li>Forever after, if any commit regresses a pinned claim, CI fails with a back-reference to the original PR and a paste-ready Cursor/Claude repair prompt.</li>
+    </ol>
+
+    <h2>The three claim templates in v0.1</h2>
+    <table class="compare">
+      <thead><tr><th>Claim shape</th><th>What gets generated</th></tr></thead>
+      <tbody>
+        <tr><td><code>Rate-limits /api/X to N req/min</code></td><td>Bursts N+1 parallel requests, asserts ≥1 returns 429</td></tr>
+        <tr><td><code>Auth required on /api/X</code></td><td>Single GET without auth header, asserts 401 or 403</td></tr>
+        <tr><td><code>Makes /webhooks/X idempotent on event_id</code></td><td>POSTs the same payload twice, asserts byte-identical response</td></tr>
+      </tbody>
+    </table>
+    <p>The LLM never writes test logic — only fills slots in deterministic templates. False-positive rate stays near zero.</p>
+
+    <h2>What's NOT in scope (deliberately)</h2>
+    <ul>
+      <li><strong>Not a code reviewer</strong> — CodeRabbit, Greptile, Qodo own that surface. Use them alongside Pinned.</li>
+      <li><strong>Not a generic test generator</strong> — tests are scoped to specific claim templates, not freeform AI-written assertions. Determinism is the moat.</li>
+      <li><strong>Not a dependency scanner</strong> — Snyk, Socket own that.</li>
+      <li><strong>Not a runtime smoke tester</strong> — Chromatic, Percy, Argos own that.</li>
+    </ul>
+
+    <h2>The PINS.md registry</h2>
+    <p>Every pinned claim lands in <code>tests/pinned/PINS.md</code>, a human-readable table that lives in your repo and grows with every PR:</p>
+    <pre><code># Pinned Claims
+
+## Active
+
+| Claim | Test | PR | Pinned by | Pinned |
+|---|---|---|---|---|
+| rate-limit /api/users (60/minute) | [pr-1247-rate-limit-api-users.test.ts](pr-1247-rate-limit-api-users.test.ts) | #1247 | @alice | 2026-04-01 |
+| auth-required /api/admin/export | [pr-1248-auth-required-api-admin-export.test.ts](pr-1248-auth-required-api-admin-export.test.ts) | #1248 | @bob | 2026-04-03 |
+| idempotent /webhooks/stripe (key: event_id) | [pr-1250-idempotent-webhooks-stripe.test.ts](pr-1250-idempotent-webhooks-stripe.test.ts) | #1250 | @carol | 2026-04-05 |
+
+## Retired
+
+| Claim | Test | PR | Retired by | Retired | Reason |
+|---|---|---|---|---|---|
+| auth-required /api/old | [retired/...test.ts](retired/...test.ts) | #1100 | @alice | 2026-03-12 | endpoint removed |</code></pre>
+    <p>The registry is the <em>moat</em>. The more pins your repo has, the more locked-in Pinned becomes — and the more behavioral protection your team gets.</p>
+
+    <h2>Install — one command</h2>
+    <div class="install"><code>npx pinnedai init</code></div>
+    <p>Writes <code>.github/workflows/pinned.yml</code>, creates <code>tests/pinned/</code>, configures GitHub Actions permissions. No account, no API key. The GitHub OIDC token is the identity.</p>
+
+    <a class="cta" href="/">See the live demo →</a>
+
+    <footer>
+      <a href="/">pinnedai.dev</a> ·
+      <a href="https://github.com/pinnedai/pinnedai">github</a> ·
+      <a href="https://www.npmjs.com/package/pinnedai">npm</a>
+    </footer>
+  </div>
+</body>
+</html>

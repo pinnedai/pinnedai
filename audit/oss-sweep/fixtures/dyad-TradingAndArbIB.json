@@ -1,0 +1,18 @@
+{
+  "repo": "dyad-apps/TradingAndArbIB",
+  "files": [
+    ".env.example",
+    "node_modules/.pnpm/ci-info@4.3.1/node_modules/ci-info/index.js",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dist/cjs/lucide-react.js",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dist/esm/icons/index.js",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dist/esm/icons/webhook-off.js",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dist/esm/icons/webhook.js",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dist/esm/lucide-react.js",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dist/lucide-react.d.ts",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dist/umd/lucide-react.js",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dist/umd/lucide-react.min.js",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dynamicIconImports.d.ts",
+    "node_modules/.pnpm/lucide-react@0.454.0_react@18.3.1/node_modules/lucide-react/dynamicIconImports.js",
+    "node_modules/.vite/deps/lucide-react.js"
+  ]
+}

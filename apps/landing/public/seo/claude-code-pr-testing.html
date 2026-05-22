@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Code PR testing — make Claude's claims testable forever</title>
+  <meta name="description" content="Claude Code writes PRs that claim to add features, fix bugs, harden endpoints. Pinned turns each claim into a permanent CI test, with a paste-ready repair prompt for Claude when tests fail." />
+  <link rel="canonical" href="https://pinnedai.dev/seo/claude-code-pr-testing.html" />
+  <link rel="stylesheet" href="seo.css" />
+</head>
+<body>
+  <div class="container">
+    <nav class="crumbs"><a href="/">pinnedai.dev</a> · claude-code-pr-testing</nav>
+
+    <span class="tag">CLAUDE CODE</span>
+    <h1>Claude Code PR testing — make Claude's promises testable forever</h1>
+    <p class="lede">Claude Code is shipping production PRs at the velocity of a senior engineer. Pinned turns each PR's behavioral claim into a permanent CI test — so Claude's promises don't just become commits, they become guardrails.</p>
+
+    <h2>The pattern you've seen</h2>
+    <p>Claude Code finishes a task and opens a PR. The description reads:</p>
+    <pre><code>## Summary
+- Added authentication requirement to the admin export endpoint
+- Implemented idempotency for the Stripe webhook handler (keyed on event_id)
+- No breaking changes to existing routes
+
+## Files changed
+- middleware.ts (auth check expanded to /api/admin/*)
+- app/api/admin/export/route.ts (new endpoint)
+- app/webhooks/stripe/route.ts (idempotency middleware added)</code></pre>
+    <p>You merge it. Tests pass (Claude usually writes a few). Production looks fine. Two months later, a separate Claude PR refactors the middleware and inadvertently widens the auth check to non-admin routes — or worse, removes the idempotency check on the webhook. Nobody notices until a customer reports a duplicate charge.</p>
+
+    <h2>How Pinned protects against this</h2>
+    <p>When Claude's first PR lands, Pinned's GitHub Action parses the claims and commits permanent tests:</p>
+    <pre><code>tests/pinned/pr-42-auth-required-api-admin-export.test.ts
+tests/pinned/pr-42-idempotent-webhooks-stripe.test.ts</code></pre>
+    <p>These tests run on <em>every</em> commit forever. The auth-required test fires an unauthenticated GET to <code>/api/admin/export</code> and asserts 401/403. The idempotent test POSTs the same payload twice with the same <code>event_id</code> and asserts byte-identical responses.</p>
+    <p>When a future Claude PR breaks one of these, CI fails — and the failure message includes a paste-ready prompt for Claude Code to repair the issue.</p>
+
+    <h2>The repair loop is the magic</h2>
+    <p>When a pin fails in CI, the test error message contains a structured prompt designed for Claude Code:</p>
+    <pre><code>═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══
+
+Fix the failing pinned claim in this test file:
+  Claim: "Auth required on /api/admin/export"
+  Original PR: pr-42
+  Route: /api/admin/export
+  Expected: unauthenticated GET to /api/admin/export returns 401 or 403
+  Actual: returned 200
+
+Restore the auth check on /api/admin/export. Likely candidates:
+  - middleware.ts or src/middleware.ts (Next.js / Hono / generic)
+  - The route handler file for /api/admin/export
+  - Auth provider config (Clerk / Auth.js / Supabase / Lucia)
+Preserve authenticated behavior. Do not modify this pinned test file.
+
+After fixing, re-run:  npx vitest run tests/pinned/pr-42-auth-required-api-admin-export.test.ts
+═══════════════════════════════════════════════════════════════</code></pre>
+    <p>You copy this block, paste it into Claude Code, Claude generates the fix using your existing subscription. You commit, CI passes, the pin stays in place to catch the next regression. <strong>Zero LLM cost to Pinned for the repair step</strong> — it's your existing Claude that does the work.</p>
+
+    <h2>Designed for the AI-coder workflow</h2>
+    <p>Pinned is not competing with Claude Code, Cursor, or Aider. It's the layer that turns their output into durable guarantees. Use whatever AI writes your code — Pinned makes the claims it makes testable forever.</p>
+
+    <h2>Install</h2>
+    <div class="install"><code>npx pinnedai init</code></div>
+    <p>Free tier protects 25 active pins per repo. Pro tier ($19/mo) unlocks unlimited pins + BYOK (use your existing Anthropic key for unlimited LLM extraction).</p>
+
+    <a class="cta" href="/">See the live demo →</a>
+
+    <footer>
+      <a href="/">pinnedai.dev</a> ·
+      <a href="https://github.com/pinnedai/pinnedai">github</a> ·
+      <a href="https://www.npmjs.com/package/pinnedai">npm</a>
+    </footer>
+  </div>
+</body>
+</html>

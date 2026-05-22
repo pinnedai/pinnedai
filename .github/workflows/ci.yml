@@ -19,4 +19,12 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm test
       - run: pnpm build
+      # Dogfood: run the pins pinnedai has set on ITSELF. Catches
+      # regressions in its own published behavior, gated by the
+      # repair-prompt back-reference to the original PR.
+      - run: pnpm dogfood:pins
+      # Signal-audit suite: every advertised feature verified via
+      # positive + negative + falsifiability controls.
+      - run: pnpm audit:features

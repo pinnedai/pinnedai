@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI code review vs. regression tests — why both, and how Pinned bridges them</title>
+  <meta name="description" content="CodeRabbit, Greptile, Copilot Workspace review your PRs. Pinned turns the review's findings into permanent regression tests. They complement each other — here's how they differ." />
+  <link rel="canonical" href="https://pinnedai.dev/seo/ai-code-review-vs-regression-tests.html" />
+  <link rel="stylesheet" href="seo.css" />
+</head>
+<body>
+  <div class="container">
+    <nav class="crumbs"><a href="/">pinnedai.dev</a> · ai-code-review-vs-regression-tests</nav>
+
+    <span class="tag">COMPARISON</span>
+    <h1>AI code review vs. regression tests — and why you want both</h1>
+    <p class="lede">CodeRabbit, Greptile, Qodo, and Copilot Workspace are great at <em>reviewing</em> your PRs. They post comments, flag bugs, suggest improvements. But review comments fade after merge. Pinned is different — it turns PR claims into <strong>permanent regression tests</strong>. Use them together: the reviewer comments, Pinned protects.</p>
+
+    <h2>The two distinct workflows</h2>
+    <p>AI PR reviewers and claim-based regression testing solve different problems at different points in the lifecycle:</p>
+    <table class="compare">
+      <thead>
+        <tr>
+          <th>Dimension</th>
+          <th>AI Code Reviewer<br>(CodeRabbit / Greptile / Qodo)</th>
+          <th>Claim-based Regression Testing<br>(Pinned)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>When it fires</td><td>At PR open</td><td>At PR open + every commit forever</td></tr>
+        <tr><td>What it produces</td><td>Inline review comments</td><td>Test files in <code>tests/pinned/</code></td></tr>
+        <tr><td>Value after merge</td><td>Fades — comments age out</td><td>Compounds — tests stay forever</td></tr>
+        <tr><td>What you cancel when you stop</td><td>Nothing carries forward</td><td>Thousands of tests stay in your repo</td></tr>
+        <tr><td>Cost vector</td><td>LLM tokens per PR review</td><td>LLM extraction per unique PR description (cached 90 days)</td></tr>
+        <tr><td>Defends against</td><td>Bugs visible in the current diff</td><td>Future regressions of merged claims</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Concrete scenario</h2>
+    <p>A Cursor-generated PR claims: <em>"Auth required on /api/admin/export."</em></p>
+    <p><strong>The AI reviewer's response:</strong> "Looks good. Verified the middleware adds the auth check." Comment is posted. PR merged. Comment disappears into history.</p>
+    <p><strong>Pinned's response:</strong> Generates <code>tests/pinned/pr-1247-auth-required-api-admin-export.test.ts</code> that fires an unauthenticated request to <code>/api/admin/export</code> and asserts 401/403. Auto-commits to the PR branch. PR merged with the test included. The test runs on every future commit forever.</p>
+    <p>Six months later, a refactor moves the route and the middleware no longer matches. <strong>The AI reviewer is silent</strong> — it doesn't know about PR #1247's claim. <strong>Pinned's test fails</strong> with: <em>"This commit breaks a claim pinned in PR #1247: 'Auth required on /api/admin/export.'"</em></p>
+
+    <h2>Why the artifact matters</h2>
+    <p>The structural difference: AI reviewers produce <strong>advice</strong>. Pinned produces <strong>code that lives in your repo</strong>. Code persists; advice fades.</p>
+    <p>This isn't an accident — it's the architectural choice. Pinned's value-prop only works if the tests are durable artifacts. CodeRabbit's value-prop only works if their LLM is reviewing your specific PR right now. Different products. They don't compete.</p>
+
+    <h2>Stacking them: the recommended workflow</h2>
+    <ol>
+      <li>Use your favorite AI code reviewer (CodeRabbit, Greptile, etc.) for inline feedback on every PR.</li>
+      <li>Use Pinned alongside it to convert any "this PR adds X" claim into a permanent test.</li>
+      <li>If the AI reviewer catches a bug, fix it. If Pinned's CI later fails, you know the claim regressed.</li>
+    </ol>
+    <p>The two workflows are additive: reviewer protects against bugs visible <em>now</em>; Pinned protects against regressions visible <em>later</em>.</p>
+
+    <h2>Install Pinned in your repo</h2>
+    <div class="install"><code>npx pinnedai init</code></div>
+    <p>One command. Writes the GitHub Action workflow, creates <code>tests/pinned/</code>, configures permissions. Free tier protects 25 active pins per repo.</p>
+
+    <a class="cta" href="/">See the live demo →</a>
+
+    <footer>
+      <a href="/">pinnedai.dev</a> ·
+      <a href="https://github.com/pinnedai/pinnedai">github</a> ·
+      <a href="https://www.npmjs.com/package/pinnedai">npm</a>
+    </footer>
+  </div>
+</body>
+</html>

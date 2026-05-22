@@ -1,0 +1,9 @@
+{
+  "repo": "plausible/analytics",
+  "files": [
+    "config/.env.dev",
+    "config/.env.e2e_test",
+    "config/.env.load",
+    "config/.env.test"
+  ]
+}

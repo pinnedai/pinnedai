@@ -1,0 +1,19 @@
+{
+  "repo": "appsmithorg/appsmith",
+  "files": [
+    ".env.example",
+    "app/client/packages/design-system/widgets/src/components/Icon/src/icons.ts",
+    "app/client/packages/icons/.env.example",
+    "app/client/packages/rts/.env.example",
+    "app/client/packages/rts/src/routes/ast_routes.ts",
+    "app/client/packages/rts/src/routes/dsl_routes.ts",
+    "app/client/packages/rts/src/routes/git_routes.ts",
+    "app/client/packages/rts/src/routes/health_check_routes.ts",
+    "app/client/playwright/.env.example",
+    "app/client/src/ce/constants/routes/appRoutes.ts",
+    "app/client/src/components/editorComponents/PartialImportExport/PartialExportModal/unitTestUtils.ts",
+    "app/client/src/constants/routes/baseRoutes.ts",
+    "app/client/src/constants/routes/index.ts",
+    "app/client/src/ee/constants/routes/appRoutes.ts"
+  ]
+}

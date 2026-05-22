@@ -1,0 +1,20 @@
+{
+  "repo": "shadcn-ui/ui",
+  "files": [
+    "apps/v4/.env.example",
+    "apps/v4/app/api/search/route.ts",
+    "apps/v4/examples/base/accordion-borders.tsx",
+    "apps/v4/examples/base/dropdown-menu-rtl.tsx",
+    "apps/v4/examples/base/dropdown-menu-submenu.tsx",
+    "apps/v4/examples/base/input-badge.tsx",
+    "apps/v4/examples/radix/accordion-borders.tsx",
+    "apps/v4/examples/radix/dropdown-menu-rtl.tsx",
+    "apps/v4/examples/radix/dropdown-menu-submenu.tsx",
+    "apps/v4/examples/radix/input-badge.tsx",
+    "apps/v4/registry/bases/base/examples/accordion-example.tsx",
+    "apps/v4/registry/bases/radix/examples/accordion-example.tsx",
+    "packages/shadcn/test/fixtures/frameworks/next-pages-src/src/pages/api/hello.ts",
+    "packages/shadcn/test/fixtures/frameworks/next-pages/pages/api/hello.ts",
+    "packages/shadcn/test/fixtures/frameworks/remix-indie-stack/.env.example"
+  ]
+}

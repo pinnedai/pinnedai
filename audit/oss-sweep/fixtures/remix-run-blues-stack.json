@@ -1,0 +1,6 @@
+{
+  "repo": "remix-run/blues-stack",
+  "files": [
+    ".env.example"
+  ]
+}

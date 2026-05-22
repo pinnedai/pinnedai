@@ -1,0 +1,10 @@
+{
+  "repo": "vercel/next-learn",
+  "files": [
+    "basics/basics-final/pages/api/hello.js",
+    "basics/demo/pages/api/hello.js",
+    "basics/typescript-final/pages/api/hello.ts",
+    "dashboard/final-example/.env.example",
+    "dashboard/starter-example/.env.example"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "repo": "vercel/platforms",
+  "files": [
+    "middleware.ts"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "repo": "dyad-apps/back-in-play",
+  "files": [
+    ".env",
+    ".env.bak",
+    ".env.local",
+    "node_modules/@nuxt/devtools/dist/client/_nuxt/vue-devtools-na2nb82m.js",
+    "node_modules/nitropack/dist/shared/nitro.DLF2_KRt.d.ts"
+  ]
+}

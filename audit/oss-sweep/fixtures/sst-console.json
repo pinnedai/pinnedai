@@ -1,0 +1,12 @@
+{
+  "repo": "sst/console",
+  "files": [
+    "infra/secret.ts",
+    "packages/backend/src/api/github.ts",
+    "packages/backend/src/api/index.ts",
+    "packages/backend/src/api/log.ts",
+    "packages/backend/src/api/webhook.ts",
+    "packages/backend/src/function/api.ts",
+    "sst-env.d.ts"
+  ]
+}
