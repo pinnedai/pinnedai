@@ -192,6 +192,13 @@ function preflight(claim: Claim, cwd: string): string | null {
       }
       return null;
     }
+    case "package-exports-exist": {
+      const full = join(cwd, claim.modulePath);
+      if (!existsSync(full)) {
+        return `module file ${claim.modulePath} doesn't exist yet — pin is saved, will verify once it lands`;
+      }
+      return null;
+    }
   }
 }
 

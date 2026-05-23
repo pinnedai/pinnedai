@@ -224,6 +224,14 @@ function ClaimChip({ claim }: { claim: Claim }) {
           <span className="chip-meta">{claim.label}</span>
         </span>
       );
+    case "package-exports-exist":
+      return (
+        <span className="chip">
+          <span className="chip-tag">exports</span>
+          <span className="chip-route">{claim.modulePath}</span>
+          <span className="chip-meta">{claim.exports.length} symbol{claim.exports.length === 1 ? "" : "s"}</span>
+        </span>
+      );
   }
 }
 
@@ -326,6 +334,12 @@ function failureBlock(claim: Claim, filename: string): string {
     case "config-invariant":
       return `${head} > pinned: config-invariant ${claim.label} in ${claim.configPath}
   AssertionError: required substring missing — config likely "cleaned up" and load-bearing line removed
+
+  ${back}
+`;
+    case "package-exports-exist":
+      return `${head} > pinned: package-exports-exist ${claim.modulePath}
+  AssertionError: missing export(s) from [${claim.exports.join(", ")}] — public API symbol renamed/deleted
 
   ${back}
 `;

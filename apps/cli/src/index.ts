@@ -27,6 +27,7 @@ export type {
   LibraryReturnsClaim,
   ConfigInvariantClaim,
   LockfileIntegrityClaim,
+  PackageExportsClaim,
 } from "./claimParser.js";
 export { generateRateLimitTest } from "./templates/rateLimit.js";
 export { generateAuthRequiredTest } from "./templates/authRequired.js";
@@ -42,6 +43,7 @@ export { generateCliFlagSupportedTest } from "./templates/cliFlagSupported.js";
 export { generateLibraryReturnsTest } from "./templates/libraryReturns.js";
 export { generateLockfileIntegrityTest } from "./templates/lockfileIntegrity.js";
 export { generateConfigInvariantTest } from "./templates/configInvariant.js";
+export { generatePackageExportsExistTest } from "./templates/packageExportsExist.js";
 export type { GeneratedTest, GenerateOpts } from "./templates/rateLimit.js";
 
 import type { Claim } from "./claimParser.js";
@@ -60,6 +62,7 @@ import { generateCliFlagSupportedTest } from "./templates/cliFlagSupported.js";
 import { generateLibraryReturnsTest } from "./templates/libraryReturns.js";
 import { generateLockfileIntegrityTest } from "./templates/lockfileIntegrity.js";
 import { generateConfigInvariantTest } from "./templates/configInvariant.js";
+import { generatePackageExportsExistTest } from "./templates/packageExportsExist.js";
 
 // Convenience dispatcher — given any Claim, pick the right generator.
 // Keeps callers (CLI, landing demo, hosted Worker) DRY.
@@ -93,6 +96,8 @@ export function generateTest(claim: Claim, opts: GenerateOpts): GeneratedTest {
       return generateLockfileIntegrityTest(claim, opts);
     case "config-invariant":
       return generateConfigInvariantTest(claim, opts);
+    case "package-exports-exist":
+      return generatePackageExportsExistTest(claim, opts);
   }
   // Exhaustiveness guard — if a new Claim variant is added without a
   // case here, TS will fail to compile this assignment with a clear

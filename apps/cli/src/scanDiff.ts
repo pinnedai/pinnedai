@@ -248,6 +248,142 @@ export function detectLockfilePins(repoPath: string): LockfilePin[] {
   return found;
 }
 
+// Auto-detect package-exports-exist pins from package.json's `main` /
+// `exports` entry. Conservative: only emits when we can identify both
+// a real entry file AND at least one named export via regex scan.
+// Doesn't try to handle TS re-exports / namespaced exports / default
+// exports — those are the user's responsibility to pin manually with
+// a PR claim.
+export type PackageExportsPin = {
+  template: "package-exports-exist";
+  modulePath: string;
+  exports: string[];
+  suggestedPin: string;
+};
+
+export function detectPackageExportsPins(repoPath: string): PackageExportsPin[] {
+  const out: PackageExportsPin[] = [];
+  const pkgPath = join(repoPath, "package.json");
+  if (!existsSync(pkgPath)) return out;
+  let pkg: Record<string, unknown>;
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  } catch {
+    return out;
+  }
+  // Skip "private" repos that aren't libraries (no public exports to protect).
+  // Most apps set private:true; libraries usually don't.
+  if (pkg.private === true) return out;
+
+  // Resolve the entry file: prefer `exports["."].import`, then
+  // `exports["."].default`, then `main`. Skip if entry is a built
+  // artifact (dist/, build/, lib/) we can't inspect statically —
+  // those don't have inline export declarations.
+  const entryPath = resolveEntryPath(pkg);
+  if (!entryPath) return out;
+
+  // The entry might be a built artifact (./dist/index.js). Look for
+  // the corresponding source file in a few common locations.
+  const sourceCandidates = guessSourcePathsFor(entryPath);
+  let modulePath: string | null = null;
+  for (const candidate of sourceCandidates) {
+    if (existsSync(join(repoPath, candidate))) {
+      modulePath = candidate;
+      break;
+    }
+  }
+  if (!modulePath) return out;
+
+  // Scan named exports via regex. Patterns supported:
+  //   export function foo() { ... }
+  //   export async function foo() { ... }
+  //   export const foo = ...
+  //   export let foo = ...
+  //   export class Foo { ... }
+  //   export { foo, bar } from "..."
+  //   export { foo, bar as baz }
+  // Default + namespace re-exports are not extracted (too risky).
+  const source = readFileSync(join(repoPath, modulePath), "utf8");
+  const names = new Set<string>();
+
+  // Direct declarations
+  const directRegex =
+    /^\s*export\s+(?:async\s+)?(?:function|const|let|var|class)\s+([a-zA-Z_$][\w$]*)/gm;
+  let m: RegExpExecArray | null;
+  while ((m = directRegex.exec(source)) !== null) {
+    names.add(m[1]);
+  }
+
+  // Re-exports: export { foo, bar as baz } [from "..."]
+  const reexportRegex = /^\s*export\s*\{([^}]+)\}/gm;
+  while ((m = reexportRegex.exec(source)) !== null) {
+    const inside = m[1];
+    const parts = inside.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+    for (const part of parts) {
+      // "foo" or "foo as bar" — capture the OUTPUT name (after "as").
+      const asMatch = /^([a-zA-Z_$][\w$]*)\s+as\s+([a-zA-Z_$][\w$]*)$/.exec(part);
+      if (asMatch) {
+        names.add(asMatch[2]);
+        continue;
+      }
+      const plainMatch = /^([a-zA-Z_$][\w$]*)$/.exec(part);
+      if (plainMatch) names.add(plainMatch[1]);
+    }
+  }
+
+  if (names.size === 0) return out;
+
+  const sortedExports = [...names].sort();
+  out.push({
+    template: "package-exports-exist",
+    modulePath,
+    exports: sortedExports,
+    suggestedPin: `package exports stay intact from ${modulePath}: ${sortedExports.slice(0, 3).join(", ")}${sortedExports.length > 3 ? "..." : ""}`,
+  });
+  return out;
+}
+
+function resolveEntryPath(pkg: Record<string, unknown>): string | null {
+  const exportsField = pkg.exports;
+  if (exportsField && typeof exportsField === "object" && !Array.isArray(exportsField)) {
+    const rootExport = (exportsField as Record<string, unknown>)["."];
+    if (typeof rootExport === "string") return rootExport;
+    if (rootExport && typeof rootExport === "object" && !Array.isArray(rootExport)) {
+      const r = rootExport as Record<string, unknown>;
+      if (typeof r.import === "string") return r.import;
+      if (typeof r.default === "string") return r.default;
+      if (typeof r.require === "string") return r.require;
+    }
+  }
+  if (typeof pkg.main === "string") return pkg.main;
+  if (typeof pkg.module === "string") return pkg.module;
+  return null;
+}
+
+// Given a built-artifact entry like "./dist/index.js", guess where
+// the source file is. Returns paths relative to the repo root. Most
+// packages map dist → src in a 1:1 directory layout.
+function guessSourcePathsFor(entryPath: string): string[] {
+  const stripped = entryPath.replace(/^\.\//, "");
+  const candidates = new Set<string>();
+  candidates.add(stripped);
+  // Common: dist/foo.js → src/foo.ts / src/foo.tsx / src/foo.mjs
+  for (const ext of [".ts", ".tsx", ".mjs", ".js"]) {
+    candidates.add(
+      stripped
+        .replace(/^dist\//, "src/")
+        .replace(/^build\//, "src/")
+        .replace(/^lib\//, "src/")
+        .replace(/\.(?:js|mjs|cjs|d\.ts)$/, ext)
+    );
+  }
+  // No-dist case: keep as-is
+  for (const ext of [".ts", ".tsx", ".mjs"]) {
+    candidates.add(stripped.replace(/\.js$/, ext));
+  }
+  return [...candidates];
+}
+
 // Well-known config invariants the detector emits as auto-pins at
 // baseline-on-init. Conservative whitelist: each entry has a real,
 // load-bearing reason to exist. Adding to this list = a pin every

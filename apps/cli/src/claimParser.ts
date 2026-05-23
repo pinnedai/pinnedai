@@ -93,6 +93,31 @@ export type CliFlagSupportedClaim = {
   raw: string;
 };
 
+// Package-exports-exist claim. Asserts that the package's main /
+// exports entry continues to export named symbols. Catches AI agents
+// that rename, delete, or relocate exported library functions —
+// breaking change for downstream consumers, hard to spot in a diff.
+//
+// Implementation: the generated test `await import()`s the package
+// (or the modulePath if specified) and asserts that each named export
+// is present and is a function / object / value (i.e., `typeof export
+// !== "undefined"`). It does NOT call the function or assert return
+// values — that's what library-returns is for.
+//
+// Auto-pinnable at baseline-on-init: walks package.json's `main` /
+// `exports` / `module` entries, imports them, captures the named
+// exports at install time, emits one pin per group.
+export type PackageExportsClaim = {
+  template: "package-exports-exist";
+  // Repo-relative path to the module file (e.g. "src/index.ts").
+  // Test will dynamic-import this path; must resolve from cwd.
+  modulePath: string;
+  // Named exports that must be present. Each one becomes an
+  // assertion: typeof mod[name] !== "undefined".
+  exports: string[];
+  raw: string;
+};
+
 // Config-invariant claim. Asserts that a target file CONTAINS a
 // specific substring or matches a literal text rule. Single-purpose
 // template for catching AI-driven config drift — "AI cleaned up
@@ -240,7 +265,8 @@ export type Claim =
   | CliFlagSupportedClaim
   | LibraryReturnsClaim
   | ConfigInvariantClaim
-  | LockfileIntegrityClaim;
+  | LockfileIntegrityClaim
+  | PackageExportsClaim;
 
 // A route token: must start with ASCII `/`, must not contain whitespace,
 // trailing punctuation, OR dangerous Unicode characters (RTL-override,
@@ -1211,6 +1237,12 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         promise: `\`${c.configPath}\` continues to contain the expected ${c.label} block — catches AI agents that "tidy" config and remove load-bearing lines.`,
         check: `Reads \`${c.configPath}\`, asserts the required text is present (substring match).`,
       };
+    case "package-exports-exist":
+      return {
+        title: `\`${c.modulePath}\` keeps exporting ${c.exports.length} symbol${c.exports.length === 1 ? "" : "s"}`,
+        promise: `\`${c.modulePath}\` continues to export: ${c.exports.join(", ")} — catches accidental renames / deletions in the public API.`,
+        check: `Dynamic-imports \`${c.modulePath}\`, asserts every name in [${c.exports.join(", ")}] is defined (\`typeof export !== "undefined"\`).`,
+      };
   }
 }
 
@@ -1312,6 +1344,8 @@ export function badCaseForClaim(claim: Claim): string {
       return `\`${claim.lockfilePath}\` SHA-256 changed (lockfile was regenerated or hand-edited; transitive deps may have shifted)`;
     case "config-invariant":
       return `${claim.label} block was removed from \`${claim.configPath}\` (likely AI "cleanup" that dropped a load-bearing config)`;
+    case "package-exports-exist":
+      return `\`${claim.modulePath}\` no longer exports one of [${claim.exports.join(", ")}] — a public-API symbol was renamed, deleted, or relocated`;
   }
 }
 
@@ -1371,6 +1405,7 @@ export function claimRoute(c: Claim): string | null {
     case "library-returns":
     case "lockfile-integrity":
     case "config-invariant":
+    case "package-exports-exist":
       return null;
   }
 }
@@ -1393,7 +1428,9 @@ export function claimSlug(claim: Claim): string {
         ? `lockfile-${claim.lockfilePath}-${claim.expectedSha256.slice(0, 12)}`
         : claim.template === "config-invariant"
           ? `config-${claim.configPath}-${claim.label}`
-          : claim.route;
+          : claim.template === "package-exports-exist"
+            ? `exports-${claim.modulePath}`
+            : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -1458,6 +1495,10 @@ export function claimKey(c: Claim): string {
       // Hash the expected substring so two pins on the same config
       // file with different required content don't collapse.
       return `config-invariant:${c.configPath}:${c.label}`;
+    case "package-exports-exist":
+      // Same module + different export sets stay distinct (lets a
+      // user pin core exports separately from utility exports).
+      return `package-exports-exist:${c.modulePath}:${[...c.exports].sort().join(",")}`;
   }
 }
 

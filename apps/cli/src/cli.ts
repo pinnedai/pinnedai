@@ -634,6 +634,10 @@ program
     "Auto-protect mode: safe | ask | off (default: prompt on TTY, 'safe' otherwise)"
   )
   .option(
+    "--http <mode>",
+    "HTTP-pin verification mode: local | preview | off (default: prompt on TTY, auto-detect from scripts.dev in --auto, 'off' in non-TTY)"
+  )
+  .option(
     "--auto",
     "Non-interactive: enable everything (safe mode + hooks + statusline + AI rules)."
   )
@@ -861,6 +865,16 @@ program
     }
     } // end if (!opts.plan)
 
+    // Resolve HTTP-pin verification mode BEFORE writing the config.
+    // For auto setupMode + no --http flag, picks "local" if scripts.dev
+    // is detected, else "off". For manual, asks the 3-option prompt.
+    // For non-TTY without --http, stays "off".
+    const httpResolution = await resolveHttpConfig({
+      setupMode,
+      cwd,
+      cliOverride: (opts as { http?: string }).http,
+    });
+
     const existingConfig = existsSync(join(cwd, ".pinnedai", "config.json"));
     // --plan: bail BEFORE any writes happen. We've already detected
     // setupMode + auto-protect mode + isGitHubRepo above; that's
@@ -869,9 +883,16 @@ program
     if (opts.plan) {
       // Plan section below runs; we fall through to it.
     } else if (!existingConfig || opts.force) {
-      const cfg: PinnedConfig = { ...DEFAULT_CONFIG, auto_protect: mode };
+      const cfg: PinnedConfig = {
+        ...DEFAULT_CONFIG,
+        auto_protect: mode,
+        http: httpResolution.http,
+      };
       writeConfig(cwd, cfg);
       out(`+ .pinnedai/config.json (${modeLabel(mode)})`);
+      // One line summarizing the HTTP-mode choice so the user knows
+      // what was set without reading the config file.
+      out(`  ${httpResolution.explainLine}`);
     } else {
       out(`= .pinnedai/config.json (exists, skipping — pass --force to overwrite)`);
     }
@@ -1271,7 +1292,7 @@ program
         // pins from package.json bin entries. We prepend these to the
         // safe[] list so they win the per-template dedup against any
         // overlapping route-based suggestions.
-        const { detectCliLibraryPins, detectLockfilePins, detectConfigInvariantPins } = await import("./scanDiff.js");
+        const { detectCliLibraryPins, detectLockfilePins, detectConfigInvariantPins, detectPackageExportsPins } = await import("./scanDiff.js");
         try {
           const cliLibPins = detectCliLibraryPins(cwd);
           for (const p of cliLibPins) {
@@ -1325,6 +1346,41 @@ program
           }
         } catch (e) {
           out(`  ! config-invariant pin detection failed: ${(e as Error).message}`);
+        }
+
+        // Package-exports-exist pins — emitted when package.json
+        // resolves to a buildable entry file with detectable named
+        // exports. Bypasses parseClaims (no natural-English form).
+        try {
+          const exportPins = detectPackageExportsPins(cwd);
+          for (const exp of exportPins) {
+            const claim = {
+              template: "package-exports-exist" as const,
+              modulePath: exp.modulePath,
+              exports: exp.exports,
+              raw: `package-exports-exist ${exp.modulePath} exports ${exp.exports.length}`,
+            };
+            const gen = generateTest(claim, { prId });
+            const target = join(pinnedDir, gen.filename);
+            try {
+              assertInsideDir(target, pinnedDir);
+              writeFileSync(target, gen.content, { flag: "wx" });
+              registry = addEntry(registry, {
+                claimId: gen.claimId,
+                prId,
+                claim,
+                filename: gen.filename,
+              });
+              baselineAutoAdded += 1;
+              baselineAddedSummaries.push(summarizeClaimForBanner(claim));
+            } catch (e) {
+              if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+                out(`  ! package-exports pin failed for ${gen.filename}: ${(e as Error).message}`);
+              }
+            }
+          }
+        } catch (e) {
+          out(`  ! package-exports detection failed: ${(e as Error).message}`);
         }
 
         // Lockfile-integrity pins bypass the suggestion→parseClaims
@@ -1722,6 +1778,171 @@ async function writeAgentRulesBlock(
 // "auto" means: safe auto-protect + pre-commit hook + pre-push hook +
 // Claude statusline + AI-coder rules. "manual" falls through to the
 // individual prompts for each piece.
+// Resolve the HTTP-pin verification mode. Three sources, in priority:
+//   1. --http <mode> CLI flag (CI / scripted installs)
+//   2. Auto-mode smart default: if package.json declares scripts.dev,
+//      use "local" mode with that script. Otherwise, "off" (HTTP pins
+//      saved but skipped until the user wires preview-URL).
+//   3. Manual mode: ask the user (local / preview / skip).
+//
+// Returns the resolved HttpConfig + a one-line explanation suitable
+// for the post-init banner ("HTTP testing: local mode (uses `npm run
+// dev`)") so the user knows what was picked.
+type HttpResolution = {
+  http: typeof DEFAULT_CONFIG.http;
+  explainLine: string;
+};
+
+async function resolveHttpConfig(opts: {
+  setupMode: "auto" | "manual";
+  cwd: string;
+  cliOverride?: string;
+}): Promise<HttpResolution> {
+  // 1. CLI flag override.
+  if (opts.cliOverride) {
+    const mode = opts.cliOverride.toLowerCase();
+    if (mode !== "local" && mode !== "preview" && mode !== "off") {
+      err(`✗ Invalid --http '${opts.cliOverride}'. Use: local | preview | off\n`);
+      process.exit(1);
+    }
+    return resolveHttpDefaults(mode as "local" | "preview" | "off", opts.cwd);
+  }
+
+  // 2. Auto-mode smart default.
+  if (opts.setupMode === "auto") {
+    return resolveHttpDefaults("auto-detect", opts.cwd);
+  }
+
+  // 3. Non-TTY without an explicit flag → keep HTTP off (CI safety).
+  if (!process.stdin.isTTY) {
+    return resolveHttpDefaults("off", opts.cwd);
+  }
+
+  // 4. Manual mode interactive prompt.
+  const detected = detectDevScript(opts.cwd);
+  const choice = await promptHttpMode(detected);
+  return resolveHttpDefaults(choice, opts.cwd);
+}
+
+function resolveHttpDefaults(
+  mode: "local" | "preview" | "off" | "auto-detect",
+  cwd: string
+): HttpResolution {
+  if (mode === "auto-detect") {
+    const detected = detectDevScript(cwd);
+    if (detected) {
+      return {
+        http: {
+          mode: "local",
+          start: detected.startCmd,
+          url: detected.guessedUrl,
+          ready_path: "/",
+          timeout_seconds: 60,
+        },
+        explainLine: `HTTP testing: local mode (will spawn \`${detected.startCmd}\` when you run \`pinned test\`)`,
+      };
+    }
+    return {
+      http: { ...DEFAULT_CONFIG.http, mode: "off" },
+      explainLine: `HTTP testing: off (no \`scripts.dev\` in package.json — HTTP pins will skip until you set PREVIEW_URL or enable local mode)`,
+    };
+  }
+  if (mode === "local") {
+    const detected = detectDevScript(cwd);
+    const start = detected?.startCmd ?? "npm run dev";
+    const url = detected?.guessedUrl ?? "http://localhost:3000";
+    return {
+      http: { mode: "local", start, url, ready_path: "/", timeout_seconds: 60 },
+      explainLine: `HTTP testing: local mode (will spawn \`${start}\` when you run \`pinned test\`)`,
+    };
+  }
+  if (mode === "preview") {
+    return {
+      http: { ...DEFAULT_CONFIG.http, mode: "preview" },
+      explainLine: `HTTP testing: preview mode (set PREVIEW_URL in your CI to the deploy URL)`,
+    };
+  }
+  return {
+    http: { ...DEFAULT_CONFIG.http, mode: "off" },
+    explainLine: `HTTP testing: off (HTTP pins will skip until you configure)`,
+  };
+}
+
+// Sniff package.json for a `scripts.dev` (or `scripts.start`) entry +
+// guess the default port for the detected framework. Returns null when
+// no usable script is found.
+function detectDevScript(
+  cwd: string
+): { startCmd: string; guessedUrl: string } | null {
+  const pkgPath = join(cwd, "package.json");
+  if (!existsSync(pkgPath)) return null;
+  let pkg: Record<string, unknown>;
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  } catch {
+    return null;
+  }
+  const scripts = (pkg.scripts ?? {}) as Record<string, string | undefined>;
+  const dev = scripts.dev ?? scripts.start;
+  if (!dev) return null;
+  // Pick a default port by framework heuristic:
+  //   - Vite (5173), Astro (4321), Hono (3000), Next.js (3000),
+  //     SvelteKit (5173), Remix (3000), Nuxt (3000)
+  // Conservative default: 3000.
+  const deps = {
+    ...(pkg.dependencies as Record<string, unknown> | undefined),
+    ...(pkg.devDependencies as Record<string, unknown> | undefined),
+  } as Record<string, unknown>;
+  let port = 3000;
+  if (deps.vite || deps["@sveltejs/kit"]) port = 5173;
+  if (deps.astro) port = 4321;
+  return {
+    startCmd: "npm run dev",
+    guessedUrl: `http://localhost:${port}`,
+  };
+}
+
+async function promptHttpMode(
+  detected: { startCmd: string; guessedUrl: string } | null
+): Promise<"local" | "preview" | "off"> {
+  const detectedLine = detected
+    ? `\n     Detected: \`${detected.startCmd}\` → ${detected.guessedUrl}`
+    : "";
+  process.stdout.write(
+    [
+      "",
+      "How should Pinned test HTTP pins?",
+      "",
+      `  1. Use my local dev server (recommended for solo work)${detectedLine}`,
+      "       Pinned will spawn `npm run dev` during `pinned test`, run pins",
+      "       against it, then shut down the process it started.",
+      "",
+      "  2. Use a preview URL (recommended in CI)",
+      "       Set PREVIEW_URL in your CI to the PR's preview deploy. Pinned",
+      "       runs pins against that URL.",
+      "",
+      "  3. Skip for now",
+      "       HTTP pins get created but stay 'not verified' until you set",
+      "       PREVIEW_URL or enable local mode later.",
+      "",
+      "  > ",
+    ].join("\n")
+  );
+  return new Promise((resolve) => {
+    const onData = (chunk: Buffer | string) => {
+      const raw = (typeof chunk === "string" ? chunk : chunk.toString("utf8")).trim().toLowerCase();
+      process.stdin.removeListener("data", onData);
+      process.stdin.pause();
+      if (raw === "" || raw === "1" || raw.startsWith("l")) return resolve("local");
+      if (raw === "2" || raw.startsWith("p")) return resolve("preview");
+      if (raw === "3" || raw.startsWith("s") || raw === "n" || raw.startsWith("no")) return resolve("off");
+      return resolve("local");
+    };
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+  });
+}
+
 async function promptSetupMode(): Promise<"auto" | "manual"> {
   process.stdout.write(
     [
@@ -1739,6 +1960,9 @@ async function promptSetupMode(): Promise<"auto" | "manual"> {
       "       · Initial baseline scan of your CURRENT code → propose 5-15 candidate pins (admin routes,",
       "         webhooks, env files). High-confidence ones get auto-added; ambiguous ones are surfaced",
       "         for you to review via `pinned protect`. (Does NOT read PR history.)",
+      "       · Smart HTTP mode: if your repo has `scripts.dev` in package.json, Pinned will spawn",
+      "         it during `pinned test` to verify HTTP pins locally. No PR-preview infrastructure",
+      "         needed. (Never runs from statusline / chat hook — only `pinned test`.)",
       "",
       "       Nothing is irreversible. Each piece can be removed later.",
       "",
@@ -1818,6 +2042,8 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `dependency lockfile`;
     case "config-invariant":
       return humanizeConfigLabel(claim.label, claim.configPath);
+    case "package-exports-exist":
+      return `\`${claim.modulePath}\` keeps exporting ${claim.exports.length} symbol${claim.exports.length === 1 ? "" : "s"}`;
   }
 }
 
@@ -5051,6 +5277,8 @@ function describeClaim(c: Claim): string {
       return `lockfile       ${c.lockfilePath}  →  sha256 ${c.expectedSha256.slice(0, 12)}…`;
     case "config-invariant":
       return `config         ${c.configPath}  →  ${c.label} present`;
+    case "package-exports-exist":
+      return `pkg-exports    ${c.modulePath}  →  exports [${c.exports.join(", ")}]`;
   }
 }
 

@@ -227,6 +227,8 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       return { files: [claim.lockfilePath] };
     case "config-invariant":
       return { files: [claim.configPath] };
+    case "package-exports-exist":
+      return { files: [claim.modulePath] };
     case "cli-output-contains":
     case "cli-exits-zero":
     case "cli-creates-file":
@@ -373,6 +375,8 @@ function claimLabel(c: Claim): string {
       return `\`lockfile ${escapeMarkdownCell(c.lockfilePath)}\` (sha256: \`${c.expectedSha256.slice(0, 12)}…\`)`;
     case "config-invariant":
       return `\`config ${escapeMarkdownCell(c.label)}\` in \`${escapeMarkdownCell(c.configPath)}\``;
+    case "package-exports-exist":
+      return `\`exports ${escapeMarkdownCell(c.modulePath)}\` (${c.exports.length} symbol${c.exports.length === 1 ? "" : "s"})`;
   }
 }
 
