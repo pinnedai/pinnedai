@@ -4075,6 +4075,7 @@ program
     if (!existsSync(opts.dir)) mkdirSync(opts.dir, { recursive: true });
     const prId = `auto-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}`;
 
+    const addedSummariesAP: string[] = [];
     for (const cand of gated.autoAdd) {
       const gen = generateTest(cand.claim, { prId });
       const target = join(opts.dir, gen.filename);
@@ -4089,6 +4090,7 @@ program
           filename: gen.filename,
         });
         written += 1;
+        addedSummariesAP.push(summarizeClaimForBanner(cand.claim));
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code === "EEXIST") {
           continue; // already pinned — silent
@@ -4117,6 +4119,8 @@ program
       totalPins: countActivePins(registry),
       recentlyAddedCount: written > 0 ? written : prev?.recentlyAddedCount,
       recentlyAddedAt: written > 0 ? new Date().toISOString() : prev?.recentlyAddedAt,
+      recentlyAddedSummaries:
+        written > 0 ? addedSummariesAP.slice(0, 5) : prev?.recentlyAddedSummaries,
       suggestedCount,
       lastCheckedSha: sha ?? undefined,
       lastCheckedDirtyHash: dirtyHash ?? undefined,
@@ -4124,12 +4128,22 @@ program
     });
 
     out("");
-    if (written > 0 && suggestedCount > 0) {
-      out(
-        `✓ Auto-added ${written} pin${written === 1 ? "" : "s"}. ${suggestedCount} more suggested — run \`pinned protect\` to review.`
-      );
-    } else if (written > 0) {
-      out(`✓ Auto-added ${written} pin${written === 1 ? "" : "s"}.`);
+    if (written > 0) {
+      // Name the added pins so the user sees what they got, not just
+      // a count. Same pattern as init's success banner.
+      out(`★ Pinned now protects ${written} more thing${written === 1 ? "" : "s"}:`);
+      for (const s of addedSummariesAP.slice(0, 5)) {
+        out(`   + ${s}`);
+      }
+      if (addedSummariesAP.length > 5) {
+        out(`   + …and ${addedSummariesAP.length - 5} more`);
+      }
+      if (suggestedCount > 0) {
+        out("");
+        out(
+          `   ${suggestedCount} more pin${suggestedCount === 1 ? "" : "s"} suggested — run \`pinned protect\` to review.`
+        );
+      }
     } else if (suggestedCount > 0) {
       out(
         `${suggestedCount} pin${suggestedCount === 1 ? "" : "s"} suggested — run \`pinned protect\` to review.`

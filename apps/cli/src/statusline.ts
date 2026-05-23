@@ -141,10 +141,13 @@ export type CatchRecord = {
 
 export const CATCH_HISTORY_LIMIT = 50;
 
-// Auto-protect surface decay windows. Kept short so the statusline
-// returns to the stable "✓ N pins" baseline quickly — the celebration
-// is meant to be noticed, not lived in.
-export const RECENTLY_ADDED_TTL_MS = 2 * 60 * 1000; // 2 minutes
+// Multi-line "Pinned added N protections" celebration TTL — the
+// expanded bullet view collapses back to a one-line steady state
+// after this window. 3 minutes balances "long enough to notice on a
+// casual glance" with "doesn't dominate the statusline as static
+// info." Single-line fallback shows under the same window when no
+// summaries are available.
+export const RECENTLY_ADDED_TTL_MS = 3 * 60 * 1000; // 3 minutes
 export const RECENTLY_CAUGHT_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Chat-hook auto-protect throttle. The UserPromptSubmit hook fires
@@ -442,9 +445,11 @@ export function formatStatusline(opts: {
     return `${prefix} · ${totalPins} pins · ${c.yellow}⚠ ${lastStatus.safetyNotes} notes${c.reset}`;
   }
   // 5. Recently added — transient celebration of auto-protect work.
-  // Decays after RECENTLY_ADDED_TTL_MS. Format: "+N pins · M total"
-  // (per the launch UX spec — shows both the delta AND the new total
-  // so the growth feels concrete).
+  // Emit a multi-line banner during the celebration window so users
+  // SEE what was added, not just an abstract count. Claude Code
+  // renders multi-line statusline output across multiple lines; VS
+  // Code's status bar truncates to the first line (acceptable
+  // fallback — the first line still names a pin).
   if (
     typeof lastStatus.recentlyAddedCount === "number" &&
     lastStatus.recentlyAddedCount > 0 &&
@@ -453,10 +458,32 @@ export function formatStatusline(opts: {
     const age = now - new Date(lastStatus.recentlyAddedAt).getTime();
     if (Number.isFinite(age) && age >= 0 && age < RECENTLY_ADDED_TTL_MS) {
       const n = lastStatus.recentlyAddedCount;
-      // Single transient prefix replaces the standard "N pins ·" prefix
-      // for the duration of the celebration.
-      const label = `${c.green}+${n} pin${n === 1 ? "" : "s"}${c.reset} · ${totalPins} total`;
-      return `${prefix} · ${label}`;
+      const summaries = lastStatus.recentlyAddedSummaries ?? [];
+      if (summaries.length > 0) {
+        // Multi-line transient celebration. Per GPT's "multi-line for
+        // celebration, never for steady state" rule:
+        //   - Line 1 alone is still useful if a single-line surface
+        //     (VS Code status bar) truncates it.
+        //   - Bullets cap at 3 (GPT-recommended balance: enough to
+        //     show value, not enough to dominate the chat surface).
+        //   - No footer here — the chat hook + init banner carry the
+        //     explanatory text. Statusline stays terse.
+        const lines: string[] = [
+          `${prefix} · ${c.green}★ Pinned added ${n} protection${n === 1 ? "" : "s"}${c.reset}`,
+        ];
+        const MAX_BULLETS = 3;
+        const visible = summaries.slice(0, MAX_BULLETS);
+        const rest = summaries.length - visible.length;
+        for (const s of visible) {
+          lines.push(`   ${c.green}+${c.reset} ${s}`);
+        }
+        if (rest > 0) {
+          lines.push(`   ${c.green}+${c.reset} …and ${rest} more`);
+        }
+        return lines.join("\n");
+      }
+      // No summaries available (older cache) — fall back to count.
+      return `${prefix} · ${c.green}★ Pinned added ${n} protection${n === 1 ? "" : "s"}${c.reset}`;
     }
   }
   // 6. Suggested pins — surfaced ONLY in ask mode. In safe mode, the
@@ -585,16 +612,19 @@ export function formatFailureHook(lastStatus: LastStatus | null): string {
 }
 
 function addCelebrationMessage(n: number, summaries: string[]): string {
-  // Same shape as init's banner — one header line naming what Pinned
-  // does, one short footer naming the consequence. The bullets
-  // describe WHAT each pin protects (not "+N pins" abstract count).
+  // Same shape as init's terminal banner — header naming what
+  // happened, bullets naming the subjects protected, footer naming
+  // the consequence. The chat hook is "terminal-class" output (per
+  // user feedback distinguishing it from the more compact statusline
+  // surface), so the explanatory footer DOES belong here — it's not
+  // the cramped status bar.
   //
   // Caps the visible list at MAX_VISIBLE so a 10-pin batch doesn't
-  // dominate the chat turn. AI agents see this output and weave it
+  // dominate the chat turn. AI agents read this output and weave it
   // into their response; keep wording calm and factual.
   const MAX_VISIBLE = 5;
   const lines: string[] = [
-    `★ Pinned added ${n} new thing${n === 1 ? "" : "s"} it'll protect from AI breakage:`,
+    `★ Pinned added ${n} new protection${n === 1 ? "" : "s"}:`,
   ];
   if (summaries.length > 0) {
     const visible = summaries.slice(0, MAX_VISIBLE);
