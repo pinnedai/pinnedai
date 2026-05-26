@@ -295,6 +295,19 @@ program
     printBanner();
     const body = await resolveBody(opts.description);
     if (body == null) {
+      // CI-friendly behavior: when running inside a GitHub Actions
+      // workflow (GITHUB_ACTIONS=true) and the PR body env var IS set
+      // but empty (PR with no description), exit cleanly with zero
+      // claims rather than failing the workflow step. Workflows
+      // shouldn't fail just because a developer opened a PR with no
+      // description.
+      const inCi = process.env.GITHUB_ACTIONS === "true";
+      const prBodyVarPresent = "GITHUB_PR_BODY" in process.env;
+      if (inCi && prBodyVarPresent) {
+        if (opts.json) out("[]");
+        else out("No claims found (empty PR description).");
+        process.exit(0);
+      }
       err(
         "✗ No PR description provided. Pass --description, pipe stdin, set GITHUB_PR_BODY, or run `npx pinnedai try` for a demo.\n"
       );
@@ -6152,24 +6165,38 @@ program
 //     generic "modification" one.
 program
   .command("check-guard-removal", { hidden: true })
-  .description("(internal) Block staged commits that delete/modify/weaken pinned tests.")
+  .description("(internal) Block commits/PRs that delete/modify/weaken pinned tests.")
   .option("--dir <path>", "Pinned tests directory.", "tests/pinned")
+  // --base flips the diff scope from "staged index" (pre-commit hook
+  // context) to "<base>...HEAD" (CI context, after actions/checkout).
+  // In CI the index is empty so the staged diff is always zero —
+  // without --base, the workflow would silently exit 0 and never catch
+  // a `git commit --no-verify` bypass. The generated workflow at
+  // `pinned init` passes --base "origin/<pr.base.ref>".
+  .option(
+    "--base <ref>",
+    "Diff against <ref>...HEAD (CI mode). Default is staged index (hook mode)."
+  )
   .option("--quiet", "Suppress non-error output.")
-  .action(async (opts: { dir: string; quiet?: boolean }) => {
+  .action(async (opts: { dir: string; base?: string; quiet?: boolean }) => {
     if (process.env.PINNEDAI_ALLOW_PIN_EDIT === "1") {
       if (!opts.quiet) out("pinned: PINNEDAI_ALLOW_PIN_EDIT=1 set — guard-removal check bypassed for this commit.");
       process.exit(0);
     }
     const cwd = process.cwd();
-    // Confirm we're in a git repo with a staged index. If not (e.g.,
-    // hook invoked outside git context), exit 0 — nothing to check.
+    // Compute diff scope. CI passes --base; the pre-commit hook does
+    // not. We still emit clean exit 0 when not in a git repo so the
+    // hook entry point never blocks unrelated commits.
     let diffRaw: string;
     try {
-      diffRaw = execFileSync(
-        "git",
-        ["diff", "--cached", "--name-status", "--", `${opts.dir}/`],
-        { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-      );
+      const gitArgs = opts.base
+        ? ["diff", `${opts.base}...HEAD`, "--name-status", "--", `${opts.dir}/`]
+        : ["diff", "--cached", "--name-status", "--", `${opts.dir}/`];
+      diffRaw = execFileSync("git", gitArgs, {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
     } catch {
       process.exit(0);
     }
@@ -6263,16 +6290,21 @@ program
         continue;
       }
       if (e.status === "M") {
-        // Look at staged content for weakening signals. We diff the
-        // staged version against HEAD; if the added lines introduce
-        // .skip / xit / no-op asserts, flag as weakened.
+        // Look at the added lines for weakening signals. Diff scope
+        // mirrors the outer name-status diff: hook mode uses the staged
+        // index, CI mode uses <base>...HEAD. Without this branch CI
+        // would always see an empty diff and skip the weakening check
+        // entirely, silently fail-opening on `--no-verify` bypass PRs.
         let stagedAdded = "";
         try {
-          stagedAdded = execFileSync(
-            "git",
-            ["diff", "--cached", "--unified=0", "--no-color", "--", e.path],
-            { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-          );
+          const diffArgs = opts.base
+            ? ["diff", `${opts.base}...HEAD`, "--unified=0", "--no-color", "--", e.path]
+            : ["diff", "--cached", "--unified=0", "--no-color", "--", e.path];
+          stagedAdded = execFileSync("git", diffArgs, {
+            cwd,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+          });
         } catch {
           /* ignore — fall through to generic modified */
         }
