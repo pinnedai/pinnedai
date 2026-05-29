@@ -1,0 +1,105 @@
+# Daily metrics snapshot — runs scripts/pulse.sh, appends one line to
+# .pulse-log on a long-lived `metrics` branch, and writes the snapshot
+# to the Actions run summary so it's visible in the runs list without
+# needing to clone anything.
+#
+# No customer telemetry — only fetches PUBLIC metrics (npm download
+# stats, Open VSX downloads, GitHub repo stats + traffic, VS Code
+# Marketplace gallery API).
+#
+# Triggers:
+#   - cron: 09:00 UTC every day
+#   - manual: workflow_dispatch (run on demand from Actions tab)
+
+name: pulse
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to commit .pulse-log to the metrics branch
+  # GITHUB_TOKEN gets repo-traffic access automatically because the
+  # workflow runs from inside the repo.
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+
+      - name: Run pulse.sh
+        id: pulse
+        env:
+          # gh CLI is preinstalled on ubuntu-latest runners; auth via
+          # GITHUB_TOKEN gives access to repo stats + traffic endpoints.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x scripts/pulse.sh
+          # JSON snapshot — machine-readable
+          bash scripts/pulse.sh --json > pulse.json
+          # Human-readable for the Actions summary
+          bash scripts/pulse.sh > pulse.txt 2>/dev/null
+          # Echo into the GitHub job summary so it shows up in the run UI
+          {
+            echo "## pulse — $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo '```'
+            cat pulse.txt
+            echo '```'
+            echo ""
+            echo "<details><summary>JSON</summary>"
+            echo ""
+            echo '```json'
+            cat pulse.json
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Append snapshot to metrics branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # Save the snapshot we just produced
+          cp pulse.json /tmp/pulse.json
+          # Identify ourselves for the metrics-branch commit
+          git config user.name "pulse-bot"
+          git config user.email "pulse-bot@users.noreply.github.com"
+
+          # Get to the metrics branch (create if missing — orphan branch
+          # so we don't carry the whole master history)
+          if git ls-remote --exit-code origin metrics >/dev/null 2>&1; then
+            git fetch origin metrics:metrics
+            git checkout metrics
+          else
+            git checkout --orphan metrics
+            git rm -rf . 2>/dev/null || true
+          fi
+
+          # Append today's row to .pulse-log (or create it)
+          DATE_TAG=$(date -u +"%Y-%m-%d")
+          STARS=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['github']['stars'])")
+          OVSX=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['open_vsx']['downloads'])")
+          CLI=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['npm']['pinnedai']['weekly'])")
+          MCP=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['npm']['pinnedai-mcp']['weekly'])")
+          ISSUES=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['github']['open_issues'])")
+          OVSX_VER=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['open_vsx']['version'])")
+
+          echo "${DATE_TAG}|${STARS}|${OVSX}|${CLI}|${MCP}|${ISSUES}|${OVSX_VER}" >> .pulse-log
+
+          # Also stash the JSON for the day (useful for richer dashboards later)
+          mkdir -p snapshots
+          cp /tmp/pulse.json "snapshots/${DATE_TAG}.json"
+
+          git add .pulse-log snapshots/
+          # Skip the commit (and exit 0) if there are no changes —
+          # happens on same-day re-runs via workflow_dispatch.
+          if git diff --cached --quiet; then
+            echo "No changes to commit (probably a same-day re-run)."
+            exit 0
+          fi
+          git commit -m "pulse: ${DATE_TAG}"
+          git push origin metrics
