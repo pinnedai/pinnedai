@@ -1,21 +1,28 @@
-# Daily metrics snapshot — runs scripts/pulse.sh, appends one line to
-# .pulse-log on a long-lived `metrics` branch, and writes the snapshot
-# to the Actions run summary so it's visible in the runs list without
-# needing to clone anything.
+# 6-hourly metrics snapshot — runs scripts/pulse.sh, appends one line
+# to .pulse-log on a long-lived `metrics` branch, and writes the
+# snapshot to the Actions run summary so it's visible in the runs list
+# without needing to clone anything.
+#
+# Why 6 hours: GitHub stars/forks/issues, Open VSX, and GitHub traffic
+# update in near-real-time, so polling 4× per day catches intraday
+# spikes. npm download stats only refresh roughly once per day on
+# npm's side — for those, 6h polling shows the same number 4× then a
+# bump when the daily refresh happens. That's still useful: tells us
+# when the refresh lands.
 #
 # No customer telemetry — only fetches PUBLIC metrics (npm download
 # stats, Open VSX downloads, GitHub repo stats + traffic, VS Code
 # Marketplace gallery API).
 #
 # Triggers:
-#   - cron: 09:00 UTC every day
+#   - cron: 00:00, 06:00, 12:00, 18:00 UTC every day
 #   - manual: workflow_dispatch (run on demand from Actions tab)
 
 name: pulse
 
 on:
   schedule:
-    - cron: "0 9 * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -79,8 +86,11 @@ jobs:
             git rm -rf . 2>/dev/null || true
           fi
 
-          # Append today's row to .pulse-log (or create it)
+          # Append this run's row to .pulse-log. Timestamp uses UTC ISO
+          # hour-precision so 4 daily runs become 4 distinct rows.
+          TS_TAG=$(date -u +"%Y-%m-%dT%H:%MZ")
           DATE_TAG=$(date -u +"%Y-%m-%d")
+          HOUR_TAG=$(date -u +"%H%M")
           STARS=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['github']['stars'])")
           OVSX=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['open_vsx']['downloads'])")
           CLI=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['npm']['pinnedai']['weekly'])")
@@ -88,11 +98,13 @@ jobs:
           ISSUES=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['github']['open_issues'])")
           OVSX_VER=$(python3 -c "import json; print(json.load(open('/tmp/pulse.json'))['open_vsx']['version'])")
 
-          echo "${DATE_TAG}|${STARS}|${OVSX}|${CLI}|${MCP}|${ISSUES}|${OVSX_VER}" >> .pulse-log
+          echo "${TS_TAG}|${STARS}|${OVSX}|${CLI}|${MCP}|${ISSUES}|${OVSX_VER}" >> .pulse-log
 
-          # Also stash the JSON for the day (useful for richer dashboards later)
+          # Stash the full JSON for this run. Filename includes the
+          # hour so 4 daily runs become 4 distinct files instead of
+          # overwriting each other.
           mkdir -p snapshots
-          cp /tmp/pulse.json "snapshots/${DATE_TAG}.json"
+          cp /tmp/pulse.json "snapshots/${DATE_TAG}-${HOUR_TAG}.json"
 
           git add .pulse-log snapshots/
           # Skip the commit (and exit 0) if there are no changes —
