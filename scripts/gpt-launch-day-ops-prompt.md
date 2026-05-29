@@ -70,7 +70,7 @@ Bias toward **silent service degradation** and **billing/quota leakage** — bot
 
 **GitHub Action ecosystem:**
 - A customer's GitHub Action runner is on a fork of our action (e.g., `pinnedai/pinnedai-action@some-commit-sha`) that doesn't have v1's bug fix. They report "Pinned is broken" but we ship the latest. How do we detect this?
-- GitHub Marketplace listing review pending (or rejected). Our docs say `pinnedai/pinnedai-action@v1` but customers can't install it. Fallback documentation path?
+- GitHub Marketplace listing review pending (or rejected). Our docs say `pinnedai/pinnedai@v0.1.0` but customers can't install it. Fallback documentation path?
 - GitHub OIDC outage for ~1 hour. Our Worker rejects ALL JWTs. No customer can install. What's the customer-facing error message and the support path?
 
 **Domain / DNS:**

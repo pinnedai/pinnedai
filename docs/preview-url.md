@@ -288,4 +288,4 @@ If your repo is CLI-only or library-only, you're set — Pinned protects what yo
 ## Still stuck?
 
 - File an issue at https://github.com/pinnedai/pinnedai/issues with your stack details
-- The Pinned action source is at https://github.com/pinnedai/pinnedai-action — PRs welcome for additional preview-platform examples
+- The Pinned action source is at https://github.com/pinnedai/pinnedai — PRs welcome for additional preview-platform examples

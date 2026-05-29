@@ -207,7 +207,7 @@ permissions:
   id-token: write   # required for OIDC
 
 steps:
-  - uses: pinnedai/pinnedai-action@v1
+  - uses: pinnedai/pinnedai@v0.1.0
 ```
 
 The Worker validates the OIDC JWT, extracts the `repository_owner` claim cryptographically, and meters the org's monthly LLM-call quota in D1. **No API key, no signup, no secret to manage.**
@@ -262,4 +262,4 @@ If you want zero LLM cost, set the repo variable `PINNEDAI_DISABLE_LLM=1`. Claim
 
 - File an issue at https://github.com/pinnedai/pinnedai/issues with your CI provider + a minimal reproduction
 - Run `npx pinnedai doctor` and paste the output
-- The Pinned action source is at https://github.com/pinnedai/pinnedai-action — PRs welcome for additional CI examples
+- The Pinned action source is at https://github.com/pinnedai/pinnedai — PRs welcome for additional CI examples
