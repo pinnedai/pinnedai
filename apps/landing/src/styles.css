@@ -1856,3 +1856,118 @@ html { scroll-behavior: smooth; }
 /* nav-active styling */
 .nav-active { color: var(--text) !important; font-weight: 600; }
 
+
+/* ═══════════════════════════════════════════════════════════════
+   Mobile top-half polish — fixes hero / terminal-card / loop /
+   nav cramping at iPhone-size viewports. Bottom half already works.
+   ═══════════════════════════════════════════════════════════════ */
+
+@media (max-width: 600px) {
+  /* Tighter container padding + section padding above the fold */
+  .container { padding: 0 16px; }
+  .hero {
+    padding-top: 32px !important;
+    padding-bottom: 32px !important;
+  }
+  .proof-strip {
+    padding: 36px 0 !important;
+  }
+
+  /* Nav: shrink CTA so brand + CTA fit comfortably at 390px */
+  .nav-inner { gap: 8px; padding-top: 10px; padding-bottom: 10px; }
+  .nav-brand { font-size: 0.95rem; }
+  .nav-cta {
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    margin-left: auto;
+  }
+
+  /* Hero text — tighter type scale on phones */
+  .hero-copy h1 {
+    font-size: 1.85rem;
+    line-height: 1.1;
+    margin: 10px 0 12px;
+  }
+  .hero-sub {
+    font-size: 0.98rem;
+    margin-bottom: 12px;
+  }
+  .hero-sub-2 { margin-bottom: 14px; }
+  .status-pill {
+    font-size: 0.72rem;
+    padding: 4px 10px;
+  }
+  .hero-grid { gap: 24px; }
+
+  /* The product loop strip — was monospace one-line, now breaks
+     onto its own logical lines for readability. */
+  .loop {
+    font-size: 0.78rem;
+    padding: 10px 12px;
+    line-height: 1.7;
+    word-spacing: 0;
+  }
+  .loop-arrow {
+    margin: 0 4px;
+  }
+
+  /* CTA row stacks vertically on tiny screens */
+  .hero-cta-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .cta {
+    padding: 11px 16px;
+    font-size: 0.95rem;
+    text-align: center;
+  }
+
+  /* Terminal card — shrink chrome + body so the pre-formatted
+     text fits in a 390px viewport without horizontal scroll. */
+  .terminal-card {
+    margin-left: -4px;
+    margin-right: -4px;
+  }
+  .terminal-bar { padding: 10px 12px; }
+  .terminal-title { font-size: 0.72rem; }
+  .terminal-body {
+    padding: 12px 14px 14px;
+    font-size: 0.70rem;
+    line-height: 1.6;
+    /* Keep overflow-x: auto from the base rule — long lines
+       still scroll horizontally rather than break the layout. */
+  }
+
+  /* Proof strip — tighter cards */
+  .proof-stat { padding: 16px 12px; }
+  .proof-num { font-size: 1.6rem; }
+  .proof-text { font-size: 0.82rem; }
+  .proof-label { font-size: 0.72rem; margin-bottom: 18px; }
+
+  /* Quick-start (2-step) — shrink cards on phones */
+  .quick-step {
+    padding: 20px 18px;
+  }
+  .quick-step h3 { font-size: 1.05rem; }
+  .quick-step-cmd {
+    font-size: 0.78rem;
+    padding: 10px 12px;
+    overflow-x: auto;
+  }
+
+  /* Welcome banner — keep, but slim it down */
+  .welcome-banner {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+}
+
+/* Very small phones (<360px) — pixel iPhone SE class */
+@media (max-width: 380px) {
+  .hero-copy h1 { font-size: 1.65rem; }
+  .terminal-body { font-size: 0.65rem; }
+  .nav-cta { padding: 6px 10px; font-size: 0.82rem; }
+}
+
