@@ -44,6 +44,8 @@ when new things come up; strike through when done.
   - awesome-vscode (for the extension)
   - awesome-nodejs (CI/testing section)
 
+- [ ] **Submit `pinnedai-mcp` to Glama MCP registry** at https://glama.ai/mcp/servers — gets you the score badge that most awesome-mcp-servers entries display. Same maintainer (`punkpeye`) runs both. Apply *after* the awesome-mcp-servers PR lands so the badge already exists when reviewed.
+
 - [ ] **One thoughtful Reddit/Discord reply per week** to recent posts
       about AI-coder regressions. Set Google Alert for "Claude Code
       bug" / "Cursor regression" / "AI rewrote my test".
