@@ -436,8 +436,9 @@ npx pinnedai audit --learned`}</pre>
               <WaitlistForm />
             </div>
             <div className="tier">
-              <div className="tier-name">Team</div>
-              <div className="tier-price">$199<span>/mo</span></div>
+              <div className="tier-name">Team <span className="tier-badge">gauging interest</span></div>
+              <div className="tier-price">tbd<span> · gauging interest</span></div>
+              <div className="tier-subtitle">If your team would want this, tell us — we're building toward it but haven't shipped yet.</div>
               <ul>
                 <li>Org-wide policies</li>
                 <li>Audit log</li>
@@ -446,8 +447,9 @@ npx pinnedai audit --learned`}</pre>
               </ul>
             </div>
             <div className="tier">
-              <div className="tier-name">Enterprise</div>
-              <div className="tier-price">$20K+<span>/yr</span></div>
+              <div className="tier-name">Enterprise <span className="tier-badge">gauging interest</span></div>
+              <div className="tier-price">tbd<span> · gauging interest</span></div>
+              <div className="tier-subtitle">For compliance-heavy orgs (SOC 2 / ISO / FedRAMP). Reach out if this is on your roadmap.</div>
               <ul>
                 <li>Self-hosted runner</li>
                 <li>SSO</li>

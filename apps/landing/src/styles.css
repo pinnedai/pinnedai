@@ -2041,3 +2041,42 @@ html { scroll-behavior: smooth; }
   }
 }
 
+
+/* ═══════════════════════════════════════════════════════════════
+   Mobile overflow fixes — round 3: terminal-card was forcing the
+   single-column grid wider than viewport, pushing everything
+   (including the h1) past the visible right edge.
+   ═══════════════════════════════════════════════════════════════ */
+
+@media (max-width: 900px) {
+  .hero-grid {
+    /* Was `1fr` which allows column to grow to widest content
+       (the terminal-card). Switch to minmax(0, 1fr) so the
+       column shrinks to container width and inner content is
+       constrained / scrollable instead of overflowing. */
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+  }
+  .hero-grid > * { min-width: 0; }
+  .terminal-card { max-width: 100%; min-width: 0; }
+  .terminal-body {
+    /* Already has overflow-x: auto — make sure it's the scroll
+       container, not the parent. */
+    max-width: 100%;
+  }
+}
+
+/* Defensive: ensure no section can force the page wider than the
+   viewport at mobile sizes. */
+@media (max-width: 600px) {
+  .hero-copy { min-width: 0; max-width: 100%; }
+  .hero-grid > .terminal-card {
+    margin-left: 0;
+    margin-right: 0;
+  }
+  .demo-grid, .how-grid, .protects-grid, .catches-grid, .tiers {
+    grid-template-columns: 1fr !important;
+    max-width: 100%;
+  }
+}
+
