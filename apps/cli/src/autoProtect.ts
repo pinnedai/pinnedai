@@ -15,7 +15,7 @@ import type { Claim } from "./claimParser.js";
 import { claimKey } from "./claimParser.js";
 import type { RegistryEntry } from "./registry.js";
 import type { ChangedFile } from "./scanDiff.js";
-import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, type DiffByFile } from "./scanDiff.js";
+import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, type DiffByFile } from "./scanDiff.js";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -222,6 +222,27 @@ export function classifyDiff(input: ClassifyInput): ClassifyResult {
     }
     for (const h of detectValidationAddedInDiff(syntheticDiff)) {
       validationHitsByRoute.set(h.route, { filePath: h.filePath, signature: h.signature });
+    }
+    // happy-path-with-side-effect — fires when a new POST/PUT/PATCH/DELETE
+    // endpoint lands. Was the gap that let a 400 regression ship on
+    // socialideagen's POST /api/signup in 2026-06-02. Decision is "ask"
+    // because the customer needs to add the X-Pinned-Side-Effect wrapper
+    // (~5-10 LOC) for the pin to verify side-effects; the pin itself
+    // doesn't reach into their DB.
+    for (const h of detectNewPostEndpointsInDiff(syntheticDiff)) {
+      tryEmit({
+        claim: {
+          template: "happy-path-with-side-effect",
+          route: h.route,
+          method: h.method,
+          sideEffectKind: "db-write",
+          sideEffectTarget: h.targetGuess,
+          raw: h.suggestedPin,
+        },
+        reason: `new ${h.method} endpoint ${h.route} added in this commit — pin asserts it returns 2xx AND actually performs its db-write side-effect (catches stub-returns-200-without-work bugs). Customer's AI agent must add the X-Pinned-Side-Effect wrapper before the pin can verify; see the pin's repairPrompt for the snippet.`,
+        triggeredBy: h.filePath,
+        decision: "ask",
+      });
     }
   } catch {
     /* detector errors must not block pin emission */

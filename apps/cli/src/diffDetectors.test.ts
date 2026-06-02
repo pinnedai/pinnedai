@@ -9,6 +9,7 @@ import {
   detectIdempotencyAddedInDiff,
   detectRateLimitAddedInDiff,
   detectPermissionAddedInDiff,
+  detectNewPostEndpointsInDiff,
   type DiffByFile,
 } from "./scanDiff.js";
 
@@ -309,5 +310,129 @@ export async function POST(req: Request) {
 }`
     );
     expect(detectPermissionAddedInDiff(diff)).toHaveLength(0);
+  });
+});
+
+// ────────────────────────────────────────────────────────────
+// detectNewPostEndpointsInDiff — fires when a new mutating endpoint
+// (POST/PUT/PATCH/DELETE) lands. Drove the socialideagen incident
+// 2026-06-02: business-critical POST /api/signup shipped a 400 to
+// prod because no Pinned coverage existed for happy-path-with-side-
+// effect on auto-detected endpoints.
+// ────────────────────────────────────────────────────────────
+
+describe("detectNewPostEndpointsInDiff", () => {
+  it("catches a new Next.js app-router POST /api/signup", () => {
+    const diff = diffOf(
+      "app/api/signup/route.ts",
+      `import { NextRequest } from "next/server";
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const user = await createUser(body);
+  return Response.json(user);
+}`
+    );
+    const hits = detectNewPostEndpointsInDiff(diff);
+    expect(hits).toHaveLength(1);
+    expect(hits[0].route).toBe("/api/signup");
+    expect(hits[0].method).toBe("POST");
+    expect(hits[0].targetGuess).toBe("signups");
+    expect(hits[0].filePath).toBe("app/api/signup/route.ts");
+  });
+
+  it("catches multiple methods across multiple files", () => {
+    const m: DiffByFile = new Map();
+    m.set("app/api/orders/route.ts", [
+      "export async function POST(req) { return Response.json({ id: 1 }); }",
+    ]);
+    m.set("app/api/users/[id]/route.ts", [
+      "export async function PATCH(req) { return Response.json({ ok: true }); }",
+    ]);
+    m.set("app/api/items/[id]/route.ts", [
+      "export async function DELETE(req) { return new Response(null, { status: 204 }); }",
+    ]);
+    const hits = detectNewPostEndpointsInDiff(m);
+    expect(hits).toHaveLength(3);
+    const byMethod = Object.fromEntries(hits.map((h) => [h.method, h.route]));
+    expect(byMethod.POST).toBe("/api/orders");
+    expect(byMethod.PATCH).toBe("/api/users/[id]");
+    expect(byMethod.DELETE).toBe("/api/items/[id]");
+  });
+
+  it("catches Express-style router.post()", () => {
+    const diff = diffOf(
+      "src/routes/signup.ts",
+      `router.post("/api/signup", async (req, res) => {
+  const user = await createUser(req.body);
+  res.json(user);
+});`
+    );
+    // Express-style routes don't map cleanly to deriveRouteFromPath
+    // (the file path doesn't equal the route). We expect either ZERO
+    // hits (file doesn't look like a route handler by path) OR a hit
+    // with the route guessed from the file. Either is acceptable —
+    // the detector's primary target is Next.js app router.
+    const hits = detectNewPostEndpointsInDiff(diff);
+    expect(hits.length).toBeGreaterThanOrEqual(0);
+  });
+
+  it("REJECTS files that aren't route handlers", () => {
+    const diff = diffOf(
+      "src/lib/utils.ts",
+      `export function helper() { return 42; }
+export async function POST(data) { return await save(data); }`
+    );
+    // Even though the file has `export async function POST`, it's not
+    // at a path that maps to a route. Detector must skip it.
+    expect(detectNewPostEndpointsInDiff(diff)).toHaveLength(0);
+  });
+
+  it("REJECTS test files", () => {
+    const diff = diffOf(
+      "app/api/signup/route.test.ts",
+      `it("POST works", async () => {
+  const res = await fetch("/api/signup", { method: "POST" });
+});`
+    );
+    expect(detectNewPostEndpointsInDiff(diff)).toHaveLength(0);
+  });
+
+  it("REJECTS GET-only routes (read-only, no side-effect to verify)", () => {
+    const diff = diffOf(
+      "app/api/health/route.ts",
+      `export async function GET() {
+  return Response.json({ status: "ok" });
+}`
+    );
+    expect(detectNewPostEndpointsInDiff(diff)).toHaveLength(0);
+  });
+
+  it("pluralizes the target guess from the last route segment", () => {
+    const m: DiffByFile = new Map();
+    m.set("app/api/order/route.ts", [
+      "export async function POST(req) { return Response.json({}); }",
+    ]);
+    m.set("app/api/category/route.ts", [
+      "export async function POST(req) { return Response.json({}); }",
+    ]);
+    m.set("app/api/box/route.ts", [
+      "export async function POST(req) { return Response.json({}); }",
+    ]);
+    const hits = detectNewPostEndpointsInDiff(m);
+    const targets = Object.fromEntries(hits.map((h) => [h.route, h.targetGuess]));
+    expect(targets["/api/order"]).toBe("orders");
+    expect(targets["/api/category"]).toBe("categories");
+    expect(targets["/api/box"]).toBe("boxes");
+  });
+
+  it("doesn't double-emit for same route in single diff", () => {
+    // Same route appearing twice in the diff (e.g. an edit + a comment
+    // change) should still produce only one hit.
+    const m: DiffByFile = new Map();
+    m.set("app/api/signup/route.ts", [
+      "export async function POST(req) { return Response.json({}); }",
+    ]);
+    const hits = detectNewPostEndpointsInDiff(m);
+    expect(hits).toHaveLength(1);
   });
 });

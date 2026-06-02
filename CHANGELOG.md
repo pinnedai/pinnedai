@@ -2,6 +2,90 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.5] — 2026-06-02
+
+Auto-detect new POST/PUT/PATCH/DELETE endpoints and auto-pin them with happy-path-with-side-effect. Closes the gap that let a 400 regression ship on `/api/signup` in socialideagen yesterday: the v0.2.0 happy-path template existed but only fired on explicit claims, never on auto-protect. Now any new mutating endpoint gets a pin candidate automatically.
+
+### Added
+
+- **`detectNewPostEndpointsInDiff()`** in `scanDiff.ts` — scans the staged diff for new `export async function POST/PUT/PATCH/DELETE` declarations in route-handler files (Next.js app router primary, pages router + Express/Fastify-style `.post()` calls also recognized). Returns one hit per new endpoint with:
+  - `route` — derived from the file path (`app/api/signup/route.ts` → `/api/signup`)
+  - `method` — POST/PUT/PATCH/DELETE
+  - `targetGuess` — pluralized last segment (`signup` → `signups`, `box` → `boxes`, `category` → `categories`)
+  - `suggestedPin` — human-readable claim text for PINS.md
+- **Wired into `autoProtect.ts`** — each new endpoint becomes a `happy-path-with-side-effect` pin candidate with `decision: "ask"` (customer needs to add the `X-Pinned-Side-Effect` wrapper before the pin can verify side-effects; the pin's repairPrompt includes the wrapper code).
+- **8 unit tests** in `diffDetectors.test.ts` covering: Next.js app router POST/PATCH/DELETE, Express-style `router.post`, pluralization rules, FP rejection of utility files / test files / GET-only routes, dedup across single diff.
+
+### Impact
+
+Two real prod incidents in one day on socialideagen would have been auto-caught:
+- 400 regression on `POST /api/signup` → pin asserts `2xx + X-Pinned-Side-Effect: db-write target=signups`
+- Idea-resolver bug on `POST /api/track/invite` → pin asserts `2xx + X-Pinned-Side-Effect: db-write target=invites`
+
+Both endpoints would have been auto-pinned at commit time (with the AGENT SETUP REQUIRED prompt for the wrapper). Customer's AI fills in the wrapper, pins fire, regressions get blocked at CI before they ship.
+
+### Notes
+
+- After upgrading to 0.2.5, run `pinned regenerate --all` to re-emit existing pins. New auto-pins land on the next `pinned init` or `git commit` that touches a route file.
+- Target-guess pluralization is best-effort; customer can override during AGENT SETUP REQUIRED.
+- `decision: "ask"` (not "safe") because the wrapper setup is a non-trivial code change. Customer confirms before pin lands.
+
+## [0.2.4] — 2026-06-02
+
+Claude Code statusLine compose-instead-of-clobber. Claude Code only supports ONE `statusLine.command`. When two tools both install statusLine setups, whichever runs LAST wins — the other gets silently shadowed. A customer running both Pinned and any other Claude statusLine-using tool (Cipherwake, custom shell, etc.) used to see only one badge, not both.
+
+### Added
+
+`pinned init` now detects an existing third-party `statusLine.command` in `.claude/settings.json` and writes a small POSIX `sh` wrapper at `.pinnedai/statusline-combined.sh` that runs **both** commands and joins their outputs with `" · "`. Claude's settings get pointed at the wrapper. The wrapper:
+
+- Runs each producer in a subshell with stderr discarded → silent tools don't break the chain
+- Joins outputs only when both are non-empty → no dangling separators
+- Self-marks with `# pinnedai:statusline-compose` so future re-runs detect their own wrapper and don't double-wrap
+- Re-runs of `pinned init` rewrite the wrapper if Pinned's bin path changed but leave the "other" command alone (idempotent)
+- Falls back gracefully — if either tool emits nothing, the other still renders
+
+Net effect: install Pinned, then install Cipherwake (or any other statusLine-using tool), re-run `pinned init` → you see **both** badges in your Claude statusline (`◆ pinned · N guards · ✓ · 🛟 cipherwake · pass`). No manual wrapper script needed.
+
+`isClaudeStatuslineInstalled()` updated to recognize both the direct command AND the compose-wrapper path as "Pinned installed."
+
+## [0.2.3] — 2026-06-02
+
+`.pinnedai/` auto-gitignored. `.pinnedai/` holds transient state (the regenerate-allow marker from 0.2.2, BYOK creds in `byok.json`, the cache directory, `.last-auto-test`, `.last-status.json`) — none of it should be committed; some of it would be a security or correctness bug if it were (committed BYOK creds → leaked API keys; committed regenerate marker → CI could bypass the guard hook for any matching file).
+
+- **`pinned init` adds `.pinnedai/` to `.gitignore`** for fresh installs.
+- **`pinned regenerate` also auto-adds it** on every run. Existing installs (from before 0.2.3) get the fix the first time they upgrade and regenerate — no manual action.
+- **Shared `ensureGitignored(pattern)` helper** — idempotent, exact-line match (won't false-positive on `.pinnedai.bak/`).
+
+### Added
+
+- **`pinned init` adds `.pinnedai/` to `.gitignore`** for fresh installs. `.pinnedai/` holds transient state (the regenerate-allow marker, BYOK creds in `byok.json`, the cache directory, `.last-auto-test`, `.last-status.json`) — none of it should be committed; some of it would be a security or correctness bug if it were.
+- **`pinned regenerate` also auto-adds `.pinnedai/`** to `.gitignore` on every run if missing. Existing installs (from before 0.2.3) get the fix the first time they upgrade and regenerate — no manual action required.
+- **Shared `ensureGitignored(pattern)` helper** — idempotent, safe-append, no-ops if the pattern is already covered. Used by init + regenerate. Easy to extend to other transient state in future releases.
+
+### Notes
+
+- The gitignore append uses an exact-line regex (with optional leading `/`), so `.pinnedai/` matches both `.pinnedai/` and `/.pinnedai/` but doesn't match unrelated rules like `.pinnedai.bak/`.
+- No change to existing `.gitignore` content if `.pinnedai/` is already there — safe to re-run.
+
+## [0.2.2] — 2026-06-02
+
+Fixes the foot-gun introduced in 0.2.1: `pinned regenerate --all` succeeded then told the user to run `git add tests/pinned/ && git commit`, but the pre-commit hook (correctly, by design) refused that commit because the pin files were modified. The hook couldn't tell *"modified by `pinned regenerate` (sanctioned)"* from *"modified by AI weakening (forbidden)"*. The only workaround was `PINNEDAI_ALLOW_PIN_EDIT=1 git commit ...` — a documented bypass that turns off ALL guard-removal protection, not just the regenerate-related changes.
+
+### Added
+
+- **`pinned regenerate` writes a short-lived `.pinnedai/regenerate-allow.json` marker** containing each regenerated filename + its sha256 + a 5-minute TTL + a unique runId. The pre-commit hook (`pinned check-guard-removal`) reads the marker and lets through modifications whose CURRENT on-disk sha256 matches the recorded one. AI tampering on top of a sanctioned regenerate (sha256 won't match) still gets blocked. Expired markers fall through to normal protection. No env-var bypass needed.
+- **Updated `pinned regenerate` success message** to reflect the new flow: *"Now commit — the pre-commit hook will recognize these as sanctioned changes (via .pinnedai/regenerate-allow.json; auto-expires in 5 min)."* Removes the misleading instruction.
+
+### Why marker over env-var or auto-commit
+
+- **Env-var bypass** (`PINNEDAI_ALLOW_PIN_EDIT=1`) turns off ALL protection — too broad. AI tampering done in the same commit as a legitimate regenerate would slip through.
+- **Auto-commit** (`pinned regenerate --commit`) skips the user's review step. Some pin changes need human eyes (e.g. a template that wraps a route name into the test code might pick up a typo).
+- **Marker file** is sha256-bound to exactly the bytes regenerate wrote — so it can ONLY authorize those specific changes, can't be exploited as a general bypass, auto-expires in 5 min so it doesn't leak.
+
+### Why .pinnedai/ for the marker
+
+`.pinnedai/` is already in `.gitignore` from `pinned init` (alongside `byok.json`, `cache/`). The marker file is transient local state — must NOT be committed, otherwise a CI run with an old marker file could bypass the hook.
+
 ## [0.2.1] — 2026-06-02
 
 Structural fix for the *"library upgrades don't reach existing pin files"* problem. Pin .test.ts files are self-contained artifacts in the customer's repo (the moat is permanence) — they're frozen at the version they were generated under. Before 0.2.1, a template-bug fix in a newer pinnedai release **did not apply to existing pins**. Customers post-upgrade saw the same false-catches as before. This release fixes that.

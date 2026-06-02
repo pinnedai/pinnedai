@@ -19,6 +19,7 @@ import {
   lstatSync,
 } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createHash, randomBytes } from "node:crypto";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { execFileSync, spawnSync as childSpawnSync } from "node:child_process";
@@ -1141,6 +1142,17 @@ program
       out(`+ ${relative(cwd, pinsPath)}`);
     } else {
       out(`= ${relative(cwd, registryPath)} (exists, skipping)`);
+    }
+
+    // Ensure .pinnedai/ is gitignored — that directory holds transient
+    // state (regenerate-allow marker, BYOK creds, cache, last-status,
+    // .last-auto-test). None of it should be committed; some of it
+    // would be a security or correctness bug if it were (byok.json
+    // contains API keys; the regenerate marker would let stale runs
+    // bypass the guard hook in CI).
+    const ignoreResult = ensureGitignored(".pinnedai/");
+    if (ignoreResult === "added") {
+      out(`+ .gitignore (added .pinnedai/ — transient state, must not be committed)`);
     }
 
     // ---- Per-piece installers ----
@@ -3396,6 +3408,56 @@ program
         }
       }
 
+      // Write a short-lived "regenerate-allow" marker so the
+      // pre-commit hook (check-guard-removal) can distinguish
+      // sanctioned modifications from AI weakening attempts. Without
+      // this, `git commit` after `pinned regenerate` would be blocked
+      // by the hook — the documented bypass (PINNEDAI_ALLOW_PIN_EDIT=1)
+      // is a foot-gun. Marker is hash-bound to the specific regenerated
+      // files + has a 5-minute TTL.
+      // Auto-fix `.pinnedai/` gitignore entry for existing installs.
+      // `pinned init` adds it for fresh installs (0.2.3+), but repos
+      // that ran an earlier init don't have it — committing a stale
+      // marker file would let CI bypass the guard hook. Run on every
+      // regenerate (not just when pins changed) so the fix lands the
+      // first time the upgraded CLI touches the repo.
+      const gitignoreResult = ensureGitignored(".pinnedai/");
+      if (gitignoreResult === "added") {
+        out("(also added .pinnedai/ to .gitignore so the marker + BYOK creds aren't committed)");
+      }
+      if (!opts.dryRun && changed > 0) {
+        try {
+          const markerDir = ".pinnedai";
+          if (!existsSync(markerDir)) {
+            mkdirSync(markerDir, { recursive: true });
+          }
+          const allowEntries = targets
+            .map((entry) => {
+              const target = join(opts.dir, entry.filename);
+              if (!existsSync(target)) return null;
+              const content = readFileSync(target, "utf8");
+              const sha256 = createHash("sha256").update(content).digest("hex");
+              return { filename: entry.filename, sha256, dir: opts.dir };
+            })
+            .filter((e): e is { filename: string; sha256: string; dir: string } => e !== null);
+          const now = Date.now();
+          const marker = {
+            version: 1,
+            createdAt: new Date(now).toISOString(),
+            expiresAt: new Date(now + 5 * 60 * 1000).toISOString(), // 5 min TTL
+            runId: randomBytes(8).toString("hex"),
+            regenerated: allowEntries,
+          };
+          writeFileSync(
+            join(markerDir, "regenerate-allow.json"),
+            JSON.stringify(marker, null, 2) + "\n"
+          );
+        } catch {
+          /* Marker write failure is non-fatal — user will fall back to
+             PINNEDAI_ALLOW_PIN_EDIT=1 if needed. */
+        }
+      }
+
       out("");
       const summary = opts.dryRun
         ? `${changed} pin(s) would change. ${unchanged} already current. ${errors} errors.`
@@ -3403,7 +3465,8 @@ program
       out(summary);
       if (!opts.dryRun && changed > 0) {
         out("");
-        out("Commit the updated pins so the fix sticks:");
+        out("Now commit — the pre-commit hook will recognize these as sanctioned");
+        out("changes (via .pinnedai/regenerate-allow.json; auto-expires in 5 min):");
         out("  git add tests/pinned/ && git commit -m \"chore(pinned): regenerate pins with latest templates\"");
       }
     }
@@ -6428,6 +6491,13 @@ program
       if (!opts.quiet) out("pinned: PINNEDAI_ALLOW_PIN_EDIT=1 set — guard-removal check bypassed for this commit.");
       process.exit(0);
     }
+    // Regenerate-allow marker — written by `pinned regenerate`. When
+    // every modified pin file in the staged diff has a matching entry
+    // (filename + sha256 of current content) in the marker AND the
+    // marker hasn't expired, allow the commit. This lets users follow
+    // the success-message instructions from `pinned regenerate` without
+    // needing PINNEDAI_ALLOW_PIN_EDIT=1.
+    const regenAllow = readRegenerateAllowMarker();
     const cwd = process.cwd();
     // Compute diff scope. CI passes --base; the pre-commit hook does
     // not. We still emit clean exit 0 when not in a git repo so the
@@ -6737,6 +6807,47 @@ program
       }
     } catch (e) {
       if (!opts.quiet) err(`pinned: guard-integrity detector failed (continuing): ${(e as Error).message}`);
+    }
+
+    // If a regenerate-allow marker is in scope, drop violations on
+    // files whose CURRENT on-disk content matches the marker's recorded
+    // sha256. Those modifications were sanctioned by `pinned regenerate`
+    // and shouldn't be treated as AI tampering.
+    if (regenAllow && violations.length > 0) {
+      const filtered: typeof violations = [];
+      let allowedCount = 0;
+      for (const v of violations) {
+        // Marker filename is relative to the pinned dir (e.g.
+        // "auto-XYZ.test.ts"); violation path is repo-relative
+        // (e.g. "tests/pinned/auto-XYZ.test.ts"). Match by basename.
+        const basename = v.path.split("/").pop() ?? v.path;
+        const allowed = regenAllow.regenerated.find((r) => r.filename === basename);
+        if (!allowed) {
+          filtered.push(v);
+          continue;
+        }
+        // Re-hash current file content and compare. If it matches the
+        // marker's sha256, this is exactly the file `pinned regenerate`
+        // wrote — sanctioned. If not, the file was edited AFTER
+        // regenerate (could be AI tampering on top of the regenerate);
+        // keep it as a violation.
+        try {
+          const currentContent = readFileSync(join(cwd, v.path), "utf8");
+          const currentSha = createHash("sha256").update(currentContent).digest("hex");
+          if (currentSha === allowed.sha256) {
+            allowedCount += 1;
+            continue;
+          }
+        } catch { /* fall through to keeping as violation */ }
+        filtered.push(v);
+      }
+      if (allowedCount > 0 && !opts.quiet) {
+        out(
+          `pinned: ${allowedCount} pin file(s) sanctioned via .pinnedai/regenerate-allow.json (created by \`pinned regenerate\`).`
+        );
+      }
+      violations.length = 0;
+      violations.push(...filtered);
     }
 
     if (violations.length === 0) process.exit(0);
@@ -7508,6 +7619,70 @@ function describeFailureScenario(c: Claim): string {
       return `${c.method} ${c.route} returns 2xx but no longer emits the X-Pinned-Side-Effect header — the endpoint may be a stub returning a happy status without actually performing the ${c.sideEffectKind} to \`${c.sideEffectTarget}\` (misleading-green).`;
     default:
       return `the contract described above is broken.`;
+  }
+}
+
+// Read the short-lived regenerate-allow marker written by
+// `pinned regenerate`. Returns null if the marker doesn't exist, has
+// expired, or fails to parse. The marker authorizes pre-commit-hook
+// bypass ONLY for files matching the recorded filenames + sha256s —
+// so it's not a general "allow any pin edit" toggle, only a "the
+// regenerate command wrote these exact bytes" attestation.
+type RegenerateAllowMarker = {
+  version: number;
+  createdAt: string;
+  expiresAt: string;
+  runId: string;
+  regenerated: Array<{ filename: string; sha256: string; dir: string }>;
+};
+// Idempotent + safe append-to-gitignore. Used by pinned init AND by
+// pinned regenerate (so existing repos auto-fix when they next
+// regenerate — don't need to wait for re-init). No-op if:
+//   - .gitignore already contains an exact-match line for the pattern
+//   - .gitignore already contains the pattern as part of a broader rule
+//   - Not in a git repo (no .git directory at cwd)
+// Writes a leading newline if .gitignore exists and doesn't end with one,
+// so the appended line doesn't accidentally extend the previous line.
+function ensureGitignored(pattern: string): "added" | "already" | "no-git" {
+  const gitignorePath = ".gitignore";
+  if (!existsSync(".git")) return "no-git";
+  let current = "";
+  try {
+    current = existsSync(gitignorePath) ? readFileSync(gitignorePath, "utf8") : "";
+  } catch {
+    return "no-git";
+  }
+  // Match the pattern as a standalone line (ignoring leading/trailing
+  // whitespace + optional leading `/`). e.g. ".pinnedai/" matches both
+  // ".pinnedai/" and "/.pinnedai/" but NOT ".pinnedai.bak/".
+  const normalized = pattern.replace(/^\/+/, "").replace(/\/+$/, "");
+  const lineRegex = new RegExp(
+    `^\\s*\\/?${normalized.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\/?\\s*$`,
+    "m"
+  );
+  if (lineRegex.test(current)) return "already";
+  const prefix = current && !current.endsWith("\n") ? "\n" : "";
+  const append = `${prefix}${pattern}\n`;
+  try {
+    writeFileSync(gitignorePath, current + append);
+    return "added";
+  } catch {
+    return "no-git";
+  }
+}
+
+function readRegenerateAllowMarker(): RegenerateAllowMarker | null {
+  const markerPath = join(".pinnedai", "regenerate-allow.json");
+  if (!existsSync(markerPath)) return null;
+  try {
+    const raw = readFileSync(markerPath, "utf8");
+    const parsed = JSON.parse(raw) as RegenerateAllowMarker;
+    if (!parsed.expiresAt) return null;
+    if (new Date(parsed.expiresAt).getTime() < Date.now()) return null;
+    if (!Array.isArray(parsed.regenerated)) return null;
+    return parsed;
+  } catch {
+    return null;
   }
 }
 

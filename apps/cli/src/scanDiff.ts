@@ -1644,6 +1644,118 @@ export function detectAuthChecksInDiff(diffByFile: DiffByFile): DiffAuthCheckHit
 }
 
 // ────────────────────────────────────────────────────────────
+// New-POST-endpoint detector (auto-protect mode)
+// ────────────────────────────────────────────────────────────
+//
+// Fires when the diff adds a new mutating route handler (POST / PUT /
+// PATCH / DELETE). Used by auto-protect to emit a
+// happy-path-with-side-effect candidate pin — without this, business-
+// critical endpoints like POST /api/signup ship without coverage and
+// the first regression hits prod (real incident on socialideagen
+// 2026-06-02).
+//
+// Recognized shapes (Next.js app router first — highest-leverage):
+//   - app/api/<path>/route.ts exporting `async function POST(...)`
+//   - same for PUT / PATCH / DELETE
+//   - pages/api/<path>.ts default export with method dispatch on POST
+//
+// The target table/model is GUESSED from the route's last segment
+// (e.g. "/api/signup" → "signups", "/api/orders" → "orders") — the
+// customer is expected to correct it via the AGENT SETUP REQUIRED
+// prompt when they wire the X-Pinned-Side-Effect wrapper.
+export type DiffNewPostEndpointHit = {
+  template: "happy-path-with-side-effect";
+  route: string;
+  method: "POST" | "PUT" | "PATCH" | "DELETE";
+  filePath: string;
+  // Best-guess side-effect target. Customer overrides via AGENT SETUP
+  // REQUIRED prompt when they add the X-Pinned-Side-Effect wrapper.
+  targetGuess: string;
+  // Human-readable claim text for PINS.md.
+  suggestedPin: string;
+};
+
+// Pluralize the route's last segment for the target guess. Conservative
+// — only handles the common English plural cases. Customer overrides
+// during wrapper setup if their table name differs.
+function pluralizeRouteSegment(seg: string): string {
+  if (!seg) return "items";
+  if (seg.endsWith("s")) return seg; // already plural
+  if (seg.endsWith("y") && !/[aeiou]y$/.test(seg)) return seg.slice(0, -1) + "ies";
+  if (/(?:s|x|z|ch|sh)$/.test(seg)) return seg + "es";
+  return seg + "s";
+}
+
+export function detectNewPostEndpointsInDiff(diffByFile: DiffByFile): DiffNewPostEndpointHit[] {
+  const out: DiffNewPostEndpointHit[] = [];
+  const seenRoutes = new Set<string>();
+  for (const [filePath, addedLines] of diffByFile.entries()) {
+    if (isTestPath(filePath)) continue;
+    const route = deriveRouteFromPath(filePath);
+    if (!route) continue;
+
+    // Strip comments + concat. We're looking for an exported handler
+    // declaration. Method dispatch via `if (req.method === "POST")`
+    // also counts (pages-router pattern).
+    const added = addedLines
+      .map((l) => l.replace(/\/\/.*$/, "").replace(/\/\*.*?\*\//g, ""))
+      .filter((l) => l.trim().length > 0)
+      .join("\n");
+    if (added.length === 0) continue;
+
+    // Next.js app router: `export async function POST(`
+    let method: "POST" | "PUT" | "PATCH" | "DELETE" | null = null;
+    const appRouterMatch = /export\s+(?:const\s+|async\s+function\s+|function\s+)(POST|PUT|PATCH|DELETE)\b/.exec(added);
+    if (appRouterMatch) {
+      method = appRouterMatch[1] as "POST" | "PUT" | "PATCH" | "DELETE";
+    }
+    // Pages router / Express / Fastify / Hono: req.method === "POST"
+    if (!method) {
+      const pagesMatch = /req\.method\s*===?\s*['"](POST|PUT|PATCH|DELETE)['"]/.exec(added);
+      if (pagesMatch) method = pagesMatch[1] as "POST" | "PUT" | "PATCH" | "DELETE";
+    }
+    // Express / Fastify: app.post / router.post / fastify.post
+    if (!method) {
+      const expressMatch = /\b(?:app|router|fastify|server)\.(?:post|put|patch|delete)\s*\(/i.exec(added);
+      if (expressMatch) {
+        const verb = expressMatch[0].match(/\.(\w+)\s*\(/)?.[1]?.toUpperCase();
+        if (verb === "POST" || verb === "PUT" || verb === "PATCH" || verb === "DELETE") {
+          method = verb;
+        }
+      }
+    }
+    if (!method) continue;
+
+    // Skip auth endpoints — signup/login/logout/etc. They CAN have
+    // happy-path pins, but the wrapper conversation is different (the
+    // side-effect target for signup is usually "users", for login is
+    // "sessions"). We still emit the pin but the customer must confirm
+    // the target. For now, allow them through — they're the case the
+    // socialideagen incident proved we need to cover.
+
+    // Skip if the route already triggered another high-confidence
+    // template (avoid double-pinning the same route). Auto-protect
+    // dedupes by claim-key but this is a cheaper early filter.
+    const key = `${method} ${route}`;
+    if (seenRoutes.has(key)) continue;
+    seenRoutes.add(key);
+
+    const lastSeg = route.split("/").filter(Boolean).pop() || "items";
+    const targetGuess = pluralizeRouteSegment(lastSeg);
+
+    out.push({
+      template: "happy-path-with-side-effect",
+      route,
+      method,
+      filePath,
+      targetGuess,
+      suggestedPin: `${method} ${route} creates a ${targetGuess} record`,
+    });
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
 // Idempotency-added detector (bug-fix mode)
 // ────────────────────────────────────────────────────────────
 //
