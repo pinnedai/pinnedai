@@ -1506,18 +1506,48 @@ program
             detectNewPostEndpointsInDiff: dnp,
             detectNewPagesInDiff: dnpg,
             detectNewValidationSchemasInDiff: dnvs,
+            detectRetroactiveWriteEndpoints: drwe,
+            detectRetroactiveJourneys: drj,
           } = await import("./scanDiff.js");
           const retroDiff: import("./scanDiff.js").DiffByFile = new Map();
+          // Two parallel views: (a) line-array for diff-detectors that
+          // expect added-line arrays, (b) full-content map for the
+          // retroactive write-endpoint scanner which needs whole
+          // handlers to detect write shapes that span multiple lines.
+          const retroContent = new Map<string, string>();
           for (const p of repoFiles) {
             try {
               const full = join(cwd, p);
               const content = readFileSync(full, "utf8");
               retroDiff.set(p, content.split("\n"));
+              retroContent.set(p, content);
             } catch {
               /* unreadable file — skip */
             }
           }
+          // 0.2.8+: dedicated retroactive write-endpoint scanner with
+          // strict write-shape requirement (supabase/prisma/drizzle/
+          // kysely/mongoose/raw-SQL/email-send). Emitted FIRST so its
+          // captured target names override the route-segment guesses
+          // from the legacy dnp() loop below.
+          const retroactiveWriteRoutes = new Set<string>();
+          for (const h of drwe(retroContent)) {
+            retroactiveWriteRoutes.add(`${h.method} ${h.route}`);
+            baselineResult.suggestions.push({
+              template: "happy-path-with-side-effect",
+              route: h.route,
+              reason: `existing ${h.method} endpoint ${h.route} — handler ${h.writeShape.kind === "email" ? "sends email via" : h.writeShape.kind === "queue" ? "enqueues via" : `writes to ${h.writeShape.target} via`} ${h.writeShape.library}. Pin asserts the endpoint returns 2xx AND emits X-Pinned-Side-Effect on its real side-effect (catches stub-returns-200-without-work bugs). AGENT SETUP REQUIRED for the response wrapper.`,
+              suggestedPin: h.suggestedPin,
+              files: [h.filePath],
+            } as (typeof baselineResult.suggestions)[number]);
+          }
+          // Legacy dnp() pass — fires on any POST/PUT/PATCH method
+          // signature regardless of write shape. Now SKIPPED when the
+          // retroactive scanner already emitted for that route (the
+          // retroactive scanner's targetGuess is from the actual write
+          // call, more accurate than route-segment pluralization).
           for (const h of dnp(retroDiff)) {
+            if (retroactiveWriteRoutes.has(`${h.method} ${h.route}`)) continue;
             baselineResult.suggestions.push({
               template: "happy-path-with-side-effect",
               route: h.route,
@@ -1547,6 +1577,19 @@ program
               files: [h.filePath],
             } as (typeof baselineResult.suggestions)[number]);
           }
+          // 0.2.8+: retroactive journey detector. Pairs existing route
+          // handlers with existing pages by shared-session-module or
+          // redirect-target. Catches multi-step contracts (e.g. signup
+          // → /thanks shows the user; confirm → /thanks?confirm=ok sets
+          // cookie) that single-step pins structurally miss. Was the
+          // remaining 2/4 gap in the socialideagen walk-forward.
+          //
+          // Stash hits on the baselineResult so the emission loop below
+          // can read them. We bypass parseClaims for journeys because
+          // the round-trip drops the rich pairing info (setsCookie,
+          // redirectIncludes) — same pattern config-invariant uses.
+          type RetroJourneyHit = ReturnType<typeof drj>[number];
+          (baselineResult as unknown as { retroJourneys: RetroJourneyHit[] }).retroJourneys = drj(retroContent);
         } catch (e) {
           out(`  ! retroactive detector pass failed (non-fatal): ${(e as Error).message}`);
         }
@@ -1643,6 +1686,53 @@ program
           }
         } catch (e) {
           out(`  ! config-invariant pin detection failed: ${(e as Error).message}`);
+        }
+
+        // 0.2.8+: retroactive journey emission. Bypasses parseClaims so
+        // the rich pair-detection info (setsCookie, redirectIncludes
+        // captured from the source) survives into the generated test.
+        const retroJourneys = (baselineResult as unknown as { retroJourneys?: Array<{
+          template: "journey";
+          label: string;
+          steps: Array<{ method: "POST" | "GET" | "PUT" | "PATCH" | "DELETE"; route: string; setsCookie?: string; redirectIncludes?: string }>;
+          filePaths: string[];
+          pairReason: string;
+          sharedToken: string;
+          suggestedPin: string;
+        }> }).retroJourneys ?? [];
+        for (const j of retroJourneys) {
+          const claim: import("./claimParser.js").JourneyClaim = {
+            template: "journey",
+            label: j.label,
+            steps: j.steps.map((s) => ({
+              method: s.method,
+              route: s.route,
+              expect: {
+                status: { min: 200, max: 399 }, // allow 3xx redirects on step 1
+                ...(s.setsCookie ? { setsCookie: s.setsCookie } : {}),
+                ...(s.redirectIncludes ? { redirectIncludes: s.redirectIncludes } : {}),
+              },
+            })),
+            raw: j.suggestedPin,
+          };
+          const gen = generateTest(claim, { prId, pinnedVersion: version });
+          const target = join(pinnedDir, gen.filename);
+          try {
+            assertInsideDir(target, pinnedDir);
+            writeFileSync(target, gen.content, { flag: "wx" });
+            registry = addEntry(registry, {
+              claimId: gen.claimId,
+              prId,
+              claim,
+              filename: gen.filename,
+            });
+            baselineAutoAdded += 1;
+            baselineAddedSummaries.push(summarizeClaimForBanner(claim));
+          } catch (e) {
+            if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+              out(`  ! retroactive journey pin failed for ${gen.filename}: ${(e as Error).message}`);
+            }
+          }
         }
 
         // Secret-not-public pin — emitted ONCE when the repo uses
@@ -2596,7 +2686,11 @@ function resolveHttpDefaults(
   }
   return {
     http: { ...DEFAULT_CONFIG.http, mode: "off" },
-    explainLine: `HTTP testing: off (HTTP pins will skip until you configure)`,
+    // Loud explainLine for the off path — without an HTTP target,
+    // every HTTP pin skips silently and Pinned provides ZERO catch
+    // coverage. Same wording the init banner uses so the user sees
+    // the warning twice (once at decision, once at write-time).
+    explainLine: `⚠ HTTP testing: OFF — every HTTP pin will SKIP. Pinned will be silent until you re-run \`pinned init\` or \`pinned config --set http.mode=local|preview\`.`,
   };
 }
 
@@ -2645,6 +2739,14 @@ async function promptHttpMode(
       "",
       "How should Pinned test HTTP pins?",
       "",
+      "  ⚠ This is the most important decision in init. Without an HTTP",
+      "    target, EVERY HTTP-shaped pin (rate-limit, auth-required,",
+      "    happy-path, page-renders, validation-rejects-bad, journey)",
+      "    will SKIP — Pinned creates the tests but verifies nothing.",
+      "    Picking option 1 or 2 turns Pinned from 'silent ledger' into",
+      "    'active guardrail.' Confirmed cost: a real dogfood deploy with",
+      "    PREVIEW_URL unset caught 0/4 production bugs.",
+      "",
       `  1. Use my local dev server (recommended for solo work)${detectedLine}`,
       "       Pinned will spawn `npm run dev` during `pinned test`, run pins",
       "       against it, then shut down the process it started.",
@@ -2652,8 +2754,10 @@ async function promptHttpMode(
       "  2. Use a preview URL (recommended in CI)",
       "       Set PREVIEW_URL in your CI to the PR's preview deploy. Pinned",
       "       runs pins against that URL.",
+      "       Vercel: vercel build → vercel deploy → use the returned URL.",
+      "       GitHub Actions: deployment-status event carries the URL.",
       "",
-      "  3. Skip for now",
+      "  3. Skip for now (NOT recommended — pins won't catch anything)",
       "       HTTP pins get created but stay 'not verified' until you set",
       "       PREVIEW_URL or enable local mode later.",
       "",
@@ -2661,13 +2765,43 @@ async function promptHttpMode(
     ].join("\n")
   );
   return new Promise((resolve) => {
-    const onData = (chunk: Buffer | string) => {
+    const onData = async (chunk: Buffer | string) => {
       const raw = (typeof chunk === "string" ? chunk : chunk.toString("utf8")).trim().toLowerCase();
       process.stdin.removeListener("data", onData);
       process.stdin.pause();
       if (raw === "" || raw === "1" || raw.startsWith("l")) return resolve("local");
       if (raw === "2" || raw.startsWith("p")) return resolve("preview");
-      if (raw === "3" || raw.startsWith("s") || raw === "n" || raw.startsWith("no")) return resolve("off");
+      if (raw === "3" || raw.startsWith("s") || raw === "n" || raw.startsWith("no")) {
+        // Loud "are you sure" re-prompt when the user picks off. The
+        // skip path is the most common cause of "Pinned didn't catch
+        // anything" feedback — we'd rather slow them down for ten
+        // seconds than ship a silent install. Single y/Enter to
+        // confirm; anything else loops back to mode selection.
+        process.stdout.write(
+          [
+            "",
+            "⚠ Pinned will be SILENT with no HTTP target.",
+            "    Are you sure? Re-confirming opts you out of the",
+            "    'catch regressions' part of Pinned — only static",
+            "    guardrails (deleted-pin / weakened-test detection) will fire.",
+            "",
+            "  [y/Enter] Confirm — install without HTTP verification",
+            "  [n] Go back to mode selection",
+            "",
+            "  > ",
+          ].join("\n")
+        );
+        process.stdin.resume();
+        process.stdin.once("data", async (chunk2: Buffer | string) => {
+          const r = (typeof chunk2 === "string" ? chunk2 : chunk2.toString("utf8")).trim().toLowerCase();
+          process.stdin.pause();
+          if (r === "" || r === "y" || r === "yes") return resolve("off");
+          // Loop back — re-run the prompt.
+          const second = await promptHttpMode(detected);
+          return resolve(second);
+        });
+        return;
+      }
       return resolve("local");
     };
     process.stdin.resume();
@@ -3550,9 +3684,28 @@ program
     assertInsideDir(opts.dir, process.cwd());
     const last = readLastStatus(opts.dir);
     const history = last?.catchHistory ?? [];
-    const total = last?.breaksCaught ?? 0;
+    // Dedupe display by claimId — keep the most recent record per
+    // claim so timestamps reflect the latest fire. Without this, a
+    // pin caught twice (e.g. cache reset → re-detected) showed twice
+    // in the listing. socialideagen dogfood 2026-06-02: login/logout/
+    // middleware each appeared twice. Same shape as the statusline
+    // 24h-rollup dedupe (117957d).
+    const byClaim = new Map<string, typeof history[number]>();
+    for (const r of history) {
+      const existing = byClaim.get(r.claimId);
+      if (!existing) {
+        byClaim.set(r.claimId, r);
+        continue;
+      }
+      const a = new Date(existing.caughtAt).getTime();
+      const b = new Date(r.caughtAt).getTime();
+      if (b > a) byClaim.set(r.claimId, r);
+    }
+    const dedupedHistory = Array.from(byClaim.values());
+    const total = last?.breaksCaught ?? dedupedHistory.length;
+    const eventCount = history.length;
 
-    if (history.length === 0) {
+    if (dedupedHistory.length === 0) {
       out("No regressions caught yet.");
       if (total > 0) {
         out(`(Lifetime count: ${total} — history was started after some catches.)`);
@@ -3563,7 +3716,13 @@ program
     }
     const limit = Math.max(1, parseInt(opts.limit, 10) || 20);
     out("");
-    out(`◆ Regressions Pinned has caught — ${history.length} recorded, ${total} lifetime`);
+    // "N issues · M events" — N is unique pins caught (the lifetime
+    // metric the user cares about), M is the total record count
+    // (transparent so they can spot inflated stale data themselves).
+    const eventsNote = eventCount > dedupedHistory.length
+      ? ` · ${eventCount} catch event${eventCount === 1 ? "" : "s"}`
+      : "";
+    out(`◆ Regressions Pinned has caught — ${dedupedHistory.length} unique pin${dedupedHistory.length === 1 ? "" : "s"}${eventsNote}, ${total} lifetime`);
     out("");
     // Look up each catch's current claim entry so we can render the
     // human Title. Fall back to the cached claimText if the pin was
@@ -3574,7 +3733,7 @@ program
     // when layman fields are present. Mixed cache (some with, some
     // without) sorts by date alone — falls through to original order.
     const { SEVERITY_RANK } = await import("./catchImpact.js");
-    const ranked = [...history];
+    const ranked = [...dedupedHistory];
     if (ranked.some((c) => c.severity)) {
       ranked.sort((a, b) => {
         const ra = SEVERITY_RANK[a.severity ?? "info"];
@@ -6549,7 +6708,18 @@ program
     const prev = readLastStatus(opts.dir);
     const prevFailing = new Set(prev?.failingClaimIds ?? []);
     const newFailures = failingClaimIds.filter((id) => !prevFailing.has(id));
-    let breaksCaught = prev?.breaksCaught ?? 0;
+    // Unique-claimId set drives breaksCaught (0.2.8+). The previous
+    // `breaksCaught += newFailures.length` over-counted when the cache
+    // briefly read green (e.g. all-skipped test runs flipped status to
+    // green; the next real run re-counted every failing pin as a
+    // fresh catch). socialideagen dogfood 2026-06-02 showed
+    // breaksCaught: 6 for 3 unique pins because of this. Migrating
+    // older caches: if `caughtClaimIds` is absent but `breaksCaught`
+    // exists, we seed the set from the catchHistory's claim IDs.
+    const caughtClaimIds = new Set<string>(
+      prev?.caughtClaimIds
+        ?? (prev?.catchHistory ?? []).map((r) => r.claimId)
+    );
     let lastCatchAt = prev?.lastCatchAt;
     let lastCatchClaimId = prev?.lastCatchClaimId;
     let catchHistory = prev?.catchHistory ?? [];
@@ -6557,7 +6727,7 @@ program
       // Real catch: was green, now failing on a claim that wasn't
       // failing before. Don't count test-runner errors (exit non-zero
       // with zero parsed FAIL lines) — those aren't regressions.
-      breaksCaught += newFailures.length;
+      for (const id of newFailures) caughtClaimIds.add(id);
       lastCatchAt = new Date().toISOString();
       lastCatchClaimId = newFailures[0];
       // Append catch records — newest first. Cap at CATCH_HISTORY_LIMIT
@@ -6594,7 +6764,7 @@ program
       const catchesPath = join(opts.dir, "CATCHES.md");
       const catchesMd = renderCatchesMarkdown({
         catchHistory,
-        breaksCaught,
+        breaksCaught: caughtClaimIds.size,
       });
       writeFileSync(catchesPath, catchesMd);
     }
@@ -6620,7 +6790,11 @@ program
       failingCount: failingClaimIds.length,
       failingClaimIds,
       totalPins,
-      breaksCaught,
+      // breaksCaught is now DERIVED from caughtClaimIds.size — same
+      // count, just dedupe-safe. Old code: `breaksCaught += newFailures.length`
+      // (over-counted on cache resets / all-skipped runs).
+      breaksCaught: caughtClaimIds.size,
+      caughtClaimIds: Array.from(caughtClaimIds),
       lastCatchAt,
       lastCatchClaimId,
       catchHistory,

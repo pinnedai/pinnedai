@@ -104,7 +104,21 @@ export type LastStatus = {
   // Incremented when a previously-passing pin starts failing. Tracks
   // the moments where Pinned demonstrably caught a regression.
   // Lifetime — never decays. Surfaced in `pinned status`.
+  //
+  // 0.2.8+: derived from `caughtClaimIds.size` rather than a running
+  // counter. The old `breaksCaught += newFailures.length` was sensitive
+  // to cache resets (e.g. `pinned test` exiting 0 on all-skipped flipped
+  // status to "green"; the next real run re-counted every currently-
+  // failing pin as a fresh catch). Re-deriving from the unique-claimId
+  // set is idempotent against that. Optional for backwards compat —
+  // older caches without `caughtClaimIds` keep their existing count.
   breaksCaught?: number;
+  // Unique claim IDs Pinned has ever caught a regression on. Used to
+  // dedupe the lifetime counter + the `pinned catches` listing. A pin
+  // that breaks → is fixed → breaks again is still ONE unique catch,
+  // not two — matches user mental model ("Pinned caught the rate-limit
+  // regression").
+  caughtClaimIds?: string[];
   // Most recent catch — drives the transient "caught N break"
   // statusline state (decays after RECENTLY_CAUGHT_TTL_MS).
   lastCatchAt?: string;

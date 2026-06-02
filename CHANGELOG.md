@@ -2,6 +2,81 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.9] — 2026-06-02
+
+One addition on top of 0.2.8 — closes the socialideagen cold-walk-forward to 4/4 by adding a retroactive journey detector.
+
+### Added — retroactive journey detector (closes walk-forward to 4/4)
+
+The 0.2.8 journey parser + diff-pair detector both rely on EITHER a PR description OR a fresh diff to fire. Customers installing Pinned cold on an existing repo had neither — the multi-step contracts that single-step pins structurally miss (signup→thanks, confirm→thanks) stayed unpinned. `detectRetroactiveJourneys` walks the full repo during `pinned init`'s baseline pass and pairs existing route handlers with existing pages via two precision-bound signals:
+
+1. **shared-session-module** — POST handler imports `writeXId` / `setXSession` / `setXCookie` from a module AND a page imports the matching `readXId` / `getXSession` / `getXUser` from the SAME module. Catches the contract "signup writes a session, /thanks page reads it back."
+
+2. **redirect-target** — route handler emits a redirect to a page that exists, AND optionally captures `setsCookie` from `res.cookies.set(NAME, ...)` calls in the same handler. Catches "confirm redirects to /thanks?confirm=ok with a session cookie set."
+
+Emitted via the config-invariant emission path (bypasses parseClaims) so rich pairing info (setsCookie, redirectIncludes captured from source) survives into the generated test. FP-checked: socialideagen produces 3 hits (signup→thanks, confirm→thanks, admin-logout→admin — all real journey contracts); 6 other dyad-apps repos produce 0 hits. **Walk-forward against socialideagen's known 4-bug commit (6bf2c28): retroactive happy-path catches #1 + #2 (signup/invite 400s on preview), retroactive journeys catch #3 + #4 (thanks "No signup found"; confirm cookie missing). 4/4 cold-walk-forward.**
+
+## [0.2.8] — 2026-06-02
+
+Five fixes from a second dogfood pass on socialideagen — the four production bugs the other Claude found ({POST /api/signup→400 on preview, POST /api/track/invite→400, GET /thanks "No signup found", GET /api/confirm cookie missing}) confirmed three structural gaps the 0.2.7 batch hadn't closed.
+
+### Fixed — `breaksCaught` + `pinned catches` double-count
+
+Cache transitioning green → failing → green (e.g. an all-skipped test run flipping status to "green") re-counted every currently-failing pin as a fresh catch. socialideagen run showed `breaksCaught: 6` for 3 unique pins (login/logout/middleware × 2 records). 0.2.8 derives `breaksCaught` from a dedupe-safe `caughtClaimIds` set (preserved in the cache) instead of incrementing on each transition. `pinned catches` listing + `CATCHES.md` render also dedupe by claimId with a "N issues · M events" footer when the record count exceeds unique count. Migration: caches without the new field re-seed from the existing `catchHistory`'s claim IDs — no count loss.
+
+### Added — retroactive happy-path emission for existing DB-writing POST handlers
+
+The 0.2.6 diff-detector only fired on routes ADDED in the current diff. Customers installing Pinned on an existing repo (the realistic adoption path) had all their real write endpoints already present — the detector silently skipped every one of them. socialideagen's signup / track/invite / track/view routes existed pre-Pinned, never got happy-path pins → 0/4 production-bug catches.
+
+0.2.8 adds `detectRetroactiveWriteEndpoints` — a strict scanner (requires a recognized write shape, not just a method handler) that walks the full repo during `pinned init`'s baseline pass. Recognized write libraries:
+
+| Library | Pattern detected |
+|---|---|
+| supabase-js | `supabase.from("X").insert/update/upsert/delete` |
+| prisma | `prisma.X.create/update/upsert/delete` (incl. `createMany` / `updateMany`) |
+| drizzle-orm | `db.insert/update/delete(X)` (also `tx.insert(...)` inside transactions) |
+| kysely | `db.insertInto("X")` / `db.updateTable("X")` / `db.deleteFrom("X")` |
+| mongoose | `Model.create(...)`, `new Model(...).save()`, `Model.updateOne(...)` |
+| raw SQL | `INSERT INTO X`, `UPDATE X SET`, `DELETE FROM X` inside `db.execute()` / `sql\`...\`` |
+| resend / sendgrid / nodemailer / aws-ses / postmark | their send / sendMail / sendEmail methods |
+| bullmq / inngest / generic queue | `queue.add()`, `inngest.send()`, `jobs.enqueue()` |
+
+FP-checked: 3 hits on socialideagen, all real (signup/track-invite/track-view); 0 hits on 6 other dyad repos that lack handler-level writes. README documents the full pattern table so customers know when happy-path will vs won't auto-emit. Diff path also uses the captured write target — `supabase.from("user_profiles").insert(` gives `targetGuess: "user_profiles"`, not the route-segment pluralization guess.
+
+### Improved — louder PREVIEW_URL prompt in `pinned init`
+
+Per dogfood debrief: "Nothing verifies without PREVIEW_URL — prompt hard for it at init; catch rate is 0 without it." Init's HTTP-mode prompt now (a) opens with a ⚠ banner explaining that every HTTP-shaped pin will skip without an HTTP target, (b) cites the 0/4 dogfood evidence directly, and (c) re-prompts when the user picks "skip" — single y/Enter confirms, anything else loops back to mode selection. The off-mode explainLine is also louder: "⚠ HTTP testing: OFF — every HTTP pin will SKIP."
+
+### Added — multi-step journey auto-detection (parser + diff pair)
+
+Two new paths for journey claims, both bypassing the v0.3 deferral:
+
+**(a) Natural-language parser** — two regex patterns:
+- `X then Y` / `X → Y` / `X -> Y` / `X followed by Y` (post-second-step prose extracts `bodyIncludes` / `bodyForbids`)
+- `After X, Y` / `Once X, Y` (leading-clause form)
+
+Both extract:
+- Step 1 method+route
+- Step 2 method (defaults to GET) + route
+- bodyIncludes from `shows "X"` / `displays "X"` / `returns "X"` / `renders "X"` / `includes "X"`
+- bodyForbids from `without "X"` / `no longer shows "X"` / `does not show "X"` / `missing "X"` + bare `without X` for short noun phrases
+
+FP-tested: 4 positive cases pass, 2 negative cases (rate-limit / validation descriptions) correctly produce zero journey claims.
+
+**(b) Diff-side pair detector** — `detectJourneyPairsInDiff` — when a new POST endpoint (with recognized writeShape) AND a new page are added in the same diff AND share at least one of {write target name appears in page route, write target name appears in page handler, write route segment appears in page route}, emit a journey candidate pairing the two. Catches the bug class socialideagen #3 lived in: "signup wrote a row, but /thanks page didn't read the new row back."
+
+Wired into `auto-protect` as an `ask` candidate (heuristic body assertions want a review before they're auto-pinned).
+
+### Wired
+
+- `caughtClaimIds: string[]` added to `LastStatus` type
+- `WriteShape` type + `detectWriteShape()` + `detectRetroactiveWriteEndpoints()` in scanDiff.ts
+- `DiffNewPostEndpointHit.writeShape?` field
+- `DiffJourneyHit` + `detectJourneyPairsInDiff()` in scanDiff.ts
+- Journey parser appended to `parseClaims()` end (post-existing-templates, dedupe via `journey:<label>:<steps>` key)
+- AutoProtect imports + journey-pair emission path
+- README documents the recognized write-shape table
+
 ## [0.2.7] — 2026-06-02
 
 Six closure fixes from a single dogfood debrief — the "0/4 catches on existing repo" finding on socialideagen pointed at structural gaps the prior 0.2.x releases didn't close. All fixes ship in one batch per the [[dont-defer-buildable-fixes]] rule.

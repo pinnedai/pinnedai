@@ -15,7 +15,7 @@ import type { Claim } from "./claimParser.js";
 import { claimKey } from "./claimParser.js";
 import type { RegistryEntry } from "./registry.js";
 import type { ChangedFile } from "./scanDiff.js";
-import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, detectNewPagesInDiff, detectNewValidationSchemasInDiff, detectHostConditionalInDiff, type DiffByFile } from "./scanDiff.js";
+import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, detectNewPagesInDiff, detectNewValidationSchemasInDiff, detectHostConditionalInDiff, detectJourneyPairsInDiff, type DiffByFile } from "./scanDiff.js";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -323,6 +323,28 @@ export function classifyDiff(input: ClassifyInput): ClassifyResult {
         },
         reason: `complement to the validation-rejects-bad pin for ${h.method} ${h.route} — validation pin only checks the bad-input direction (will stay green if real users get 4xx for valid requests). This pin checks the good-input direction. Needs the X-Pinned-Side-Effect wrapper.`,
         triggeredBy: h.filePath,
+        decision: "ask",
+      });
+    }
+
+    // Journey-pair detector (0.2.8+) — pairs a new POST endpoint with
+    // a new page added in the same diff when they share state. Emits
+    // a JourneyClaim as an ask candidate (never auto-add — the
+    // generated body assertions are heuristic and want a review).
+    for (const h of detectJourneyPairsInDiff(syntheticDiff)) {
+      tryEmit({
+        claim: {
+          template: "journey",
+          label: h.label,
+          steps: h.steps.map((s) => ({
+            method: s.method,
+            route: s.route,
+            expect: { status: { min: 200, max: 299 } },
+          })),
+          raw: h.suggestedPin,
+        },
+        reason: `new ${h.steps[0].method} ${h.steps[0].route} + new page ${h.steps[1].route} added in the same diff (${h.sharedToken}). Pin asserts the multi-step contract — that the write is reflected in what the page renders — which single-step pins can't catch.`,
+        triggeredBy: h.filePaths[0],
         decision: "ask",
       });
     }

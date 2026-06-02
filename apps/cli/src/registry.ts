@@ -512,6 +512,24 @@ export function renderCatchesMarkdown(input: {
   breaksCaught: number;
 }): string {
   const { catchHistory, breaksCaught } = input;
+  // Dedupe by claimId — same fix as `pinned catches` listing. Keep the
+  // most recent record per pin so the ledger shows unique regressions,
+  // not unique RECORDS. A pin caught twice (e.g. across cache resets)
+  // wrote two CATCHES.md entries before this; now one entry per pin.
+  const byClaim = new Map<string, CatchRenderRecord>();
+  for (const r of catchHistory) {
+    const existing = byClaim.get(r.claimId);
+    if (!existing) {
+      byClaim.set(r.claimId, r);
+      continue;
+    }
+    const a = existing.caughtAt ? new Date(existing.caughtAt).getTime() : 0;
+    const b = r.caughtAt ? new Date(r.caughtAt).getTime() : 0;
+    if (b > a) byClaim.set(r.claimId, r);
+  }
+  const dedupedHistory = Array.from(byClaim.values());
+  const eventCount = catchHistory.length;
+
   const lines: string[] = [
     "# Pinned catches",
     "",
@@ -521,7 +539,7 @@ export function renderCatchesMarkdown(input: {
     "",
   ];
 
-  if (catchHistory.length === 0) {
+  if (dedupedHistory.length === 0) {
     lines.push(
       "_No catches yet. Pinned is quietly verifying your pins on every commit; if any future change ever breaks a protected behavior, the catch will show up here._",
       ""
@@ -529,12 +547,15 @@ export function renderCatchesMarkdown(input: {
     return lines.join("\n");
   }
 
+  const eventsNote = eventCount > dedupedHistory.length
+    ? ` · ${eventCount} catch events recorded`
+    : "";
   lines.push(
-    `**Lifetime catches:** ${breaksCaught} (showing ${Math.min(catchHistory.length, breaksCaught)} most recent)`,
+    `**Lifetime catches:** ${breaksCaught} unique pin${breaksCaught === 1 ? "" : "s"}${eventsNote} (showing ${dedupedHistory.length} most recent)`,
     ""
   );
 
-  for (const c of catchHistory) {
+  for (const c of dedupedHistory) {
     const date = c.caughtAt ? c.caughtAt.slice(0, 10) : "—";
     const bugFixTag = c.bugFixOrigin ? " 🔁" : "";
     const pinTitle = c.template
@@ -571,10 +592,10 @@ export function renderCatchesMarkdown(input: {
   // Bug-fix-origin catches deserve a callout — they're the strongest
   // narrative ("the same bug Pinned was created to prevent fired
   // again, and Pinned caught it the second time too").
-  const bugFixCatches = catchHistory.filter((c) => c.bugFixOrigin).length;
+  const bugFixCatches = dedupedHistory.filter((c) => c.bugFixOrigin).length;
   if (bugFixCatches > 0) {
     lines.push(
-      `_🔁 = pin extracted from a bug-fix PR (${bugFixCatches} of ${catchHistory.length} catches). These are the cases where Pinned re-caught a regression that was already fixed once._`
+      `_🔁 = pin extracted from a bug-fix PR (${bugFixCatches} of ${dedupedHistory.length} catches). These are the cases where Pinned re-caught a regression that was already fixed once._`
     );
     lines.push("");
   }

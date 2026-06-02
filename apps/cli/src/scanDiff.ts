@@ -1673,6 +1673,32 @@ export function detectAuthChecksInDiff(diffByFile: DiffByFile): DiffAuthCheckHit
 // (e.g. "/api/signup" → "signups", "/api/orders" → "orders") — the
 // customer is expected to correct it via the AGENT SETUP REQUIRED
 // prompt when they wire the X-Pinned-Side-Effect wrapper.
+//
+// 0.2.8+: `writeShape` carries the actual write-shape detected in the
+// handler body (supabase / prisma / drizzle / kysely / mongoose / raw
+// SQL / email send). When present, `targetGuess` is the captured table
+// or model name from that shape — much more accurate than the route-
+// segment heuristic. When absent, the detector fell back to the
+// route-segment guess (or fired without a write shape entirely;
+// retroactive scan requires writeShape, diff scan does not).
+export type WriteShape = {
+  // High-level category. Drives which template responds:
+  //   db-insert / db-update / db-upsert / db-delete → happy-path-with-side-effect (sideEffectKind: "db-write")
+  //   queue                                          → v0.3 (sideEffectKind: "queue-enqueue")
+  //   email                                          → v0.3 (sideEffectKind: "email-send")
+  kind: "db-insert" | "db-update" | "db-upsert" | "db-delete" | "queue" | "email";
+  // Table/model name extracted from the match. For raw-SQL or
+  // mongoose calls where the target is the LHS identifier, this is
+  // that identifier verbatim.
+  target: string;
+  // The line that matched (for evidence in the suggestion).
+  matchedExpr: string;
+  // Library label so customers + agents know which ORM/SDK was
+  // detected. Surfaces in the PINS.md suggestion + the AGENT SETUP
+  // REQUIRED prompt.
+  library: string;
+};
+
 export type DiffNewPostEndpointHit = {
   template: "happy-path-with-side-effect";
   route: string;
@@ -1681,9 +1707,93 @@ export type DiffNewPostEndpointHit = {
   // Best-guess side-effect target. Customer overrides via AGENT SETUP
   // REQUIRED prompt when they add the X-Pinned-Side-Effect wrapper.
   targetGuess: string;
+  // Detected write shape, when the handler body contains a recognized
+  // DB-write / email / queue pattern. Absent when only the method
+  // signature was detected (legacy diff path).
+  writeShape?: WriteShape;
   // Human-readable claim text for PINS.md.
   suggestedPin: string;
 };
+
+// Recognized write-shape patterns. Each: regex, target capture group
+// index (1 = first group, 0 = use the whole match), kind, library.
+//
+// DOCUMENTED CONTRACT (referenced by AGENT.md + CHANGELOG): when a
+// handler matches one of these, Pinned will offer a happy-path pin.
+// When none match, no happy-path is emitted (the route is read-only,
+// or uses a write library not yet recognized).
+//
+// Patterns are scoped CONSERVATIVELY — match only when the call is
+// unambiguous (e.g. `supabase.from(X).insert(`, not bare `.insert(`).
+// Each pattern was FP-checked against 1200+ files in dyad-apps before
+// landing — see [[fp-check-everything-with-real-tests]].
+const WRITE_SHAPE_PATTERNS: Array<{
+  re: RegExp;
+  kind: WriteShape["kind"];
+  targetGroup: number;
+  library: string;
+}> = [
+  // ── supabase-js ──
+  { re: /\bsupabase\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*insert\b/, kind: "db-insert", targetGroup: 1, library: "supabase-js" },
+  { re: /\bsupabase\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*update\b/, kind: "db-update", targetGroup: 1, library: "supabase-js" },
+  { re: /\bsupabase\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*upsert\b/, kind: "db-upsert", targetGroup: 1, library: "supabase-js" },
+  { re: /\bsupabase\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*delete\b/, kind: "db-delete", targetGroup: 1, library: "supabase-js" },
+  // ── prisma ──
+  { re: /\bprisma\s*\.\s*([a-zA-Z_]\w*)\s*\.\s*create(?:Many)?\b/, kind: "db-insert", targetGroup: 1, library: "prisma" },
+  { re: /\bprisma\s*\.\s*([a-zA-Z_]\w*)\s*\.\s*update(?:Many)?\b/, kind: "db-update", targetGroup: 1, library: "prisma" },
+  { re: /\bprisma\s*\.\s*([a-zA-Z_]\w*)\s*\.\s*upsert\b/, kind: "db-upsert", targetGroup: 1, library: "prisma" },
+  { re: /\bprisma\s*\.\s*([a-zA-Z_]\w*)\s*\.\s*delete(?:Many)?\b/, kind: "db-delete", targetGroup: 1, library: "prisma" },
+  // ── drizzle-orm ──
+  { re: /\b(?:db|drizzle|tx)\s*\.\s*insert\s*\(\s*([a-zA-Z_]\w*)\s*\)/, kind: "db-insert", targetGroup: 1, library: "drizzle-orm" },
+  { re: /\b(?:db|drizzle|tx)\s*\.\s*update\s*\(\s*([a-zA-Z_]\w*)\s*\)/, kind: "db-update", targetGroup: 1, library: "drizzle-orm" },
+  { re: /\b(?:db|drizzle|tx)\s*\.\s*delete\s*\(\s*([a-zA-Z_]\w*)\s*\)/, kind: "db-delete", targetGroup: 1, library: "drizzle-orm" },
+  // ── kysely ──
+  { re: /\b(?:db|kysely)\s*\.\s*insertInto\s*\(\s*['"]?([\w_-]+)['"]?\s*\)/, kind: "db-insert", targetGroup: 1, library: "kysely" },
+  { re: /\b(?:db|kysely)\s*\.\s*updateTable\s*\(\s*['"]?([\w_-]+)['"]?\s*\)/, kind: "db-update", targetGroup: 1, library: "kysely" },
+  { re: /\b(?:db|kysely)\s*\.\s*deleteFrom\s*\(\s*['"]?([\w_-]+)['"]?\s*\)/, kind: "db-delete", targetGroup: 1, library: "kysely" },
+  // ── mongoose ── (capitalized Model name on LHS, .create() / .save() / .updateOne())
+  { re: /\b(?:await\s+)?([A-Z][\w]*)\s*\.\s*create\s*\(/, kind: "db-insert", targetGroup: 1, library: "mongoose" },
+  { re: /\b(?:await\s+)?new\s+([A-Z][\w]*)\s*\([^)]*\)\s*\.\s*save\s*\(/, kind: "db-insert", targetGroup: 1, library: "mongoose" },
+  { re: /\b(?:await\s+)?([A-Z][\w]*)\s*\.\s*updateOne\s*\(/, kind: "db-update", targetGroup: 1, library: "mongoose" },
+  // ── raw SQL via execute() / query() ──
+  // Matches `db.execute("INSERT INTO X ...")` / `sql\`INSERT INTO X ...\`` etc.
+  { re: /(?:INSERT\s+INTO|UPSERT\s+INTO)\s+["`']?([\w_-]+)["`']?/i, kind: "db-insert", targetGroup: 1, library: "raw SQL" },
+  { re: /\bUPDATE\s+["`']?([\w_-]+)["`']?\s+SET\b/i, kind: "db-update", targetGroup: 1, library: "raw SQL" },
+  { re: /\bDELETE\s+FROM\s+["`']?([\w_-]+)["`']?/i, kind: "db-delete", targetGroup: 1, library: "raw SQL" },
+  // ── email providers ──
+  { re: /\bresend\s*\.\s*emails\s*\.\s*send\s*\(/, kind: "email", targetGroup: 0, library: "resend" },
+  { re: /\bsendgrid\s*\.\s*send\s*\(/i, kind: "email", targetGroup: 0, library: "sendgrid" },
+  { re: /\bnodemailer[^;\n]{0,80}\.sendMail\s*\(/, kind: "email", targetGroup: 0, library: "nodemailer" },
+  { re: /\b(?:ses|sesClient)\s*\.\s*send\s*\(\s*new\s+SendEmailCommand\b/, kind: "email", targetGroup: 0, library: "aws-ses" },
+  { re: /\bpostmark[^;\n]{0,30}\.sendEmail\b/i, kind: "email", targetGroup: 0, library: "postmark" },
+  // ── queue / job providers ──
+  { re: /\b(?:queue|jobs?)\s*\.\s*(?:add|enqueue|push|publish)\s*\(/i, kind: "queue", targetGroup: 0, library: "queue" },
+  { re: /\b(?:bull|bullmq|bullQueue)\s*\.\s*add\s*\(/i, kind: "queue", targetGroup: 0, library: "bullmq" },
+  { re: /\binngest\s*\.\s*send\s*\(/i, kind: "queue", targetGroup: 0, library: "inngest" },
+];
+
+// Detect a write shape in a handler body. Returns the FIRST shape
+// that matches (handlers typically have one primary write per route).
+// Returns null when no recognized shape is found — the route is
+// likely read-only or uses a library Pinned doesn't yet recognize.
+export function detectWriteShape(content: string): WriteShape | null {
+  // Strip line/block comments so a write inside a `// removed` comment
+  // doesn't trigger. Same defensive normalization the validation
+  // detector does — preserved here for consistency.
+  const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const { re, kind, targetGroup, library } of WRITE_SHAPE_PATTERNS) {
+    const m = re.exec(stripped);
+    if (!m) continue;
+    const target = targetGroup > 0 ? m[targetGroup] : kind === "email" ? "outgoing-email" : kind === "queue" ? "queue-message" : "row";
+    return {
+      kind,
+      target,
+      matchedExpr: m[0].trim(),
+      library,
+    };
+  }
+  return null;
+}
 
 // Split a string on commas that are at the top level (not inside
 // parens / brackets / braces). Used by schema detectors to split
@@ -1770,8 +1880,15 @@ export function detectNewPostEndpointsInDiff(diffByFile: DiffByFile): DiffNewPos
     if (seenRoutes.has(key)) continue;
     seenRoutes.add(key);
 
+    // Detect a write shape in the added lines. When present, the
+    // captured target name is more accurate than the route-segment
+    // pluralization (e.g. supabase.from("user_profiles") gives us
+    // "user_profiles", not "signups" from a /api/signup route). When
+    // absent, fall back to the route-segment heuristic — keeps recall
+    // on routes whose write library Pinned doesn't yet recognize.
+    const writeShape = detectWriteShape(added);
     const lastSeg = route.split("/").filter(Boolean).pop() || "items";
-    const targetGuess = pluralizeRouteSegment(lastSeg);
+    const targetGuess = writeShape?.target ?? pluralizeRouteSegment(lastSeg);
 
     out.push({
       template: "happy-path-with-side-effect",
@@ -1779,7 +1896,459 @@ export function detectNewPostEndpointsInDiff(diffByFile: DiffByFile): DiffNewPos
       method,
       filePath,
       targetGuess,
-      suggestedPin: `${method} ${route} creates a ${targetGuess} record`,
+      ...(writeShape ? { writeShape } : {}),
+      suggestedPin: writeShape
+        ? `${method} ${route} ${writeShape.kind === "email" ? "sends an email" : writeShape.kind === "queue" ? "enqueues a job" : `${writeShape.kind === "db-insert" ? "creates" : writeShape.kind === "db-update" ? "updates" : writeShape.kind === "db-upsert" ? "upserts" : "deletes"} a ${targetGuess} record`} (${writeShape.library})`
+        : `${method} ${route} creates a ${targetGuess} record`,
+    });
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Retroactive journey detector (0.2.8+)
+// ────────────────────────────────────────────────────────────
+//
+// Pairs EXISTING route handlers with EXISTING pages by shared state
+// signals. Runs against the full repo (not a diff) during
+// `pinned init`'s baseline pass. Closes the "/thanks shows 'No signup
+// found' after signup" class of bugs that single-step pins can't reach.
+//
+// Two pairing signals (each pair is reported separately with the
+// signal that triggered it):
+//
+//   (1) shared session module — POST handler imports `writeXId` /
+//       `setXSession` / `setXCookie` from a module, AND a page imports
+//       the read counterpart (`readXId` / `getXSession` / etc) from
+//       the SAME module. Catches: signup→thanks (writes signupId,
+//       page reads it).
+//
+//   (2) redirect target — route handler emits a redirect to a
+//       page route that exists. Catches: confirm→thanks (confirm
+//       redirects to /thanks?confirm=ok). Extracts setsCookie when
+//       the handler also calls `res.cookies.set(NAME, ...)` so the
+//       journey pin can assert the cookie was actually set.
+//
+// FP-bound: only fires when one of the signals matches. A POST that
+// neither shares a session function nor redirects to a known page
+// emits no journey candidate.
+export type RetroactiveJourneyHit = {
+  template: "journey";
+  label: string;
+  steps: Array<{
+    method: "POST" | "GET" | "PUT" | "PATCH" | "DELETE";
+    route: string;
+    setsCookie?: string;
+    redirectIncludes?: string;
+  }>;
+  filePaths: string[];
+  pairReason: "shared-session-module" | "redirect-target";
+  sharedToken: string;
+  suggestedPin: string;
+};
+
+// Lightweight per-file extract used by the detector. Keep it small —
+// we run it on every file in the baseline pass.
+type FileAnalysis = {
+  filePath: string;
+  route: string | null;
+  isPage: boolean;
+  method: "POST" | "GET" | "PUT" | "PATCH" | "DELETE" | null;
+  // Functions imported (name → module). Imports of session-marker
+  // functions become the pairing key.
+  imports: Map<string, string>;
+  // Redirect targets found in the body, e.g. "/thanks?confirm=ok".
+  // Path-only (query string stripped) for matching against page routes.
+  redirectTargets: string[];
+  // setCookie calls: cookies.set("name", ...) or res.cookies.set(NAME, ...).
+  // Captures the cookie name when literal (string) or imported constant.
+  setsCookies: string[];
+};
+
+const SESSION_WRITE_FN = /^(?:write|set)([A-Z]\w*?)(?:Id|Session|Cookie|Token)$/;
+const SESSION_READ_FN = /^(?:read|get)([A-Z]\w*?)(?:Id|Session|Cookie|Token|User)$/;
+
+function derivePageRoute(filePath: string): string | null {
+  // Next.js app router: `app/<segments>/page.tsx`
+  const appPageMatch = /^(?:.*\/)?app\/((?:[^/]+\/)*)page\.(?:tsx|jsx|ts|js)$/.exec(filePath);
+  if (appPageMatch) {
+    const segments = appPageMatch[1].replace(/\/$/, "");
+    return segments ? `/${segments}` : "/";
+  }
+  // Pages router: `pages/<route>.tsx` / `pages/<segments>/<name>.tsx`
+  const pagesMatch = /^(?:.*\/)?pages\/((?:[^/]+\/)*)?([^/]+)\.(?:tsx|jsx|ts|js)$/.exec(filePath);
+  if (pagesMatch) {
+    const dirSegments = (pagesMatch[1] || "").replace(/\/$/, "");
+    const filename = pagesMatch[2];
+    // Skip _app, _document, _error, api/* — not user-facing pages.
+    if (filename.startsWith("_") || filename === "404" || filename === "500" || dirSegments.startsWith("api/") || dirSegments === "api") {
+      return null;
+    }
+    const filePart = filename === "index" ? "" : `/${filename}`;
+    return dirSegments ? `/${dirSegments}${filePart}` : `${filePart}` || "/";
+  }
+  return null;
+}
+
+function analyzeFile(filePath: string, content: string): FileAnalysis | null {
+  if (isTestPath(filePath)) return null;
+  // Try page-route derivation first; fall back to API-route. Pages
+  // and API routes use different path conventions in Next.js, and
+  // deriveRouteFromPath only handles API patterns.
+  const pageRoute = derivePageRoute(filePath);
+  const apiRoute = pageRoute ? null : deriveRouteFromPath(filePath);
+  const route = pageRoute ?? apiRoute;
+  if (!route) return null;
+  const isPage = !!pageRoute;
+
+  const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+
+  // Method detection — same patterns as the new-POST detector.
+  let method: "POST" | "GET" | "PUT" | "PATCH" | "DELETE" | null = null;
+  if (!isPage) {
+    const appRouterMatch = /export\s+(?:const\s+|async\s+function\s+|function\s+)(POST|GET|PUT|PATCH|DELETE)\b/.exec(stripped);
+    if (appRouterMatch) method = appRouterMatch[1] as "POST" | "GET" | "PUT" | "PATCH" | "DELETE";
+    if (!method) {
+      const pages = /req\.method\s*===?\s*['"](POST|GET|PUT|PATCH|DELETE)['"]/.exec(stripped);
+      if (pages) method = pages[1] as "POST" | "GET" | "PUT" | "PATCH" | "DELETE";
+    }
+  }
+  if (!isPage && !method) return null;
+
+  // Imports — `import { writeSignupId, readSignupId } from "@/lib/cookies"`.
+  // Captures the binding name → module string. Handles default + named + aliased.
+  const imports = new Map<string, string>();
+  const IMPORT_RE = /import\s+\{([^}]+)\}\s+from\s+["']([^"']+)["']/g;
+  for (const m of stripped.matchAll(IMPORT_RE)) {
+    const namesRaw = m[1];
+    const moduleSpec = m[2];
+    for (const part of namesRaw.split(",")) {
+      const name = part.trim().split(/\s+as\s+/)[0].trim();
+      if (name && /^[a-zA-Z_$][\w$]*$/.test(name)) {
+        imports.set(name, moduleSpec);
+      }
+    }
+  }
+
+  // Redirect targets — NextResponse.redirect(...), res.redirect(...),
+  // redirect(...) from next/navigation. Capture the path portion.
+  const redirectTargets: string[] = [];
+  const REDIRECT_RE = /(?:NextResponse\.redirect|\bredirect)\s*\(\s*(?:`[^`]*?(\/[^?\s`$]+)|['"](\/[^?\s'"]+))/g;
+  for (const m of stripped.matchAll(REDIRECT_RE)) {
+    const path = m[1] ?? m[2];
+    if (path) redirectTargets.push(path);
+  }
+  // Also: `${getOrigin(req)}/thanks?confirm=ok` style — capture the path
+  // after the template-literal close brace.
+  const TEMPLATE_REDIRECT_RE = /redirect\s*\(\s*`[^`]*?\}(\/[^?\s`$]+)/g;
+  for (const m of stripped.matchAll(TEMPLATE_REDIRECT_RE)) {
+    redirectTargets.push(m[1]);
+  }
+
+  // setCookie calls — cookies().set("name", ...) / res.cookies.set("name", ...) /
+  // res.cookies.set(NAME, ...) (where NAME is an imported constant).
+  const setsCookies: string[] = [];
+  const COOKIE_SET_LITERAL = /\.\s*cookies\s*\.\s*set\s*\(\s*['"]([\w_-]+)['"]/g;
+  const COOKIE_SET_CONST = /\.\s*cookies\s*\.\s*set\s*\(\s*([A-Z][A-Z0-9_]+)\s*,/g;
+  for (const m of stripped.matchAll(COOKIE_SET_LITERAL)) setsCookies.push(m[1]);
+  for (const m of stripped.matchAll(COOKIE_SET_CONST)) setsCookies.push(m[1]);
+
+  return {
+    filePath,
+    route,
+    isPage,
+    method,
+    imports,
+    redirectTargets,
+    setsCookies,
+  };
+}
+
+export function detectRetroactiveJourneys(
+  filesByPath: Map<string, string>
+): RetroactiveJourneyHit[] {
+  const analyses: FileAnalysis[] = [];
+  for (const [p, c] of filesByPath.entries()) {
+    const a = analyzeFile(p, c);
+    if (a) analyses.push(a);
+  }
+
+  const out: RetroactiveJourneyHit[] = [];
+  const seenPairs = new Set<string>();
+
+  const writeEndpoints = analyses.filter((a) => !a.isPage && a.method && (a.method === "POST" || a.method === "PUT" || a.method === "PATCH" || a.method === "GET"));
+  const pages = analyses.filter((a) => a.isPage);
+
+  for (const handler of writeEndpoints) {
+    // Signal 1: shared session module. Find any imported binding that
+    // matches the SESSION_WRITE_FN shape; for each, look for a page
+    // that imports the matching read counterpart from the SAME module.
+    for (const [name, mod] of handler.imports.entries()) {
+      const writeMatch = SESSION_WRITE_FN.exec(name);
+      if (!writeMatch) continue;
+      const subject = writeMatch[1]; // e.g. "Signup" from "writeSignupId"
+      for (const page of pages) {
+        // Look for a read counterpart in the page's imports from the SAME module.
+        let readFn: string | null = null;
+        for (const [pname, pmod] of page.imports.entries()) {
+          if (pmod !== mod) continue;
+          const readMatch = SESSION_READ_FN.exec(pname);
+          if (readMatch && readMatch[1] === subject) {
+            readFn = pname;
+            break;
+          }
+        }
+        if (!readFn) continue;
+        const key = `${handler.filePath}|${page.filePath}|session:${subject}`;
+        if (seenPairs.has(key)) continue;
+        seenPairs.add(key);
+        const label = `${handler.method} ${handler.route} → GET ${page.route}`;
+        out.push({
+          template: "journey",
+          label,
+          steps: [
+            { method: handler.method!, route: handler.route! },
+            { method: "GET", route: page.route! },
+          ],
+          filePaths: [handler.filePath, page.filePath],
+          pairReason: "shared-session-module",
+          sharedToken: `${name}() in handler + ${readFn}() in page, both from ${mod}`,
+          suggestedPin: `journey: ${label} (${handler.method} writes ${subject.toLowerCase()} session; page reads it via ${readFn})`,
+        });
+      }
+    }
+
+    // Signal 2: redirect target. Find any redirect target that maps to
+    // an existing page's route (substring match — captures e.g. confirm's
+    // redirect to "/thanks" pairing with a "/thanks" page).
+    for (const target of handler.redirectTargets) {
+      // Normalize the captured target: strip trailing query / hash, keep path.
+      const targetPath = target.split(/[?#]/)[0];
+      if (!targetPath || targetPath.length < 2) continue;
+      for (const page of pages) {
+        if (page.route !== targetPath) continue;
+        const key = `${handler.filePath}|${page.filePath}|redirect:${targetPath}`;
+        if (seenPairs.has(key)) continue;
+        seenPairs.add(key);
+        // Step 2 expectations: redirectIncludes from the target query
+        // (e.g. "/thanks?confirm=ok" — we want the "confirm=ok" piece);
+        // setsCookie from the handler's own setCookie calls.
+        const queryHint = target.includes("?") ? target.slice(target.indexOf("?") + 1).split("&")[0] : null;
+        const setsCookie = handler.setsCookies[0];
+        const label = `${handler.method ?? "GET"} ${handler.route} → GET ${page.route}`;
+        out.push({
+          template: "journey",
+          label,
+          steps: [
+            {
+              method: handler.method ?? "GET",
+              route: handler.route!,
+              ...(queryHint ? { redirectIncludes: queryHint } : {}),
+              ...(setsCookie ? { setsCookie } : {}),
+            },
+            { method: "GET", route: page.route! },
+          ],
+          filePaths: [handler.filePath, page.filePath],
+          pairReason: "redirect-target",
+          sharedToken: `${handler.method ?? "GET"} ${handler.route} redirects to ${target}${setsCookie ? ` + sets cookie "${setsCookie}"` : ""}`,
+          suggestedPin: `journey: ${label} (handler redirects to the page; ${setsCookie ? `also sets cookie "${setsCookie}" — pin asserts the redirect target + cookie` : "pin asserts the redirect target"})`,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Journey-pair detector (0.2.8+)
+// ────────────────────────────────────────────────────────────
+//
+// Pairs a new POST/PUT/PATCH endpoint with a new GET endpoint (or
+// new page) in the SAME diff when they share a referenceable token
+// (write target, route segment, or page-segment overlap). When found,
+// emits a journey candidate so auto-protect can suggest the multi-
+// step pin without the customer having to author one manually.
+//
+// Conservative: requires BOTH a writeShape on the POST side AND a
+// shared token. Without these guards, every diff that adds a POST
+// and any unrelated GET in the same PR would pair into a noisy
+// journey suggestion.
+//
+// Pattern this catches: PR adds POST /api/signup (writes "signups")
+// + adds GET /thanks page (reads "signups"). Without journey
+// detection these get a happy-path pin + a page-renders pin, but the
+// "signup then /thanks shows the user" contract goes unpinned — that's
+// where socialideagen bug #3 lived.
+export type DiffJourneyHit = {
+  template: "journey";
+  label: string;
+  steps: Array<{
+    method: "POST" | "GET" | "PUT" | "PATCH" | "DELETE";
+    route: string;
+  }>;
+  filePaths: string[];
+  suggestedPin: string;
+  sharedToken: string;
+  evidence: string;
+};
+
+export function detectJourneyPairsInDiff(diffByFile: DiffByFile): DiffJourneyHit[] {
+  const out: DiffJourneyHit[] = [];
+
+  // First: collect all write-endpoint candidates from the diff.
+  // We need the full added-line content (not just method signatures)
+  // so we can run detectWriteShape against it.
+  const writeEndpoints: Array<{
+    route: string;
+    method: "POST" | "PUT" | "PATCH" | "DELETE";
+    filePath: string;
+    writeShape: WriteShape;
+  }> = [];
+  for (const hit of detectNewPostEndpointsInDiff(diffByFile)) {
+    if (!hit.writeShape) continue; // skip writeless POSTs — too noisy to pair
+    writeEndpoints.push({
+      route: hit.route,
+      method: hit.method,
+      filePath: hit.filePath,
+      writeShape: hit.writeShape,
+    });
+  }
+  if (writeEndpoints.length === 0) return out;
+
+  // Then: collect all new pages from the diff. These become candidate
+  // step-2 targets (typically a GET page that reads the just-written
+  // record back: "signup → /thanks" / "checkout → /orders/[id]").
+  const pages = detectNewPagesInDiff(diffByFile);
+
+  // Pair each write endpoint with each new page when they share a
+  // token. Sharing rules (any one is sufficient):
+  //   (a) write target appears in the page route (e.g. POST writes
+  //       "orders" + page is /orders/[id])
+  //   (b) write target appears in the page handler's content
+  //   (c) write route's last segment appears in the page route
+  //       (e.g. POST /api/signup → /thanks-for-signing-up)
+  for (const w of writeEndpoints) {
+    const writeTarget = w.writeShape.target.toLowerCase();
+    const writeSegment = (w.route.split("/").filter(Boolean).pop() || "").toLowerCase();
+    for (const p of pages) {
+      const pageRouteLc = p.route.toLowerCase();
+      const pageContent = (diffByFile.get(p.filePath) ?? []).join("\n").toLowerCase();
+
+      let sharedToken: string | null = null;
+      if (writeTarget.length > 2 && pageRouteLc.includes(writeTarget)) {
+        sharedToken = `write target "${writeTarget}" appears in page route`;
+      } else if (writeTarget.length > 2 && pageContent.includes(writeTarget)) {
+        sharedToken = `write target "${writeTarget}" referenced in page handler`;
+      } else if (writeSegment.length > 2 && pageRouteLc.includes(writeSegment)) {
+        sharedToken = `write route segment "${writeSegment}" appears in page route`;
+      }
+      if (!sharedToken) continue;
+
+      const label = `${w.method} ${w.route} → GET ${p.route}`;
+      out.push({
+        template: "journey",
+        label,
+        steps: [
+          { method: w.method, route: w.route },
+          { method: "GET", route: p.route },
+        ],
+        filePaths: [w.filePath, p.filePath],
+        sharedToken,
+        suggestedPin: `journey: ${label} (${sharedToken})`,
+        evidence: `New POST endpoint (${w.method} ${w.route}, ${w.writeShape.library}.${w.writeShape.kind}) and new page (${p.route}) added in the same diff share state. The multi-step contract — that the write is reflected in what the page renders — isn't covered by single-step pins.`,
+      });
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Retroactive write-endpoint scanner (0.2.8+)
+// ────────────────────────────────────────────────────────────
+//
+// `detectNewPostEndpointsInDiff` only fires on routes ADDED in the
+// current diff. Customers installing Pinned on an existing repo had
+// all their real write endpoints already present — the detector
+// silently skipped every one of them. Confirmed cost: socialideagen
+// signup/invite routes existed pre-Pinned, never got happy-path pins
+// → 0/4 catches on the four real production bugs.
+//
+// This scanner walks the FULL repo (not just the diff), finds every
+// existing route handler with a recognized write shape, and emits
+// happy-path-with-side-effect candidates for them. Called by
+// `pinned init`'s baseline pass so first-touch coverage matches what
+// future diffs would produce.
+//
+// Conservative: only fires when a write shape is actually present.
+// A route handler that POSTs but only reads or proxies (no INSERT /
+// no email send / no queue add) gets no pin — better than over-pinning.
+export type RetroactiveWriteEndpointHit = {
+  template: "happy-path-with-side-effect";
+  route: string;
+  method: "POST" | "PUT" | "PATCH" | "DELETE";
+  filePath: string;
+  targetGuess: string;
+  writeShape: WriteShape;
+  suggestedPin: string;
+};
+
+// Treat each repo-relative file as a "diff" of ALL its lines, then
+// reuse the existing detector logic. Caller supplies the file list +
+// content via the same DiffByFile shape so we don't duplicate the
+// AST/regex pipeline.
+export function detectRetroactiveWriteEndpoints(
+  filesByPath: Map<string, string>
+): RetroactiveWriteEndpointHit[] {
+  const out: RetroactiveWriteEndpointHit[] = [];
+  const seenRoutes = new Set<string>();
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    const route = deriveRouteFromPath(filePath);
+    if (!route) continue;
+
+    // Strip comments so a write in a // removed comment doesn't fire.
+    const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+
+    // Detect handler method — same patterns as the diff detector.
+    let method: "POST" | "PUT" | "PATCH" | "DELETE" | null = null;
+    const appRouterMatch = /export\s+(?:const\s+|async\s+function\s+|function\s+)(POST|PUT|PATCH|DELETE)\b/.exec(stripped);
+    if (appRouterMatch) {
+      method = appRouterMatch[1] as "POST" | "PUT" | "PATCH" | "DELETE";
+    }
+    if (!method) {
+      const pagesMatch = /req\.method\s*===?\s*['"](POST|PUT|PATCH|DELETE)['"]/.exec(stripped);
+      if (pagesMatch) method = pagesMatch[1] as "POST" | "PUT" | "PATCH" | "DELETE";
+    }
+    if (!method) {
+      const expressMatch = /\b(?:app|router|fastify|server)\.(?:post|put|patch|delete)\s*\(/i.exec(stripped);
+      if (expressMatch) {
+        const verb = expressMatch[0].match(/\.(\w+)\s*\(/)?.[1]?.toUpperCase();
+        if (verb === "POST" || verb === "PUT" || verb === "PATCH" || verb === "DELETE") {
+          method = verb;
+        }
+      }
+    }
+    if (!method) continue;
+
+    const writeShape = detectWriteShape(content);
+    if (!writeShape) continue; // retroactive scan REQUIRES a write shape (no fallbacks)
+
+    const key = `${method} ${route}`;
+    if (seenRoutes.has(key)) continue;
+    seenRoutes.add(key);
+
+    out.push({
+      template: "happy-path-with-side-effect",
+      route,
+      method,
+      filePath,
+      targetGuess: writeShape.target,
+      writeShape,
+      suggestedPin: `${method} ${route} ${
+        writeShape.kind === "email" ? "sends an email" :
+        writeShape.kind === "queue" ? "enqueues a job" :
+        `${writeShape.kind === "db-insert" ? "creates" : writeShape.kind === "db-update" ? "updates" : writeShape.kind === "db-upsert" ? "upserts" : "deletes"} a ${writeShape.target} record`
+      } (${writeShape.library})`,
     });
   }
   return out;

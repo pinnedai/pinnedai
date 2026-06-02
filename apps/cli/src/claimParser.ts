@@ -1597,6 +1597,76 @@ export function parseClaims(rawBody: string): Claim[] {
     }
   }
 
+  // ── Multi-step journey claims (0.2.8+) ───────────────────────────
+  // High-precision parser for the common "X then Y" / "after X, Y" /
+  // "X → Y" phrasings. Conservative: requires both steps to be
+  // method+route shaped + extracts body assertions from the
+  // surrounding "shows X" / "without Y" / "returns the Z" prose.
+  // Less common phrasings rely on the LLM SYSTEM_PROMPT (entry #8)
+  // to extract; these regexes cover the high-value path so customers
+  // without BYOK get the same coverage.
+  //
+  // Two regex shapes, both with the same capture groups:
+  //   (a) "X then Y" / "X → Y" / "X -> Y" / "X followed by Y"
+  //   (b) "After X, Y" / "Once X, Y" — leading-clause phrasing
+  const JOURNEY_PATTERNS = [
+    /\b(?<m1>POST|GET|PUT|PATCH|DELETE)\s+(?<r1>\/[A-Za-z0-9_/:.{}\[\]\-]+)[^\n]{0,80}?(?:then|->|→|followed by|,\s*then)\s+(?:(?<m2>POST|GET|PUT|PATCH|DELETE)\s+)?(?<r2>\/[A-Za-z0-9_/:.{}\[\]\-]+)[^\n]{0,200}/gi,
+    /\b(?:After|Once)\s+(?<m1>POST|GET|PUT|PATCH|DELETE)\s+(?<r1>\/[A-Za-z0-9_/:.{}\[\]\-]+)\s*,?\s*(?<m2>POST|GET|PUT|PATCH|DELETE)\s+(?<r2>\/[A-Za-z0-9_/:.{}\[\]\-]+)[^\n]{0,200}/gi,
+  ];
+  for (const re of JOURNEY_PATTERNS) for (const m of body.matchAll(re)) {
+    const g = m.groups!;
+    const m1 = g.m1.toUpperCase() as "POST" | "GET" | "PUT" | "PATCH" | "DELETE";
+    const m2 = (g.m2 ?? "GET").toUpperCase() as "POST" | "GET" | "PUT" | "PATCH" | "DELETE";
+    const r1 = g.r1;
+    const r2 = g.r2;
+    if (r1 === r2) continue; // single-route — not a journey
+
+    // Extract body assertions from the chunk AFTER the second route.
+    // The match's tail is the next ~200 chars; parse for "shows X" /
+    // "displays X" / "returns the X" / "without X" / "no longer shows X".
+    const tail = m[0].slice(m[0].indexOf(r2) + r2.length);
+    const bodyIncludes: string[] = [];
+    const bodyForbids: string[] = [];
+    // Quoted strings: "shows '<quoted>'" / "returns \"<quoted>\""
+    const QUOTED_INCLUDE = /\b(?:shows?|displays?|returns?|renders?|includes?|contains?)\s+(?:the\s+)?["'`]([^"'`\n]{2,80})["'`]/gi;
+    const QUOTED_FORBID = /\b(?:without|no longer (?:shows?|displays?)|does(?:n't| not) (?:show|display|contain)|missing)\s+(?:the\s+)?["'`]([^"'`\n]{2,80})["'`]/gi;
+    for (const qm of tail.matchAll(QUOTED_INCLUDE)) bodyIncludes.push(qm[1]);
+    for (const qm of tail.matchAll(QUOTED_FORBID)) bodyForbids.push(qm[1]);
+    // Bare "without expired session" / "no error banner" — capture
+    // the next 1-3 word noun phrase. Conservative on length.
+    if (bodyForbids.length === 0) {
+      const bareForbid = /\bwithout\s+([a-z][a-z0-9 _'\-]{2,40}?)(?:[\.,;]|$)/i.exec(tail);
+      if (bareForbid) bodyForbids.push(bareForbid[1].trim());
+    }
+
+    const label = `${m1} ${r1} → ${m2} ${r2}`;
+    const expectStep2: JourneyStep["expect"] = {
+      status: { min: 200, max: 299 },
+    };
+    if (bodyIncludes.length > 0) expectStep2.bodyIncludes = bodyIncludes;
+    if (bodyForbids.length > 0) expectStep2.bodyForbids = bodyForbids;
+
+    const c: JourneyClaim = {
+      template: "journey",
+      label,
+      steps: [
+        {
+          method: m1,
+          route: r1,
+          expect: { status: { min: 200, max: 299 } },
+        },
+        {
+          method: m2,
+          route: r2,
+          expect: expectStep2,
+        },
+      ],
+      raw: m[0].trim().replace(/\s+/g, " "),
+    };
+    const stepKey = c.steps.map((s) => `${s.method}:${s.route}`).join("|");
+    push(c, `journey:${label}:${stepKey}`);
+  }
+
   return claims;
 }
 

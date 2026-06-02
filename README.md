@@ -70,6 +70,21 @@ Three new templates for the contracts a real app actually wants pinned:
 - **`validation-rejects-bad`** — *"POST /api/X with bad input returns 400."* Catches removed/weakened input validation. One pin, N sub-tests (malformed-JSON + per-field missing).
 - **`happy-path-with-side-effect`** — *"POST /api/X creates a users record."* Catches stub endpoints returning 200 without doing the work (misleading-green) via the `X-Pinned-Side-Effect` response header convention.
 
+`happy-path-with-side-effect` auto-fires on routes with these recognized write shapes (0.2.8+), both in new diffs AND retroactively on `pinned init` for existing handlers:
+
+| Library | Pattern detected |
+|---|---|
+| supabase-js | `supabase.from("X").insert/update/upsert/delete` |
+| prisma | `prisma.X.create/update/upsert/delete` (incl. `createMany` / `updateMany`) |
+| drizzle-orm | `db.insert/update/delete(X)` (also `tx.insert(...)` inside transactions) |
+| kysely | `db.insertInto("X")` / `db.updateTable("X")` / `db.deleteFrom("X")` |
+| mongoose | `Model.create(...)`, `new Model(...).save()`, `Model.updateOne(...)` |
+| raw SQL | `INSERT INTO X`, `UPDATE X SET`, `DELETE FROM X` inside `db.execute()` / `sql\`...\`` |
+| resend / sendgrid / nodemailer / aws-ses / postmark | their send / sendMail / sendEmail methods |
+| bullmq / inngest / generic queue | `queue.add()`, `inngest.send()`, `jobs.enqueue()` |
+
+If your repo uses a write library not yet recognized, the pin won't auto-fire — open an issue with the import pattern. Adding a row is two regex lines.
+
 See [CHANGELOG.md](./CHANGELOG.md#020--2026-06-02) for parser phrasings + the side-effect wrapper customers add.
 
 ## What Pinned protects
