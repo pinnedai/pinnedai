@@ -7,9 +7,9 @@
   "recentlyAddedCount": 1,
   "recentlyAddedAt": "2026-06-02T07:33:03.111Z",
   "suggestedCount": 0,
-  "lastCheckedSha": "ba8bceb87dd598751c91e1e1840f4b435bf73095",
-  "lastCheckedDirtyHash": "762cda2d3d98eb80",
-  "updatedAt": "2026-06-02T09:25:28.787Z",
+  "lastCheckedSha": "df89d3f5aad9651d0313d9e3f2045e4a8638a869",
+  "lastCheckedDirtyHash": "f381a98d4a89e34f",
+  "updatedAt": "2026-06-02T09:26:51.182Z",
   "lastAutoProtectAt": "2026-05-26T15:35:19.295Z",
   "lastAddNotifiedAt": "2026-06-02T07:33:03.111Z",
   "recentlyAddedSummaries": [
@@ -97,10 +97,10 @@
       "originPr": "v0-1-1"
     }
   ],
-  "checksRun": 43,
-  "verifiedStreak": 8,
-  "skippedCount": 2,
-  "lastVerifiedAt": "2026-06-02T08:16:34.188Z",
-  "lastCoveredAt": "2026-06-02T08:16:34.190Z",
-  "lastCoveredCount": 49
+  "checksRun": 44,
+  "verifiedStreak": 9,
+  "skippedCount": 3,
+  "lastVerifiedAt": "2026-06-02T09:25:31.840Z",
+  "lastCoveredAt": "2026-06-02T09:25:31.842Z",
+  "lastCoveredCount": 48
 }

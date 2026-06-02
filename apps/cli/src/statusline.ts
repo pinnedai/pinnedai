@@ -1022,13 +1022,35 @@ export function formatChatHook(
         const t = new Date(r.caughtAt).getTime();
         return Number.isFinite(t) && t >= cutoff;
       });
-      if (recent.length > 0) {
+      // Dedupe by claimId — the catchHistory legitimately records every
+      // run's catch (so re-running `pinned test` against an unfixed
+      // breakage doesn't lose the audit trail), but the user-facing
+      // "N regressions caught in the last 24h" must count UNIQUE pins,
+      // not unique records. Without this dedupe, 3 broken pins × 2
+      // recorded runs = "6 regressions caught" — inflated stale data
+      // that re-announces the same issues every prompt. Caught on
+      // socialideagen dogfood 2026-06-02 as a HIGH-severity TRUST bug.
+      const byClaim = new Map<string, CatchRecord>();
+      for (const r of recent) {
+        const existing = byClaim.get(r.claimId);
+        if (!existing) {
+          byClaim.set(r.claimId, r);
+          continue;
+        }
+        // Keep the most-recent record per claim so timestamps reflect
+        // when the issue last fired, not the first time.
+        const a = new Date(existing.caughtAt).getTime();
+        const b = new Date(r.caughtAt).getTime();
+        if (b > a) byClaim.set(r.claimId, r);
+      }
+      const deduped = Array.from(byClaim.values());
+      if (deduped.length > 0) {
         // Sort by severity (highest first) so the headline picks the
         // most-serious catch as the lede.
         const rankOf: Record<string, number> = {
           critical: 4, high: 3, medium: 2, low: 1, info: 0,
         };
-        const ranked = [...recent].sort(
+        const ranked = [...deduped].sort(
           (a, b) => (rankOf[b.severity ?? "info"] ?? 0) - (rankOf[a.severity ?? "info"] ?? 0)
         );
         return {
