@@ -30,7 +30,10 @@
       "filename": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2.test.ts",
       "pinnedAt": "2026-05-20T03:06:38.275Z",
       "pinnedBy": "michaelzon",
-      "status": "active"
+      "status": "retired",
+      "retiredAt": "2026-06-02T03:00:02.318Z",
+      "retireReason": "Check output intentionally changed in 0.1.3 — 'Found N claim(s)' became 'Recognized N of M claim(s); X dropped' so silent parser failures are surfaced. Coverage now lives in the cli.integration test 'reports dropped claims when phrasings dont match any template'.",
+      "retiredBy": "michaelzon"
     },
     {
       "claimId": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-x-1f36y4",

@@ -24,6 +24,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { execFileSync, spawnSync as childSpawnSync } from "node:child_process";
 import {
   parseClaims,
+  parseClaimsWithDiagnostics,
   unionClaims,
   describeClaimForUser,
   detectBugFixPhrase,
@@ -313,14 +314,30 @@ program
       );
       process.exit(1);
     }
-    const regexClaims = parseClaims(body);
+    const regexDiag = parseClaimsWithDiagnostics(body);
+    const regexClaims = regexDiag.recognized;
     const llm = await llmExtract(body);
     const llmClaims = llm.ok ? llm.claims : [];
     const claims = unionClaims(regexClaims, llmClaims);
     const llmContribution = claims.length - regexClaims.length;
 
+    // A line was "dropped" by regex if no template matched it. Some of
+    // those lines may now be covered by an LLM claim — recompute by
+    // checking each dropped line against the unioned claim set.
+    const finalCoveredText = claims.map((c) => c.raw.toLowerCase().trim());
+    const dropped = regexDiag.dropped.filter((line) => {
+      const norm = line.toLowerCase().trim();
+      return !finalCoveredText.some(
+        (r) => r === norm || norm.includes(r) || r.includes(norm)
+      );
+    });
+
     if (opts.json) {
-      out(JSON.stringify(claims, null, 2));
+      // Include diagnostics in JSON so consumers (the GitHub Action,
+      // PR-comment workflow, etc.) can surface dropped lines too.
+      const payload =
+        dropped.length > 0 ? { claims, dropped } : claims;
+      out(JSON.stringify(payload, null, 2));
       return;
     }
     if (llm.ok && !opts.json) {
@@ -331,15 +348,31 @@ program
     } else if (!llm.ok && llm.reason === "error") {
       err(`✗ LLM extraction failed: ${llm.error}\n`);
     }
-    if (claims.length === 0) {
+    if (claims.length === 0 && dropped.length === 0) {
       out("No claims found. Examples of claim phrasings Pinned recognizes:");
       out('  "Rate-limits /api/users to 60 req/min."');
       out('  "Auth required on /api/admin/export."');
       out('  "Makes /webhooks/stripe idempotent on event_id."');
       return;
     }
-    out(`Found ${claims.length} claim(s):`);
-    for (const c of claims) out(`  • ${describeClaim(c)}`);
+    if (dropped.length > 0) {
+      // Surface dropped lines BEFORE the recognized list so users notice
+      // them. Otherwise "Found N claim(s)" reads like 100% recognition.
+      const total = claims.length + dropped.length;
+      out(
+        `Recognized ${claims.length} of ${total} claim(s). ${dropped.length} dropped — no template matched their phrasing:`
+      );
+      for (const d of dropped) out(`  - ${d}`);
+      out("");
+      out(
+        "Tip: rephrase using a supported pattern (run `pinned check` with no args for examples), or open an issue at https://github.com/pinnedai/pinnedai/issues — we add templates from real claim phrasings."
+      );
+      out("");
+    }
+    if (claims.length > 0) {
+      out(`Recognized claim(s):`);
+      for (const c of claims) out(`  • ${describeClaim(c)}`);
+    }
   });
 
 // ---------- generate ----------
@@ -391,12 +424,31 @@ program
         err("✗ No PR description provided.\n");
         process.exit(1);
       }
-      const regexClaims = parseClaims(body);
+      const regexDiag = parseClaimsWithDiagnostics(body);
+      const regexClaims = regexDiag.recognized;
       const llm = await llmExtract(body);
       const llmClaims = llm.ok ? llm.claims : [];
       const claims = unionClaims(regexClaims, llmClaims);
+      // Surface dropped lines from the regex pass that the LLM didn't
+      // pick up either. Users explicitly asked for these to be visible
+      // (silent failure → looks like 100% recognition).
+      const finalCoveredText = claims.map((c) => c.raw.toLowerCase().trim());
+      const droppedClaims = regexDiag.dropped.filter((line) => {
+        const norm = line.toLowerCase().trim();
+        return !finalCoveredText.some(
+          (r) => r === norm || norm.includes(r) || r.includes(norm)
+        );
+      });
       if (llm.ok) {
         out(`(${describeLlmMode(llm)})`);
+      }
+      if (droppedClaims.length > 0 && !opts.json) {
+        const total = claims.length + droppedClaims.length;
+        out(
+          `Recognized ${claims.length} of ${total} claim(s). ${droppedClaims.length} dropped — no template matched:`
+        );
+        for (const d of droppedClaims) out(`  - ${d}`);
+        out("");
       }
       if (claims.length === 0) {
         // Distinguish "regex found nothing AND LLM also found nothing"
@@ -2096,24 +2148,43 @@ program
       }
     }
     out("");
-    out("Try it:");
-    out("  npx pinnedai try            # local demo");
-    out("  pinned status               # see pins + risks + safety + breaks caught");
-    out("  pinned auto-protect         # scan working tree, auto-add safe pins");
-    out("");
-    out("Optional add-ons:");
-    out("  pinned install-claude       # add /pinned-status, /pinned-list, /pinned-review, /pinned-done slash commands in Claude Code");
     if (wantPreCommit && wantPostCommit) {
+      out("✓ Auto-protection is wired — just commit normally. Pinned does the work.");
       out("");
-      out("Auto-protection is fully wired:");
-      out("  · git commit  → auto-adds new pins (pre-commit hook)");
-      out("  · git commit  → auto-verifies existing pins in the background (post-commit hook)");
-      out("  · git push    → backstop scan (pre-push hook)");
-      out("Set PINNEDAI_SKIP_HOOK=1 on any git command to bypass.");
+      out("  · git commit  → Pinned scans your diff. New auth checks, routes,");
+      out("                   webhooks, env edits get auto-pinned (pre-commit hook).");
+      out("  · git commit  → existing pins re-verify in the background (post-commit).");
+      out("  · git push    → backstop scan (pre-push hook).");
+      out("");
+      out("  You don't need to write claim text. Pinned learns from your diffs.");
+      out("  Future AI edits that weaken / skip / delete a guard get blocked at commit.");
     } else if (wantPreCommit) {
+      out("✓ Pre-commit hook installed — Pinned auto-pins new guards on every commit.");
+      out("  You don't need to write claim text. Pinned learns from your diffs.");
+    } else {
+      out("◆ Pinned is scaffolded. To enable auto-pin-on-commit, re-run with --auto");
+      out("  or install the pre-commit hook manually (see docs/integrations).");
+    }
+    out("");
+    out("Other useful commands:");
+    out("  pinned list                 # all pins (one line each)");
+    out("  pinned show <pin-id>        # what a pin asserts + what would make it fail");
+    out("  pinned status               # see pins + risks + safety + breaks caught");
+    out("  pinned auto-protect         # one-shot scan of working tree (without committing)");
+    out("  npx pinnedai try            # zero-config demo");
+    out("");
+    out("If you want to pin a behavior from a PR description manually:");
+    out("  pinned check --description \"Auth required on /api/admin\"");
+    out("  pinned generate --pr-id pr-123 --description \"...\"");
+    out("");
+    out("Add to Claude Code (optional):");
+    out("  pinned install-claude       # /pinned-status, /pinned-list, /pinned-review, /pinned-done");
+    out("  Note: the Pinned statusline ('◆ pinned · N guards') only appears when");
+    out("  Claude Code is launched from inside this project directory. If you launched");
+    out("  from a parent dir, restart Claude Code from here to see it.");
+    if (wantPreCommit) {
       out("");
-      out("Pre-commit hook is installed — pin growth happens automatically on every commit.");
-      out("Set PINNEDAI_SKIP_HOOK=1 to bypass for one commit.");
+      out("Set PINNEDAI_SKIP_HOOK=1 on any git command to bypass auto-protect for one commit.");
     }
   });
 
@@ -3141,7 +3212,8 @@ program
 // on this pin" command.
 program
   .command("show")
-  .description("Show full detail for a single pinned claim: text, file, status, catch history.")
+  .alias("describe")
+  .description("Show full detail for a single pinned claim: what it asserts, what would make it fail, file, status, catch history.")
   .argument("<claim-id>", "Claim id (filename without .test.ts)")
   .option(
     "--dir <path>",
@@ -3177,6 +3249,7 @@ program
     const catches = (last?.catchHistory ?? []).filter((c) => c.claimId === claimId);
 
     const d = describeClaimForUser(entry.claim);
+    const failureScenario = describeFailureScenario(entry.claim);
     const pinnedAtDay = entry.pinnedAt.replace(/T.*$/, "");
     out("");
     out(`◆ ${d.title}`);
@@ -3186,6 +3259,9 @@ program
     out("");
     out(`  What Pinned checks:`);
     out(`  ${d.check}`);
+    out("");
+    out(`  This pin FAILS if:`);
+    out(`  ${failureScenario}`);
     out("");
     out(`  Status:  ${status}`);
     out(`  Added:   ${pinnedAtDay} in PR ${entry.prId} by ${entry.pinnedBy}`);
@@ -7217,6 +7293,66 @@ function describeLlmMode(
     return `LLM cached via hosted Worker (no quota burned) [${planTag}]`;
   }
   return `LLM via hosted Worker [${planTag}]`;
+}
+
+// Plain-English failure scenario per template. Surfaced in `pinned show`
+// (alias `describe`) to make the pin's contract explicit — addresses the
+// "pins are a black box; I have to read the generated test file to see
+// what's being checked" feedback. Each line should answer: what concrete
+// change to the code would cause this pin to fail?
+function describeFailureScenario(c: Claim): string {
+  switch (c.template) {
+    case "auth-required":
+      return `${c.route} starts serving protected content without auth (any non-401/403, non-login-redirect, non-login-form response means the auth check was removed).`;
+    case "rate-limit":
+      return `${c.route} stops returning 429 after the ${c.rate}/${c.window} threshold (the rate limiter was removed or its threshold was raised).`;
+    case "permission-required":
+      return `${c.route} stops requiring the '${c.role}' role (the role check is removed, or a non-${c.role} role gains access).`;
+    case "tier-cap":
+      return `${c.route} stops enforcing the ${c.tier}-tier cap of ${c.cap} ${c.resource} (the cap is raised, removed, or applied to the wrong tier).`;
+    case "idempotent":
+      return `${c.route} stops deduplicating by ${c.idField} — the same payload twice produces different responses or double side-effects.`;
+    case "returns-status":
+      return `${c.method} ${c.route} stops returning ${c.status}${c.condition ? ` on ${c.condition}` : ""} (validation logic was removed or weakened).`;
+    case "cli-output-contains":
+      return `\`${c.route}\` stops printing "${c.text.length > 60 ? c.text.slice(0, 59) + "…" : c.text}" to stdout (the output line was renamed, removed, or moved to stderr).`;
+    case "cli-exits-zero":
+      return `\`${c.route}\` starts exiting with a non-zero code (introduced bug, removed dependency, syntax error).`;
+    case "cli-creates-file":
+      return `\`${c.route}\` stops creating ${c.filePath} (the write logic was removed or the path changed).`;
+    case "cli-flag-supported":
+      return `\`${c.route}\` rejects the ${c.flag} flag (the flag was renamed, removed, or its handler broken).`;
+    case "cli-json-shape":
+      return `\`${c.route}\`'s JSON output loses any of: ${c.keys.join(", ")} (the response shape was refactored without backward compatibility).`;
+    case "library-returns":
+      return `${c.functionName} in ${c.modulePath} stops returning ${JSON.stringify(c.expected)} (signature changed, default removed, dependency injection rewired).`;
+    case "lockfile-integrity":
+      return `${c.lockfilePath} content drifts (sha256 != ${c.expectedSha256.slice(0, 12)}…) — pin assumes the lockfile is the source of truth for installed dep versions.`;
+    case "config-invariant":
+      return `${c.configPath} loses '${c.label}' — a config key that was present at pin time is missing or relocated.`;
+    case "package-exports-exist":
+      return `${c.modulePath} stops exporting any of: [${c.exports.join(", ")}] — a refactor accidentally drops an export that something imports.`;
+    case "secret-not-public":
+      return `A file in the public surface contains a value matching the secret marker pattern (${c.secretMarkers.join(", ")}) — looks like an API key was committed.`;
+    case "url-literal-preserved":
+      return `${c.filePath} stops containing the literal "${c.urlLiteral}" (URL drift — search-and-replace, typo in a config rename, or environment variable hardcoded somewhere else).`;
+    case "tsc-clean":
+      return `\`tsc -p ${c.tsconfigPath}\` exits non-zero — TypeScript compilation broke somewhere.`;
+    case "module-export-stable":
+      return `${c.modulePath} stops exporting '${c.exportName}' — an AI refactor renamed or removed a symbol something else depends on.`;
+    case "react-route-registered":
+      return `${c.routerFilePath} no longer registers the route '${c.routePath}' — link or navigation to this path will 404.`;
+    case "webhook-handler-exists":
+      return `${c.filePath} loses its ${c.provider} signature verification (the verify call was removed, leaving the webhook accepting unsigned payloads).`;
+    case "import-path-resolves":
+      return `${c.sourceFilePath} can't resolve '${c.importPath}' — the imported file was renamed, removed, or its export changed.`;
+    case "changed-literal-preserved":
+      return `${c.filePath} reverts to the old ${c.shape} value '${c.oldValue}' (the fix that changed it to '${c.newValue}' was undone).`;
+    case "form-submit-error-handling":
+      return `Submit handler in ${c.filePath} loses its error-state path (no setError/catch/toast on submit failure — UI silently swallows errors).`;
+    default:
+      return `the contract described above is broken.`;
+  }
 }
 
 function describeClaim(c: Claim): string {

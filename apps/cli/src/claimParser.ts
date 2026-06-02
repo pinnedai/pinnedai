@@ -1288,6 +1288,96 @@ export function parseClaims(rawBody: string): Claim[] {
   return claims;
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic parser — same matching as parseClaims, but ALSO reports lines
+// that looked claim-shaped but didn't match any template's regex. Surfaced
+// in `pinned check` and the PR-comment workflow so users aren't silently
+// misled into thinking "Found 1 claim(s)" means 1/1 when it actually means
+// 1/N (N-1 lines were dropped because no template matched their phrasing).
+// ---------------------------------------------------------------------------
+
+export type ParseDiagnostics = {
+  /** Claims that matched a recognized template. */
+  recognized: Claim[];
+  /**
+   * Lines that LOOK like intended claims (mention a route + a status code
+   * or a domain verb like "requires"/"returns"/"rejects") but weren't
+   * matched by any template's regex. Each entry is the original line as it
+   * appeared in the input (post-redaction), trimmed.
+   */
+  dropped: string[];
+};
+
+// A line is "claim-shaped" if it mentions BOTH a target (route or HTTP
+// method) AND an outcome (status code, or a domain verb describing what
+// the endpoint does). Used to filter `dropped[]` so we don't spam users
+// with every uncovered prose sentence — only ones that read like
+// behavioral promises but failed to parse.
+const CLAIM_SHAPE_TARGET =
+  /(?:\/[A-Za-z0-9_/:.{}\-]+|\b(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b)/i;
+const CLAIM_SHAPE_OUTCOME =
+  /\b(?:[1-5]\d{2})\b|\b(?:returns?|rejects?|requires?|must|valid|invalid|blocks?|auth(?:enticate[ds]?|orize[ds]?|s)?)\b/i;
+
+export function parseClaimsWithDiagnostics(rawBody: string): ParseDiagnostics {
+  const recognized = parseClaims(rawBody);
+  const body = redactSecrets(rawBody);
+
+  // Normalized text covered by recognized matches — used to suppress
+  // claim-shaped lines that ARE actually covered (the regex match might
+  // be a substring of a longer sentence, so we test both directions).
+  const coveredText = recognized
+    .map((c) => normalizeForCompare(c.raw))
+    .filter((s) => s.length > 0);
+
+  const candidates = splitIntoClaimCandidates(body);
+  const dropped: string[] = [];
+  const seenDropped = new Set<string>();
+
+  for (const candidate of candidates) {
+    const line = candidate.trim();
+    if (line.length < 8) continue;
+    if (!CLAIM_SHAPE_TARGET.test(line)) continue;
+    if (!CLAIM_SHAPE_OUTCOME.test(line)) continue;
+
+    const norm = normalizeForCompare(line);
+    if (seenDropped.has(norm)) continue;
+
+    // Already covered by a recognized claim? Substring either direction.
+    const covered = coveredText.some(
+      (r) => r === norm || norm.includes(r) || r.includes(norm)
+    );
+    if (covered) continue;
+
+    seenDropped.add(norm);
+    dropped.push(line);
+  }
+
+  return { recognized, dropped };
+}
+
+function splitIntoClaimCandidates(body: string): string[] {
+  // Split on hard line breaks first, then strip a leading list marker
+  // (bullet or "1. " style) from each line, then split each line on
+  // sentence boundaries. CRITICAL: don't split on `\d+\. ` mid-line —
+  // that pattern matches HTTP status codes followed by a period (e.g.
+  // "...returns 400. POST /next/...") and was truncating claim text.
+  // List markers only count when they're at the START of a line.
+  return body
+    .split(/\n+/)
+    .map((line) => line.replace(/^\s*(?:[-*•]\s+|\d+\.\s+)/, ""))
+    .flatMap((line) => line.split(/(?<=[.!?])\s+(?=[A-Z/])/))
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function normalizeForCompare(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;!?]+$/, "")
+    .trim();
+}
+
 // Shared filter for CLI command shapes — must start with a word char
 // and look like an ACTUAL invocation, not a bare binary name. A bare
 // alphabetic token (e.g. `hermesc`, `localToUtc`) is almost always a

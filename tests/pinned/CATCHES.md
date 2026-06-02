@@ -4,7 +4,17 @@ Auto-maintained by [pinnedai](https://pinnedai.dev). Each entry is a regression 
 
 **Do not edit by hand** — this file is rewritten on every `pinned test` run that detects a new catch.
 
-**Lifetime catches:** 7 (showing 7 most recent)
+**Lifetime catches:** 8 (showing 8 most recent)
+
+## 2026-06-02 · cli-output-contains on node ./apps/cli/dist/cli.js check --description "Rate-limits /api/users to 60 req/min."
+
+**Original claim:** \`node ./apps/cli/dist/cli.js check --description "Rate-limits /api/users to 60 req/min."\` outputs \`Found 1 claim(s)\`
+
+**Originally pinned in:** `v0-1-1`
+
+**Test that caught it:** [`tests/pinned/v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2.test.ts`](v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2.test.ts)
+
+---
 
 ## 2026-05-26 · auth-required on /api/admin/export
 

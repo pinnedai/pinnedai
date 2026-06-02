@@ -62,7 +62,41 @@ const STATIC_VERIFY = ${JSON.stringify(claim.staticVerify ?? null)};
 // When absent, that direction skips silently.
 const TOKEN_AUTH = process.env.PREVIEW_TEST_TOKEN_AUTH;
 
-function repairPrompt(actualStatus: number): string {
+// Auth-response validator — accepts 401/403, 3xx redirects to login,
+// OR 200 with a login form. Returns a structured verdict so the
+// repair prompt can explain WHY a response didn't qualify.
+async function authResponseIsValid(res: Response): Promise<{ ok: boolean; reason: string }> {
+  // Classic API auth — 401/403.
+  if (res.status === 401 || res.status === 403) {
+    return { ok: true, reason: res.status + " auth-error status" };
+  }
+  // Redirect to a login page — accept if Location points at a login URL.
+  if (res.status >= 300 && res.status < 400) {
+    const loc = res.headers.get("location") || "";
+    if (/\\b(login|signin|sign-in|auth|account)\\b/i.test(loc)) {
+      return { ok: true, reason: res.status + " redirect to login (" + loc.slice(0, 80) + ")" };
+    }
+    return { ok: false, reason: res.status + " redirect to " + loc + " — Location doesn't look like a login page" };
+  }
+  // 2xx — only valid if the body actually looks like a login form.
+  if (res.status >= 200 && res.status < 300) {
+    let body = "";
+    try { body = await res.text(); } catch {}
+    const hasPasswordInput = /<input[^>]*type=["']?password["']?/i.test(body);
+    const hasLoginWord = /\\b(sign\\s*in|log\\s*in|login|please\\s+sign|please\\s+log|unauthori[zs]ed|not\\s+signed)\\b/i.test(body);
+    const hasLoginFormAction = /action=["'][^"']*\\/(login|signin|auth)\\b/i.test(body);
+    if (hasPasswordInput && (hasLoginWord || hasLoginFormAction)) {
+      return { ok: true, reason: "200 with login form (password input + sign-in copy)" };
+    }
+    if (hasLoginFormAction && hasLoginWord) {
+      return { ok: true, reason: "200 with login form (form action + sign-in copy)" };
+    }
+    return { ok: false, reason: "200 OK but body has no login-form markers — looks like the route served protected content unauthenticated" };
+  }
+  return { ok: false, reason: res.status + " unexpected" };
+}
+
+function repairPrompt(actualStatus: number, reason: string): string {
   return [
     "",
     "═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══",
@@ -72,8 +106,9 @@ function repairPrompt(actualStatus: number): string {
     "  Original PR: " + ORIGINAL_PR,
     "  Route: " + ROUTE,
     "  Bad case: " + BAD_CASE,
-    "  Expected: unauthenticated GET to " + ROUTE + " returns 401 or 403",
-    "  Actual: returned " + actualStatus,
+    "  Expected: unauthenticated GET to " + ROUTE + " refuses to serve protected content",
+    "  (Accepts: 401/403, 3xx redirect to login, or 200 with login form.)",
+    "  Actual: " + actualStatus + " — " + reason,
     "",
     "Restore the auth check on " + ROUTE + ". Likely candidates:",
     "  - middleware.ts or src/middleware.ts (Next.js / Hono / generic)",
@@ -193,13 +228,23 @@ describe("pinned: auth-required on " + ROUTE, () => {
 
   // Direction 1 — REMOVAL CHECK (always runs given PREVIEW_URL)
   // Catches: auth check stripped from the route entirely.
-  it.skipIf(previewMissing && !forceRequire)("returns 401 or 403 when called without an Authorization header", async () => {
+  //
+  // Accepts THREE shapes of "auth required" — strict 401/403 is the
+  // classic API answer, but modern apps often:
+  //   (a) redirect to /login (3xx with Location pointing at a login URL)
+  //   (b) render a login form inline (200 with <input type=password>
+  //       and sign-in copy — common in Next.js / Vite SPAs)
+  // Demanding bare 401/403 would force these apps to degrade UX in
+  // order to pass the pin. We accept any shape that demonstrates "this
+  // endpoint refused to serve protected content without auth."
+  it.skipIf(previewMissing && !forceRequire)("refuses to serve protected content without auth", async () => {
     const url = PREVIEW_URL!.replace(/\\/$/, "") + ROUTE;
-    const res = await pinnedFetch(url, { method: "GET" });
-    if (![401, 403].includes(res.status)) {
-      throw new Error(repairPrompt(res.status));
+    const res = await pinnedFetch(url, { method: "GET", redirect: "manual" });
+    const verdict = await authResponseIsValid(res);
+    if (!verdict.ok) {
+      throw new Error(repairPrompt(res.status, verdict.reason));
     }
-    expect([401, 403].includes(res.status)).toBe(true);
+    expect(verdict.ok).toBe(true);
   });
 
   // Direction 2 — OVER-TIGHTENING CHECK (gated on PREVIEW_TEST_TOKEN_AUTH)

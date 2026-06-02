@@ -169,9 +169,24 @@ describe("CLI: check", () => {
       "--description",
       "Rate-limits /api/users to 60 req/min.",
     ]);
-    expect(stdout).toContain("Found 1 claim(s)");
+    expect(stdout).toContain("Recognized claim(s)");
     expect(stdout).toContain("/api/users");
     expect(stdout).toContain("60/minute");
+  });
+
+  it("reports dropped claims when phrasings don't match any template", () => {
+    const { stdout } = runCli(testDir, [
+      "check",
+      "--description",
+      "Auth required on /admin. POST /api/signup rejects request bodies without an email field with 400. POST /api/track/invite without a sig_signup cookie returns 401.",
+    ]);
+    // 1 of 3 recognized
+    expect(stdout).toContain("Recognized 1 of 3 claim(s)");
+    // Both dropped lines should be surfaced
+    expect(stdout).toContain("POST /api/signup");
+    expect(stdout).toContain("POST /api/track/invite");
+    // Should still print the recognized claim
+    expect(stdout).toContain("/admin");
   });
 
   it("--json emits a JSON array", () => {

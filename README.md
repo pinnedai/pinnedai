@@ -130,6 +130,7 @@ npx pinned scan-diff                 # show what Pinned would auto-protect in th
 npx pinned audit --learned           # scan sibling code paths for risks matching learned patterns
 npx pinned probe-admin               # enumerate admin/internal routes + their protection state
 npx pinned list                      # list all active + retired pins
+npx pinned show <pin-id>             # what a pin asserts + what would make it fail (alias: `describe`)
 ```
 
 ### Lifecycle

@@ -2,6 +2,24 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.1.1] — 2026-06-01
+
+Friction fixes from real Claude-Code dogfooding on a fresh project.
+
+### Fixed
+
+- **Silent parser failure on unrecognized claims.** When `pinned check --description "claim A. claim B. claim C."` only matched 1 of 3, the output said `Found 1 claim(s)` — read as 1/1, not 1/3. Now: `Recognized 1 of 3 claim(s). 2 dropped — no template matched their phrasing:` followed by each dropped line verbatim. `--json` payload includes a `dropped` array so the GitHub Action / PR-comment workflow / agent flows surface them too. The `pinned generate` command surfaces them too. New `parseClaimsWithDiagnostics()` export; `parseClaims()` unchanged for backwards compat.
+
+### Changed
+
+- **`auth-required` template now accepts three response shapes** instead of demanding bare 401/403. Modern apps that redirect-to-login (3xx with `Location` matching `/login|signin|auth/`) or render a login form inline (200 with `<input type=password>` + sign-in copy) are now valid — pins no longer false-fail because the app prioritized UX. Existing 401/403 still works. Embedded `authResponseIsValid()` validator in every generated `auth-required` pin. Failure prompt explains which shape was missing.
+- **`pinned show` (alias `pinned describe`) now prints "This pin FAILS if: ..."** — a plain-English failure scenario per template, so developers don't have to read the generated test file to understand what the pin actually asserts. 23 templates each get a tailored one-liner ("`/api/admin` starts serving protected content without auth", "`pnpm-lock.yaml` content drifts", "`apps/api/oauth.ts` reverts to the old URL value", etc.).
+- **`pinned init` post-success output now leads with auto-protect**, not manual `pinned check` claim writing. The old "Try it: pinned check --description ..." framing misled users into thinking they had to handcraft claim text. New text opens with: *"✓ Auto-protection is wired — just commit normally. Pinned does the work."* Manual claim flow demoted to "If you want to pin a behavior from a PR description manually:" further down. Documents the Claude Code statusline launch-dir caveat.
+
+### Deferred to 0.2
+
+- **No-op / graceful-skip detection** for misleading-green pins (when an endpoint returns `200 {ok:true,skipped:true}` because env was unset and the pin asserts only the status). Needs design — wrong implementation makes pins flaky.
+
 ## [Unreleased]
 
 ### Roadmap notes (not yet built)
