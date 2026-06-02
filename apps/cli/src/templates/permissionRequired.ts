@@ -209,6 +209,10 @@ describe("pinned: permission-required " + ROLE + " on " + ROUTE, () => {
 
   // Direction 3 — OVER-TIGHTENING CHECK
   // Catches: legit users blocked (auth made too strict / role gate too narrow).
+  // Also catches the misleading-green case where the handler returns
+  // 200 with { error: "..." } / { skipped: true } / { degraded: true } —
+  // the route accepted the right-role token but didn't actually do
+  // its work. Same tier-2 body-marker close as happy-path-with-side-effect.
   it.skipIf((previewMissing || rightRoleMissing) && !forceRequire)("accepts " + ROLE + "-role tokens with 2xx", async () => {
     const url = PREVIEW_URL!.replace(/\\/$/, "") + ROUTE;
     const res = await pinnedFetch(url, {
@@ -221,6 +225,30 @@ describe("pinned: permission-required " + ROLE + " on " + ROUTE, () => {
         "2xx for " + ROLE + "-role token",
         "returned " + res.status + " (route may be over-tightened — even " + ROLE + " is blocked)"
       ));
+    }
+    // Body-marker: 200 with failure markers is a misleading-green.
+    try {
+      const body = await res.clone().text();
+      const json = body ? JSON.parse(body) as Record<string, unknown> : null;
+      if (json && typeof json === "object") {
+        if (json["error"] !== undefined) {
+          throw new Error(repairPrompt(
+            "right-role",
+            "2xx + meaningful body",
+            "returned 2xx but body contains 'error' field — route accepted the " + ROLE + "-role token but the handler is degraded"
+          ));
+        }
+        if (json["skipped"] === true || json["degraded"] === true) {
+          throw new Error(repairPrompt(
+            "right-role",
+            "2xx + meaningful body",
+            "returned 2xx but body says skipped:true or degraded:true — handler is in a stub/fallback state"
+          ));
+        }
+      }
+    } catch (e) {
+      // Re-throw repair-prompt errors. Swallow non-JSON parse errors.
+      if (e instanceof Error && e.message.includes("PINNED FAILURE")) throw e;
     }
     expect(res.status).toBeGreaterThanOrEqual(200);
     expect(res.status).toBeLessThan(300);

@@ -18,9 +18,9 @@
 import type { Claim } from "./claimParser.js";
 
 const SYSTEM_PROMPT = `You extract structured claims from GitHub pull request descriptions.
-A "claim" is a verifiable behavioral promise about a route, webhook, or CLI command.
+A "claim" is a verifiable behavioral promise about a route, webhook, page, or CLI command.
 
-Return ONLY claims that match one of these four shapes:
+Return ONLY claims that match one of these seven shapes:
 
 1. rate-limit:
    { "template": "rate-limit", "route": "/api/X", "rate": N, "window": "second"|"minute"|"hour" }
@@ -35,6 +35,55 @@ Return ONLY claims that match one of these four shapes:
    { "template": "cli-output-contains", "route": "<cli invocation>", "text": "<expected stdout substring>" }
    Use this when the author claims a CLI command emits specific output.
    "route" is the full command invocation (e.g. "pinned doctor", "npm test").
+
+5. page-renders:
+   { "template": "page-renders", "route": "/path" }
+   Use when the author claims a page renders / loads / displays without crashing.
+   "route" is the URL path (e.g. "/dashboard", "/about"). Root path is "/".
+
+6. validation-rejects-bad:
+   { "template": "validation-rejects-bad", "route": "/api/X", "method": "POST"|"PUT"|"PATCH"|"DELETE", "requiredFields": ["field1", "field2"] }
+   Use when the author claims an endpoint validates input + rejects bad input.
+   "requiredFields" is the explicit list of required field names if mentioned;
+   empty array [] is acceptable when the author says "validates body" generically.
+
+7. happy-path-with-side-effect:
+   { "template": "happy-path-with-side-effect", "route": "/api/X", "method": "POST"|"PUT"|"PATCH"|"DELETE", "sideEffectKind": "db-write", "sideEffectTarget": "<table-or-model-name>" }
+   Use when the author claims an endpoint returns 2xx AND performs a downstream
+   write (database row, queue message, file upload, email). For v0.2.x only
+   db-write is supported; other side-effects extend in v0.3+.
+   "sideEffectTarget" is the table/model name (e.g. "users", "orders", "invites").
+
+8. journey (multi-step user-flow walker):
+   {
+     "template": "journey",
+     "label": "<short human label>",
+     "steps": [
+       {
+         "method": "POST"|"GET"|"PUT"|"PATCH"|"DELETE",
+         "route": "/path",
+         "body": { ... },                          // optional JSON body
+         "headers": { "Header-Name": "value" },    // optional extra headers
+         "followRedirects": false,                  // default false
+         "expect": {
+           "status": 200 | { "min": 200, "max": 299 },
+           "bodyIncludes": ["substring"],          // body must contain
+           "bodyForbids": ["expired", "error"],   // body must NOT contain
+           "setsCookie": "session_id",             // Set-Cookie required
+           "redirectIncludes": "/dashboard"        // Location header required
+         }
+       }
+     ]
+   }
+   Use when the author claims a multi-step flow works end-to-end — typically
+   N requests where later steps depend on session/state set by earlier ones.
+   Examples: "signup then /me returns the new email", "login then /dashboard
+   renders without warnings", "checkout then /orders/:id shows the order".
+   Cookies from each step's response are jar-collected and sent on subsequent
+   steps automatically. Use \`bodyForbids\` for "should NOT see expired session"
+   / "no error banner" / "no Application error: a client-side exception"
+   regressions. Only emit when the author explicitly described a multi-step
+   contract — do NOT split a single-route claim into a one-step journey.
 
 If the PR description contains no recognizable claims, return an empty array.
 

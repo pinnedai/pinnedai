@@ -19,10 +19,42 @@
 // Once the wrapper is added, IT is itself protected by Pinned —
 // future AI edits that remove the wrapper get caught recursively.
 
-import type { HappyPathWithSideEffectClaim } from "../claimParser.js";
+import type { HappyPathWithSideEffectClaim, ClaimFieldShape } from "../claimParser.js";
 import { claimSlug } from "../claimParser.js";
 import type { GenerateOpts, GeneratedTest } from "./rateLimit.js";
 import { PINNED_FETCH_HELPER_SRC } from "./sharedFetch.js";
+
+// Synthesize a body value that should satisfy `shape`. Deterministic
+// (same shape → same value) so regenerate is idempotent and diffs
+// against existing tests are stable. Mirrors `valueForFieldShape` in
+// scanDiff.ts — duplicated here so the template stays browser-safe.
+function valueForShape(shape: ClaimFieldShape): unknown {
+  switch (shape.kind) {
+    case "string": {
+      if (shape.format === "email") return "pinned-test@example.com";
+      if (shape.format === "url") return "https://example.com/pinned";
+      if (shape.format === "uuid") return "00000000-0000-4000-8000-000000000000";
+      if (shape.format === "cuid") return "c000000000000000000000000";
+      if (shape.format === "date") return "2026-01-01";
+      if (shape.format === "datetime") return "2026-01-01T00:00:00.000Z";
+      const base = "pinned-test-value";
+      if (shape.min && shape.min > base.length) return base.padEnd(shape.min, "x");
+      return base;
+    }
+    case "number":
+      return shape.min !== undefined ? shape.min : 1;
+    case "boolean":
+      return false;
+    case "literal":
+      return shape.value;
+    case "enum":
+      return shape.values[0];
+    case "array":
+      return [];
+    case "unknown":
+      return "pinned-test-value";
+  }
+}
 
 export function generateHappyPathWithSideEffectTest(
   claim: HappyPathWithSideEffectClaim,
@@ -31,6 +63,25 @@ export function generateHappyPathWithSideEffectTest(
   const slug = claimSlug(claim);
   const claimId = `${opts.prId}-${slug}`;
   const filename = `${claimId}.test.ts`;
+
+  // Synthesize the request body at generation time, from the claim's
+  // bodyShape (populated when the validation detector could read the
+  // route's zod schema). Falls back to a placeholder body when no
+  // shape was captured (yup/joi/inline-validation cases). Bake the
+  // value into the emitted test so the customer sees the actual body
+  // Pinned will send and can edit it if needed.
+  const synthesizedBody: Record<string, unknown> = {};
+  let bodyKind: "schema-derived" | "placeholder";
+  if (claim.bodyShape && Object.keys(claim.bodyShape).length > 0) {
+    for (const [field, shape] of Object.entries(claim.bodyShape)) {
+      synthesizedBody[field] = valueForShape(shape);
+    }
+    bodyKind = "schema-derived";
+  } else {
+    synthesizedBody.pinnedTest = true;
+    synthesizedBody.placeholderField = "pinned-test-value";
+    bodyKind = "placeholder";
+  }
 
   const content = `// ═══════════════════════════════════════════════════════════════
 // ◆ Pinned by pinnedai — https://pinnedai.dev
@@ -111,13 +162,13 @@ function repairPrompt(message: string, status?: number, headers?: Record<string,
   ].filter(Boolean).join("\\n");
 }
 
-// Build a minimal valid-shape body. Customer can edit this if the
-// endpoint needs a richer payload — the test file is theirs to tweak.
+// Body synthesized at pin-generation time from the route's validation
+// schema (${bodyKind === "schema-derived" ? `zod schema for fields: ${Object.keys(synthesizedBody).join(", ")}` : "placeholder — no schema detected at pin time"}).
+// Edit this if your endpoint needs a richer payload — the test file
+// is yours to tweak. Regenerate (\`pinned regenerate ${claimId}\`)
+// rebuilds this from the latest schema.
 function buildValidBody(): Record<string, unknown> {
-  return {
-    pinnedTest: true,
-    placeholderField: "pinned-test-value",
-  };
+  return ${JSON.stringify(synthesizedBody, null, 2).split("\n").join("\n  ")};
 }
 
 describe("pinned: happy-path-with-side-effect " + METHOD + " " + ROUTE, () => {
@@ -134,7 +185,7 @@ describe("pinned: happy-path-with-side-effect " + METHOD + " " + ROUTE, () => {
   });
 
   it.skipIf(previewMissing && !forceRequire)(
-    "returns 2xx AND emits X-Pinned-Side-Effect headers",
+    "valid request returns 2xx + side-effect emitted (or non-error body)",
     async () => {
       const url = PREVIEW_URL!.replace(/\\/$/, "") + ROUTE;
       const res = await pinnedFetch(url, {
@@ -146,22 +197,64 @@ describe("pinned: happy-path-with-side-effect " + METHOD + " " + ROUTE, () => {
         body: JSON.stringify(buildValidBody()),
       });
 
+      // Tier 1 (MANDATORY): valid request must return 2xx. This alone
+      // catches "valid-input → 4xx" regressions (the most common
+      // happy-path failure — caught on socialideagen 2026-06-02 as
+      // signup 400 + invite 400).
       if (res.status < 200 || res.status >= 300) {
-        throw new Error(repairPrompt("non-2xx status", res.status));
+        throw new Error(repairPrompt("non-2xx status (likely cause: the placeholder buildValidBody() doesn't satisfy the endpoint's validation schema, OR the endpoint genuinely regressed on the happy path — open this .test.ts and fix buildValidBody() to match your schema, then re-run)", res.status));
       }
 
+      // Tier 2 (MANDATORY): response body must NOT carry failure
+      // markers. A 200 with { error: "..." } / { skipped: true } /
+      // { degraded: true } / { ok: true, skipped: true } is the
+      // misleading-green case — endpoint returned 2xx but didn't
+      // actually do its work. Closes the "graceful no-op pass" gap.
+      let bodyText = "";
+      let bodyJson: Record<string, unknown> | null = null;
+      try {
+        bodyText = await res.text();
+        bodyJson = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : null;
+      } catch {
+        /* non-JSON body — fall through; tier-3 header checks still apply */
+      }
+      if (bodyJson && typeof bodyJson === "object") {
+        if (bodyJson["error"] !== undefined) {
+          throw new Error(repairPrompt("2xx but body contains 'error' field: " + JSON.stringify(bodyJson["error"]).slice(0, 200), res.status));
+        }
+        if (bodyJson["skipped"] === true) {
+          throw new Error(repairPrompt("2xx but body says skipped:true — endpoint is in a degraded/stub state (e.g. missing env var → graceful no-op)", res.status));
+        }
+        if (bodyJson["degraded"] === true) {
+          throw new Error(repairPrompt("2xx but body says degraded:true — endpoint reports it's in a fallback state", res.status));
+        }
+      }
+
+      // Tier 3 (OPTIONAL — SOFT): X-Pinned-Side-Effect headers. When
+      // present, we verify them. When ABSENT, we WARN once (so the
+      // customer knows the strongest tier of verification is available
+      // via the wrapper) but DON'T fail — the tier-1+tier-2 checks
+      // already give meaningful protection without customer setup.
+      // This removes the foot-gun where auto-emitted pins failed on
+      // first run because the wrapper hadn't been installed yet.
       const sideEffectKind = res.headers.get("X-Pinned-Side-Effect") || res.headers.get("x-pinned-side-effect");
       const sideEffectTarget = res.headers.get("X-Pinned-Side-Effect-Target") || res.headers.get("x-pinned-side-effect-target");
       const sideEffectId = res.headers.get("X-Pinned-Side-Effect-Id") || res.headers.get("x-pinned-side-effect-id");
 
       if (!sideEffectKind) {
-        throw new Error(
-          repairPrompt(
-            "endpoint returned 2xx but X-Pinned-Side-Effect header is missing — endpoint may be a stub returning a happy status without doing the work (misleading-green)",
-            res.status
-          )
+        // Soft note — doesn't fail, just signals the upgrade path.
+        console.warn(
+          "[pinned] " + METHOD + " " + ROUTE + ": 2xx + non-error body verified. " +
+          "Upgrade to stronger verification: add the X-Pinned-Side-Effect response wrapper " +
+          "(see https://pinnedai.dev/docs/x-pinned-side-effect) so this pin can also confirm " +
+          "the " + EXPECTED_KIND + " to '" + EXPECTED_TARGET + "' actually happened."
         );
+        expect(res.status).toBeGreaterThanOrEqual(200);
+        expect(res.status).toBeLessThan(300);
+        return;
       }
+
+      // Wrapper is present — verify its claims.
       if (sideEffectKind !== EXPECTED_KIND) {
         throw new Error(
           repairPrompt(

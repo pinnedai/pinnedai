@@ -15,7 +15,7 @@ import type { Claim } from "./claimParser.js";
 import { claimKey } from "./claimParser.js";
 import type { RegistryEntry } from "./registry.js";
 import type { ChangedFile } from "./scanDiff.js";
-import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, detectNewPagesInDiff, detectNewValidationSchemasInDiff, type DiffByFile } from "./scanDiff.js";
+import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, detectNewPagesInDiff, detectNewValidationSchemasInDiff, detectHostConditionalInDiff, type DiffByFile } from "./scanDiff.js";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -78,6 +78,14 @@ export type ClassifyInput = {
 export type ClassifyResult = {
   safe: AutoProtectCandidate[];
   ask: AutoProtectCandidate[];
+  // Non-pin warnings surfaced to the user. v0.2.7+: host-conditional
+  // handlers that read the request host and gate behavior on it. These
+  // aren't auto-pinned (the right response varies — install a wrapper,
+  // change the gate, accept the divergence) but the customer should
+  // know before a happy-path pin's first run false-fails.
+  warnings?: {
+    hostConditional?: Array<{ filePath: string; route: string | null; expression: string; evidence: string }>;
+  };
 };
 
 // File patterns that should never trigger auto-protect even if they
@@ -266,6 +274,7 @@ export function classifyDiff(input: ClassifyInput): ClassifyResult {
     // Each required field becomes a sub-test asserting the endpoint
     // 4xx's when that field is missing. Safe to auto-pin: no wrapper
     // required.
+    const validationRoutesAutoPinned = new Set<string>();
     for (const h of detectNewValidationSchemasInDiff(syntheticDiff)) {
       tryEmit({
         claim: {
@@ -278,6 +287,43 @@ export function classifyDiff(input: ClassifyInput): ClassifyResult {
         reason: `new validation schema for ${h.method} ${h.route} (${h.requiredFields.length} required field(s)) — pin asserts the endpoint correctly 4xx's on malformed JSON + bodies missing each required field.`,
         triggeredBy: h.filePath,
         decision: "safe",
+      });
+      validationRoutesAutoPinned.add(`${h.method} ${h.route}`);
+    }
+    // Complementary happy-path pin — validation-rejects-bad checks the
+    // INVERSE direction (bad input → 4xx). It will stay green while a
+    // regression in the GOOD-input path (valid request → 4xx, the more
+    // common regression class) silently ships. Auto-emit a happy-path-
+    // with-side-effect candidate for every route that just got a
+    // validation-rejects-bad pin, so both directions are covered.
+    // Caught on socialideagen dogfood 2026-06-02: invite endpoint got
+    // validation pin, real bug was good-request → 4xx, pin stayed
+    // green while every real signup broke.
+    for (const h of detectNewValidationSchemasInDiff(syntheticDiff)) {
+      const lastSeg = h.route.split("/").filter(Boolean).pop() || "items";
+      const targetGuess = lastSeg.endsWith("s")
+        ? lastSeg
+        : /[aeiou]y$/.test(lastSeg) || !lastSeg.endsWith("y")
+          ? lastSeg + (/(?:s|x|z|ch|sh)$/.test(lastSeg) ? "es" : "s")
+          : lastSeg.slice(0, -1) + "ies";
+      tryEmit({
+        claim: {
+          template: "happy-path-with-side-effect",
+          route: h.route,
+          method: h.method,
+          sideEffectKind: "db-write",
+          sideEffectTarget: targetGuess,
+          // Schema-derived body shape from the validation detector
+          // (when zod fields were extractable). Lets the emitted test
+          // ship a body that satisfies the schema on first run, not
+          // a placeholder that 4xx's. Falls through to the placeholder
+          // when h.bodyShape is undefined (yup/joi/no-schema cases).
+          ...(h.bodyShape ? { bodyShape: h.bodyShape } : {}),
+          raw: `${h.method} ${h.route} with valid body returns 2xx + writes to ${targetGuess}`,
+        },
+        reason: `complement to the validation-rejects-bad pin for ${h.method} ${h.route} — validation pin only checks the bad-input direction (will stay green if real users get 4xx for valid requests). This pin checks the good-input direction. Needs the X-Pinned-Side-Effect wrapper.`,
+        triggeredBy: h.filePath,
+        decision: "ask",
       });
     }
   } catch {
@@ -529,7 +575,29 @@ export function classifyDiff(input: ClassifyInput): ClassifyResult {
     }
   }
 
-  return { safe, ask };
+  // Host-conditional warnings (0.2.7+). Not pins themselves — surface
+  // these so the customer knows a happy-path / journey pin against
+  // PREVIEW_URL might false-fail because the handler takes its
+  // non-prod branch. The customer's correct response varies (install
+  // a Pinned bypass header, change the gate, accept divergence).
+  let warnings: ClassifyResult["warnings"] | undefined;
+  try {
+    const hostHits = detectHostConditionalInDiff(syntheticDiff);
+    if (hostHits.length > 0) {
+      warnings = {
+        hostConditional: hostHits.map((h) => ({
+          filePath: h.filePath,
+          route: h.route,
+          expression: h.hostExpression,
+          evidence: h.evidence,
+        })),
+      };
+    }
+  } catch {
+    /* detector errors must not block classification */
+  }
+
+  return { safe, ask, ...(warnings ? { warnings } : {}) };
 }
 
 // Cap the safe list to the safety budget. Returns the kept safe

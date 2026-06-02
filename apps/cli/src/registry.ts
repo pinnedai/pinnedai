@@ -268,6 +268,10 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       return { routes: [claim.route] };
     case "happy-path-with-side-effect":
       return { routes: [claim.route] };
+    case "journey":
+      // All routes the journey touches — any edit to any step's
+      // handler is reason to re-run the journey.
+      return { routes: claim.steps.map((s) => s.route) };
   }
 }
 
@@ -428,6 +432,12 @@ function claimLabel(c: Claim): string {
       return `\`${escapeMarkdownCell(c.method)} ${escapeMarkdownCell(c.route)}\` rejects bad input`;
     case "happy-path-with-side-effect":
       return `\`${escapeMarkdownCell(c.method)} ${escapeMarkdownCell(c.route)}\` writes to \`${escapeMarkdownCell(c.sideEffectTarget)}\``;
+    case "journey": {
+      const path = c.steps
+        .map((s) => `${s.method} ${escapeMarkdownCell(s.route)}`)
+        .join(" → ");
+      return `\`journey: ${escapeMarkdownCell(c.label)}\` (${path})`;
+    }
   }
 }
 

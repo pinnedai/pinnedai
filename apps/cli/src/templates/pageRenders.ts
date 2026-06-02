@@ -69,6 +69,22 @@ const ERROR_MARKERS = [
   "[Vue warn]",                                     // Vue render error
 ];
 
+// Soft-404 markers — Next.js renders a 404 page with HTTP status 200
+// in several configurations (custom not-found.tsx, error.tsx fallback,
+// CDN cache hit on a now-missing page). Without these, a missing/renamed
+// page would silently pass the page-renders pin since 200 + non-empty
+// HTML body is technically present. Same wrong-direction failure mode
+// the validation-rejects-bad pin's 404/405 check closes.
+const SOFT_404_MARKERS = [
+  "404 - This page could not be found",     // Next.js default 404
+  "Page Not Found</h1>",                      // very common custom 404 H1
+  "Page not found</h1>",                      // case variant
+  "<title>404</title>",                       // bare 404 title tag
+  "<title>404:",                              // prefixed 404 title
+  "This page could not be found",            // Next.js default body
+  "NEXT_NOT_FOUND",                          // Next.js notFound() exception name
+];
+
 // Auth-gated page detector — re-uses the same shape as auth-required's
 // validator. Login-redirect, login-form, or bare 401/403 all mean
 // "this page is gated; page-renders pin is out of scope." The
@@ -163,6 +179,20 @@ describe("pinned: page-renders GET " + ROUTE, () => {
     for (const marker of ERROR_MARKERS) {
       if (body.includes(marker)) {
         throw new Error(repairPrompt(res.status, "body contains render-error marker: " + JSON.stringify(marker)));
+      }
+    }
+    // Soft-404: 200 status but body is a not-found page. Same shape
+    // as the validation-rejects-bad 404/405 disambiguation — without
+    // this, a deleted page would silently keep its pin green.
+    for (const marker of SOFT_404_MARKERS) {
+      if (body.includes(marker)) {
+        throw new Error(
+          repairPrompt(
+            res.status,
+            "soft-404: page returned " + res.status + " but body is a not-found page (marker: " + JSON.stringify(marker) + "). " +
+            "The route was likely deleted/renamed; the framework's catch-all is rendering a 404 page with a 200 status."
+          )
+        );
       }
     }
     expect(res.status).toBeGreaterThanOrEqual(200);

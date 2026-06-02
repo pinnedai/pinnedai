@@ -1493,6 +1493,63 @@ program
           prBodyClaims: [],
           existingPins: baselineRegistry.claims,
         });
+
+        // Retroactive coverage — also run the v0.2.5/0.2.6 diff detectors
+        // (happy-path / page-renders / validation-rejects-bad) against
+        // the CURRENT state of every file in the repo. Without this, an
+        // existing-codebase adopter gets only the scanDiffFull suggestions
+        // (auth surfaces, lockfile, etc.) — their business-critical
+        // happy-path / validation / page contracts stay unpinned, which
+        // was confirmed in real dogfooding as the #1 buyer blocker.
+        try {
+          const {
+            detectNewPostEndpointsInDiff: dnp,
+            detectNewPagesInDiff: dnpg,
+            detectNewValidationSchemasInDiff: dnvs,
+          } = await import("./scanDiff.js");
+          const retroDiff: import("./scanDiff.js").DiffByFile = new Map();
+          for (const p of repoFiles) {
+            try {
+              const full = join(cwd, p);
+              const content = readFileSync(full, "utf8");
+              retroDiff.set(p, content.split("\n"));
+            } catch {
+              /* unreadable file — skip */
+            }
+          }
+          for (const h of dnp(retroDiff)) {
+            baselineResult.suggestions.push({
+              template: "happy-path-with-side-effect",
+              route: h.route,
+              reason: `existing ${h.method} endpoint ${h.route} — pin asserts it returns 2xx AND emits X-Pinned-Side-Effect (catches stub-returns-200-without-work bugs). AGENT SETUP REQUIRED for the response wrapper.`,
+              suggestedPin: h.suggestedPin,
+              files: [h.filePath],
+              // Surfaced through the existing safe/ambiguous classifier.
+              // happy-path can't auto-create until the customer adds the
+              // wrapper, so it stays in "ask" via the round-trip parser.
+            } as (typeof baselineResult.suggestions)[number]);
+          }
+          for (const h of dnpg(retroDiff)) {
+            baselineResult.suggestions.push({
+              template: "page-renders",
+              route: h.route,
+              reason: `existing page ${h.route} — pin asserts it renders without crashing (no React/Next/Vite render-error markers in the response).`,
+              suggestedPin: h.suggestedPin,
+              files: [h.filePath],
+            } as (typeof baselineResult.suggestions)[number]);
+          }
+          for (const h of dnvs(retroDiff)) {
+            baselineResult.suggestions.push({
+              template: "validation-rejects-bad",
+              route: h.route,
+              reason: `existing validation schema for ${h.method} ${h.route} (${h.requiredFields.length} required field(s)) — pin asserts each missing-field case 4xx's.`,
+              suggestedPin: h.suggestedPin,
+              files: [h.filePath],
+            } as (typeof baselineResult.suggestions)[number]);
+          }
+        } catch (e) {
+          out(`  ! retroactive detector pass failed (non-fatal): ${(e as Error).message}`);
+        }
         // Pin coverage: each suggestion may map back to a rule we know
         // is safe. Since the suggestion type doesn't carry the rule id
         // through (only template + route), we re-classify by template
@@ -2772,6 +2829,8 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `\`${claim.method} ${claim.route}\` keeps rejecting malformed / incomplete bodies (catches AI removing validation)`;
     case "happy-path-with-side-effect":
       return `\`${claim.method} ${claim.route}\` actually performs its ${claim.sideEffectKind} to \`${claim.sideEffectTarget}\` (catches stub endpoints returning 200 without doing the work)`;
+    case "journey":
+      return `User journey \`${claim.label}\` (${claim.steps.length} step${claim.steps.length === 1 ? "" : "s"}) keeps working end-to-end (catches multi-step regressions — e.g. signup OK but /me returns stale data — that single-route pins structurally miss)`;
   }
 }
 
@@ -3446,6 +3505,7 @@ program
             createdAt: new Date(now).toISOString(),
             expiresAt: new Date(now + 5 * 60 * 1000).toISOString(), // 5 min TTL
             runId: randomBytes(8).toString("hex"),
+            source: "regenerate" as const,
             regenerated: allowEntries,
           };
           writeFileSync(
@@ -4241,8 +4301,19 @@ program
       const hasTouchedPins = scan.touchedPins.length > 0;
       const testFailed = testExitCode !== 0;
       const skippedFromTest = /(\d+)\s+skipped/.exec(testOutput);
-      const hasSkippedPins =
-        skippedFromTest !== null && parseInt(skippedFromTest[1], 10) > 0;
+      const skippedCount = skippedFromTest !== null ? parseInt(skippedFromTest[1], 10) : 0;
+      const passedFromTest = /(\d+)\s+passed/.exec(testOutput);
+      const passedCount = passedFromTest !== null ? parseInt(passedFromTest[1], 10) : 0;
+      const hasSkippedPins = skippedCount > 0;
+      // "Mostly inactive" = most of what ran was actually skipped. This
+      // is the false-confidence trap surfaced by dogfooding 2026-06-02:
+      // guard returning REVIEW with skipped pins reads as "almost-PASS"
+      // when in fact Pinned is verifying nothing. We escalate the
+      // messaging when the skip ratio is high.
+      const totalRan = skippedCount + passedCount;
+      const skipRatio = totalRan > 0 ? skippedCount / totalRan : 0;
+      const mostlyInactive = totalRan > 0 && skipRatio >= 0.5;
+      const fullyInactive = totalRan > 0 && passedCount === 0 && skippedCount > 0;
 
       let verdict: "PASS" | "REVIEW" | "BLOCK";
       let exitCode: 0 | 1 | 2;
@@ -4317,12 +4388,33 @@ program
         out(`✗ pinned test failed — at least one pin caught a regression.`);
         out(`  Run \`pinned test\` for full output, or \`pinned catches\` for history.`);
         out("");
+      } else if (fullyInactive) {
+        // EVERY pin skipped. Pinned is providing zero protection.
+        // Loud to break the "false confidence" trap surfaced by
+        // dogfooding 2026-06-02: REVIEW + ⊘ skipped read as
+        // "almost-PASS" when in fact nothing was verified.
+        out(`⚠ NOT VERIFYING — all ${skippedCount} pin(s) skipped this run.`);
+        out(`  Pinned is providing ZERO protection right now. REVIEW is NOT 'almost-PASS'.`);
+        out(`  Most common cause: PREVIEW_URL env var is unset, so live HTTP pins skip silently.`);
+        out(`  Fix: export PREVIEW_URL=https://your-preview-deploy.vercel.app  (then re-run)`);
+        out(`  Docs: https://pinnedai.dev/docs/preview-url`);
+        out("");
+      } else if (mostlyInactive) {
+        // Majority skipped — also serious but less catastrophic than
+        // fullyInactive. Still call out the gap explicitly so it's not
+        // perceived as a near-pass.
+        out(
+          `⚠ MOSTLY NOT VERIFYING — ${skippedCount} of ${totalRan} pin(s) skipped (${Math.round(skipRatio * 100)}%).`
+        );
+        out(`  Only ${passedCount} pin(s) actually ran. The skipped ones provide no protection.`);
+        out(`  Likely cause: PREVIEW_URL or fixture tokens unset. See https://pinnedai.dev/docs/preview-url.`);
+        out("");
       } else if (hasSkippedPins) {
         out(
-          `⊘ Some pins SKIPPED (no PREVIEW_URL / fixture tokens) — they're not currently verifying.`
+          `⊘ ${skippedCount} pin(s) skipped this run — those aren't verifying (set PREVIEW_URL / fixture tokens to enable).`
         );
         out(
-          `  See https://pinnedai.dev/docs/preview-url to enable verification.`
+          `  See https://pinnedai.dev/docs/preview-url. The other ${passedCount} pin(s) verified normally.`
         );
         out("");
       } else if (verdict === "PASS") {
@@ -5117,12 +5209,18 @@ program
     "tests/pinned"
   )
   .option("--quiet", "Suppress the pinned banner header.")
+  .option(
+    "--auto-stage",
+    "Stage the specific files Pinned wrote this run (newly authored pin files + .registry.json + PINS.md). Used by the pre-commit hook. Replaces the previous blanket `git add tests/pinned/` so unrelated changes in tests/pinned/ aren't silently bundled into the user's commit."
+  )
   .action(async (opts: {
     base: string;
     mode?: string;
     budget?: number;
     dryRun?: boolean;
     dir: string;
+    quiet?: boolean;
+    autoStage?: boolean;
   }) => {
     printBanner();
     assertInsideDir(opts.dir, process.cwd());
@@ -5207,6 +5305,7 @@ program
     const prId = `auto-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}`;
 
     const addedSummariesAP: string[] = [];
+    const writtenPinPaths: string[] = [];
     for (const cand of gated.autoAdd) {
       const gen = generateTest(cand.claim, { prId });
       const target = join(opts.dir, gen.filename);
@@ -5222,6 +5321,7 @@ program
         });
         written += 1;
         addedSummariesAP.push(summarizeClaimForBanner(cand.claim));
+        writtenPinPaths.push(relative(cwd, target));
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code === "EEXIST") {
           continue; // already pinned — silent
@@ -5231,6 +5331,54 @@ program
     }
     if (written > 0) {
       writeRegistry(opts.dir, registry);
+      // Sanctioned-write marker: tells the pre-commit hook that the
+      // about-to-follow `check-guard-removal` should NOT flag the
+      // registry / PINS.md modifications or the newly-authored pin
+      // files. Same mechanism `pinned regenerate` uses. Without this
+      // marker, auto-protect's own writes would block the user's
+      // commit — the hook would call its own work AI tampering.
+      const registryRel = relative(cwd, join(opts.dir, ".registry.json"));
+      const pinsRel = relative(cwd, join(opts.dir, "PINS.md"));
+      const allWritten = [registryRel, pinsRel, ...writtenPinPaths];
+      writeSanctionedWriteMarker("auto-protect", allWritten);
+
+      // --auto-stage: stage ONLY the files Pinned just authored, with
+      // a visible notice. Replaces the previous blanket `git add
+      // tests/pinned/` from the shell hook, which silently bundled any
+      // unrelated change in tests/pinned/ into the user's commit.
+      if (opts.autoStage) {
+        const staged: string[] = [];
+        for (const p of allWritten) {
+          try {
+            childSpawnSync("git", ["add", "--", p], {
+              cwd,
+              stdio: "ignore",
+            });
+            staged.push(p);
+          } catch {
+            /* best-effort; user can stage manually if this fails */
+          }
+        }
+        if (staged.length > 0 && !opts.quiet) {
+          out("");
+          out(
+            `pinned: auto-staged ${staged.length} file${staged.length === 1 ? "" : "s"} into this commit:`
+          );
+          for (const p of staged.slice(0, 6)) {
+            out(`   • ${p}`);
+          }
+          if (staged.length > 6) {
+            out(`   • …and ${staged.length - 6} more`);
+          }
+          out(
+            `   (this replaces the pre-0.2.7 blanket \`git add tests/pinned/\` —`
+          );
+          out(
+            `    only files Pinned itself authored this run are staged; unrelated`
+          );
+          out(`    changes in tests/pinned/ stay where you left them)`);
+        }
+      }
     }
 
     // Stamp the cache so the statusline + status command surface the
@@ -5281,6 +5429,39 @@ program
       );
     } else {
       out(`✓ No new behaviors to protect.`);
+    }
+
+    // Host-conditional warnings (0.2.7+). Surface AFTER the pin
+    // counts so the user sees the divergence-risk note when their
+    // newly-added pin would otherwise false-fail on first PREVIEW_URL run.
+    const hostWarnings = classified.warnings?.hostConditional;
+    if (hostWarnings && hostWarnings.length > 0 && !opts.quiet) {
+      out("");
+      out(
+        `⚠ Host-conditional handler${hostWarnings.length === 1 ? "" : "s"} detected (${hostWarnings.length})`
+      );
+      out(
+        `   These handlers read the request host header and gate behavior on it.`
+      );
+      out(
+        `   When Pinned probes against PREVIEW_URL, the handler likely takes its`
+      );
+      out(
+        `   non-prod branch — happy-path / journey pins for these routes may`
+      );
+      out(
+        `   false-fail on first run.`
+      );
+      for (const w of hostWarnings.slice(0, 5)) {
+        out(`   • ${w.filePath}${w.route ? `  (${w.route})` : ""}`);
+      }
+      if (hostWarnings.length > 5) {
+        out(`   • …and ${hostWarnings.length - 5} more`);
+      }
+      out(
+        `   See https://pinnedai.dev/docs/host-conditional for the wrapper that`
+      );
+      out(`   makes Pinned probes follow the prod branch.`);
     }
   });
 
@@ -5742,7 +5923,23 @@ program
         }
       }
     } else if (cache) {
-      out(`  ✓ ${totalPins} active, all passing`);
+      // Critical: "all passing" is a LIE if every pin actually skipped.
+      // A pin that skips (no PREVIEW_URL / no fixture token) provides
+      // zero protection — surfacing it as "passing" is the most
+      // dangerous UI line in Pinned (caught by socialideagen dogfood
+      // 2026-06-02 as a HIGH-severity TRUST bug).
+      const skipped = cache.skippedCount ?? 0;
+      const verifiedCount = totalPins - skipped;
+      if (skipped > 0 && verifiedCount === 0) {
+        out(`  ⚠ ${totalPins} active — NOT VERIFYING (all ${skipped} skipped). Pinned is providing ZERO protection right now.`);
+        out(`    Set PREVIEW_URL to verify live pins. See https://pinnedai.dev/docs/preview-url.`);
+      } else if (skipped > 0) {
+        out(`  ⚠ ${totalPins} active — ${verifiedCount} verified, ${skipped} skipped (no PREVIEW_URL / fixture tokens — those aren't verifying).`);
+      } else if (totalPins === 0) {
+        out(`  ${totalPins} active.`);
+      } else {
+        out(`  ✓ ${totalPins} active, all verified.`);
+      }
     } else {
       out(`  ? ${totalPins} active, not tested yet — run \`pinned test\``);
     }
@@ -5757,8 +5954,16 @@ program
     if (checksRun > 0 || streak > 0) {
       out("");
       out(`Verification:`);
+      const skippedNow = cache?.skippedCount ?? 0;
+      const verifiedNow = totalPins - skippedNow;
       if (cache?.status === "failing") {
         out(`  Streak broken on the current check. Fix above, then verify again.`);
+      } else if (skippedNow > 0 && verifiedNow === 0) {
+        // Don't report a "successful streak" when every pin is skipped
+        // — that's the false-confidence trap. The streak is technically
+        // unbroken but contains zero verifications.
+        out(`  ⚠ ${checksRun} run${checksRun === 1 ? "" : "s"} recorded, but ALL pins skipped each time.`);
+        out(`    There is no actual verification streak. Set PREVIEW_URL to start verifying.`);
       } else if (streak > 0) {
         const lastVerifiedAt = cache?.lastVerifiedAt;
         const ageLabel = lastVerifiedAt
@@ -5770,7 +5975,8 @@ program
               return `${Math.floor(mins / 1440)}d ago`;
             })()
           : "unknown";
-        out(`  ✓ ${streak} consecutive successful run${streak === 1 ? "" : "s"} · ${checksRun} total · last: ${ageLabel}`);
+        const skipNote = skippedNow > 0 ? ` (${skippedNow} skipped — not verified)` : "";
+        out(`  ✓ ${streak} consecutive successful run${streak === 1 ? "" : "s"} · ${checksRun} total · last: ${ageLabel}${skipNote}`);
       } else {
         out(`  ${checksRun} total run${checksRun === 1 ? "" : "s"} — no current streak.`);
       }
@@ -6809,41 +7015,57 @@ program
       if (!opts.quiet) err(`pinned: guard-integrity detector failed (continuing): ${(e as Error).message}`);
     }
 
-    // If a regenerate-allow marker is in scope, drop violations on
+    // If a sanctioned-write marker is in scope, drop violations on
     // files whose CURRENT on-disk content matches the marker's recorded
     // sha256. Those modifications were sanctioned by `pinned regenerate`
-    // and shouldn't be treated as AI tampering.
+    // or `pinned auto-protect` and shouldn't be treated as AI tampering.
+    //
+    // Two match strategies, both consulted:
+    //   1. `regenerated` (legacy): match by basename against files inside
+    //      the pinned dir. Written by `pinned regenerate`.
+    //   2. `sanctionedFiles` (0.2.7+): match by full repo-relative path,
+    //      covers .registry.json + PINS.md + auto-protect's new pins.
+    //      Written by `pinned auto-protect`.
     if (regenAllow && violations.length > 0) {
       const filtered: typeof violations = [];
       let allowedCount = 0;
+      let allowedSources = new Set<string>();
       for (const v of violations) {
-        // Marker filename is relative to the pinned dir (e.g.
-        // "auto-XYZ.test.ts"); violation path is repo-relative
-        // (e.g. "tests/pinned/auto-XYZ.test.ts"). Match by basename.
-        const basename = v.path.split("/").pop() ?? v.path;
-        const allowed = regenAllow.regenerated.find((r) => r.filename === basename);
-        if (!allowed) {
+        let matched: { sha256: string } | undefined;
+        // Strategy 2: exact repo-relative path match.
+        const sanctionedByPath = regenAllow.sanctionedFiles?.find((s) => s.path === v.path);
+        if (sanctionedByPath) {
+          matched = sanctionedByPath;
+        } else {
+          // Strategy 1: basename match against `regenerated` (legacy).
+          const basename = v.path.split("/").pop() ?? v.path;
+          const sanctionedByBasename = regenAllow.regenerated?.find((r) => r.filename === basename);
+          if (sanctionedByBasename) matched = sanctionedByBasename;
+        }
+        if (!matched) {
           filtered.push(v);
           continue;
         }
-        // Re-hash current file content and compare. If it matches the
-        // marker's sha256, this is exactly the file `pinned regenerate`
-        // wrote — sanctioned. If not, the file was edited AFTER
-        // regenerate (could be AI tampering on top of the regenerate);
-        // keep it as a violation.
+        // Re-hash current file content. If it matches the marker's sha256,
+        // this is exactly the file the CLI wrote — sanctioned. If not, the
+        // file was edited AFTER the sanctioned write (could be AI tampering
+        // on top); keep it as a violation.
         try {
           const currentContent = readFileSync(join(cwd, v.path), "utf8");
           const currentSha = createHash("sha256").update(currentContent).digest("hex");
-          if (currentSha === allowed.sha256) {
+          if (currentSha === matched.sha256) {
             allowedCount += 1;
+            if (sanctionedByPath) allowedSources.add("auto-protect");
+            else allowedSources.add("regenerate");
             continue;
           }
         } catch { /* fall through to keeping as violation */ }
         filtered.push(v);
       }
       if (allowedCount > 0 && !opts.quiet) {
+        const srcLabel = regenAllow.source ?? Array.from(allowedSources).join(" + ");
         out(
-          `pinned: ${allowedCount} pin file(s) sanctioned via .pinnedai/regenerate-allow.json (created by \`pinned regenerate\`).`
+          `pinned: ${allowedCount} pinned write(s) sanctioned via .pinnedai/regenerate-allow.json (created by \`pinned ${srcLabel}\`).`
         );
       }
       violations.length = 0;
@@ -7622,18 +7844,31 @@ function describeFailureScenario(c: Claim): string {
   }
 }
 
-// Read the short-lived regenerate-allow marker written by
-// `pinned regenerate`. Returns null if the marker doesn't exist, has
-// expired, or fails to parse. The marker authorizes pre-commit-hook
-// bypass ONLY for files matching the recorded filenames + sha256s —
-// so it's not a general "allow any pin edit" toggle, only a "the
-// regenerate command wrote these exact bytes" attestation.
+// Read the short-lived sanctioned-write marker written by
+// `pinned regenerate` and `pinned auto-protect`. Returns null if the
+// marker doesn't exist, has expired, or fails to parse. The marker
+// authorizes pre-commit-hook bypass ONLY for files matching the
+// recorded paths + sha256s — so it's not a general "allow any pin
+// edit" toggle, only a "the pinned CLI wrote these exact bytes"
+// attestation.
+//
+// Two arrays, both honored by check-guard-removal:
+//   - `regenerated` — pin files inside the pinned dir, matched by basename.
+//     (Legacy from 0.2.1+; written by `pinned regenerate`.)
+//   - `sanctionedFiles` — arbitrary repo-relative paths (registry,
+//     PINS.md, newly-authored pin files), matched by full path.
+//     (Added 0.2.7; written by `pinned auto-protect`.)
+//
+// Either array can be present without the other. `source` records
+// which command wrote the marker (for debugging / human output).
 type RegenerateAllowMarker = {
   version: number;
   createdAt: string;
   expiresAt: string;
   runId: string;
-  regenerated: Array<{ filename: string; sha256: string; dir: string }>;
+  source?: "regenerate" | "auto-protect";
+  regenerated?: Array<{ filename: string; sha256: string; dir: string }>;
+  sanctionedFiles?: Array<{ path: string; sha256: string }>;
 };
 // Idempotent + safe append-to-gitignore. Used by pinned init AND by
 // pinned regenerate (so existing repos auto-fix when they next
@@ -7679,10 +7914,68 @@ function readRegenerateAllowMarker(): RegenerateAllowMarker | null {
     const parsed = JSON.parse(raw) as RegenerateAllowMarker;
     if (!parsed.expiresAt) return null;
     if (new Date(parsed.expiresAt).getTime() < Date.now()) return null;
-    if (!Array.isArray(parsed.regenerated)) return null;
+    // Marker is valid if at least one of the two arrays is present.
+    const hasRegenerated = Array.isArray(parsed.regenerated);
+    const hasSanctioned = Array.isArray(parsed.sanctionedFiles);
+    if (!hasRegenerated && !hasSanctioned) return null;
     return parsed;
   } catch {
     return null;
+  }
+}
+
+// Write a sanctioned-write marker. Called by `auto-protect` after it
+// modifies the registry / PINS.md / writes new pin files inside a
+// pre-commit hook run, so the subsequent `check-guard-removal` step
+// doesn't fight itself.
+//
+// Marker has a 5-min TTL and binds to specific sha256s of the
+// repo-relative paths it sanctions. If anything edits those files
+// between write and commit, the sha256 won't match and the change is
+// flagged normally.
+function writeSanctionedWriteMarker(
+  source: "auto-protect",
+  repoRelativeFiles: string[]
+): void {
+  try {
+    const markerDir = ".pinnedai";
+    if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+    const sanctionedFiles = repoRelativeFiles
+      .map((p) => {
+        if (!existsSync(p)) return null;
+        const content = readFileSync(p, "utf8");
+        const sha256 = createHash("sha256").update(content).digest("hex");
+        return { path: p, sha256 };
+      })
+      .filter((e): e is { path: string; sha256: string } => e !== null);
+    if (sanctionedFiles.length === 0) return;
+    const now = Date.now();
+    // If a regenerate marker already exists and hasn't expired, merge
+    // into it (rare — but possible when a user runs `pinned regenerate`
+    // followed by `pinned auto-protect` within 5 minutes). Preserves
+    // both `regenerated` and `sanctionedFiles` arrays.
+    const existing = readRegenerateAllowMarker();
+    const merged: RegenerateAllowMarker = {
+      version: 1,
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + 5 * 60 * 1000).toISOString(),
+      runId: randomBytes(8).toString("hex"),
+      source,
+      regenerated: existing?.regenerated,
+      sanctionedFiles: [
+        ...(existing?.sanctionedFiles ?? []).filter(
+          (e) => !sanctionedFiles.some((s) => s.path === e.path)
+        ),
+        ...sanctionedFiles,
+      ],
+    };
+    writeFileSync(
+      join(markerDir, "regenerate-allow.json"),
+      JSON.stringify(merged, null, 2) + "\n"
+    );
+  } catch {
+    /* Marker write failure is non-fatal — the user will see the hook
+       block and can use PINNEDAI_ALLOW_PIN_EDIT=1 to bypass once. */
   }
 }
 
@@ -7796,6 +8089,10 @@ function describeClaim(c: Claim): string {
       return `validation     ${c.method} ${c.route}  →  rejects ${c.requiredFields.length || 1} bad-input case(s)`;
     case "happy-path-with-side-effect":
       return `happy-path     ${c.method} ${c.route}  →  emits X-Pinned-Side-Effect (${c.sideEffectKind}: ${c.sideEffectTarget})`;
+    case "journey": {
+      const path = c.steps.map((s) => `${s.method} ${s.route}`).join(" → ");
+      return `journey        ${c.label}  →  ${path}`;
+    }
   }
 }
 

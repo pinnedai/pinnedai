@@ -274,6 +274,9 @@ export function classifyPinStrength(
       // v0.2 workhorse templates — all live HTTP. Strong if PREVIEW_URL
       // is configured, unverified otherwise (same model as auth-required).
       return httpVerifiable ? "behavioral" : "unverified";
+    case "journey":
+      // Multi-step HTTP. Same gating as the single-step HTTP templates.
+      return httpVerifiable ? "behavioral" : "unverified";
   }
 }
 
@@ -550,6 +553,22 @@ export type ValidationRejectsBadClaim = {
   raw: string;
 };
 
+// Body-shape descriptor populated by the validation-schema detector
+// when it can read the route's zod schema. Used by happy-path's
+// buildValidBody() to ship a body that satisfies the schema instead
+// of a placeholder that 4xx's on first run.
+// Mirrors `FieldShape` in scanDiff.ts — duplicated here to keep
+// claimParser browser-safe (no scanDiff import which pulls node:fs
+// via the diff-reader paths).
+export type ClaimFieldShape =
+  | { kind: "string"; min?: number; format?: "email" | "url" | "uuid" | "date" | "datetime" | "cuid" }
+  | { kind: "number"; int?: boolean; min?: number }
+  | { kind: "boolean" }
+  | { kind: "literal"; value: string | number | boolean }
+  | { kind: "enum"; values: string[] }
+  | { kind: "array"; items?: ClaimFieldShape }
+  | { kind: "unknown" };
+
 export type HappyPathWithSideEffectClaim = {
   template: "happy-path-with-side-effect";
   route: string;
@@ -560,6 +579,49 @@ export type HappyPathWithSideEffectClaim = {
   sideEffectKind: "db-write";
   // Table/model name the endpoint writes to.
   sideEffectTarget: string;
+  // Per-field schema shape from the route's zod/yup/joi validator,
+  // captured at pin-generation time. Optional — falls back to
+  // placeholder `{ pinnedTest: true }` body when absent.
+  bodyShape?: Record<string, ClaimFieldShape>;
+  raw: string;
+};
+
+// Multi-step user journey. Captures bugs that single-route templates
+// can't reach: e.g. signup then /me returns the new email; login then
+// dashboard renders without an "expired session" message; checkout
+// then order detail page shows the right line items. Cookies from
+// each step's response are jar-collected and sent on later steps,
+// so session-bearing journeys work without explicit token plumbing.
+//
+// Per-step assertions: status (range or exact), bodyIncludes,
+// bodyForbids, setsCookie, redirectIncludes. Tier-2 misleading-green
+// markers (`error` / `skipped:true` / `degraded:true`) are checked
+// implicitly via the runtime — no per-step opt-in needed.
+//
+// Auto-detection from PR descriptions is shallow in v0.2.7 (regex
+// for the two most common shapes: "X then /Y returns Z" / "after X,
+// /Y renders"). LLM extraction via the SYSTEM_PROMPT covers the long
+// tail. Generic auto-protect detection lives in v0.3.
+export type JourneyStep = {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  route: string;
+  body?: Record<string, unknown>;
+  headers?: Record<string, string>;
+  followRedirects?: boolean;
+  expect: {
+    status?: { min: number; max: number } | number;
+    bodyIncludes?: string[];
+    bodyForbids?: string[];
+    setsCookie?: string;
+    redirectIncludes?: string;
+  };
+};
+
+export type JourneyClaim = {
+  template: "journey";
+  // Human-readable label used in the describe() block.
+  label: string;
+  steps: JourneyStep[];
   raw: string;
 };
 
@@ -590,7 +652,8 @@ export type Claim =
   | FormSubmitErrorHandlingClaim
   | PageRendersClaim
   | ValidationRejectsBadClaim
-  | HappyPathWithSideEffectClaim;
+  | HappyPathWithSideEffectClaim
+  | JourneyClaim;
 
 // A route token: must start with ASCII `/`, must not contain whitespace,
 // trailing punctuation, OR dangerous Unicode characters (RTL-override,
@@ -1928,6 +1991,16 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         promise: `The endpoint keeps performing its real side-effect (a ${c.sideEffectKind} to \`${c.sideEffectTarget}\`) — catches the misleading-green case where a refactor stubs out the work but keeps returning 200.`,
         check: `Sends a valid ${c.method} to \`${c.route}\` with \`X-Pinned-Test: 1\`. Asserts response is 2xx AND emits \`X-Pinned-Side-Effect\` headers proving the side-effect ran. Requires a small response wrapper on the handler — see https://pinnedai.dev/docs/x-pinned-side-effect`,
       };
+    case "journey": {
+      const stepSummary = c.steps
+        .map((s) => `${s.method} ${s.route}`)
+        .join(" → ");
+      return {
+        title: `journey: ${c.label}`,
+        promise: `The user journey \`${c.label}\` (${stepSummary}) still works end-to-end — cookies carry, statuses match, and no degraded body markers appear.`,
+        check: `Walks ${c.steps.length} step(s) with a shared cookie jar. Per step: asserts status, body inclusions, body forbids, and any expected Set-Cookie / redirect. Catches regressions single-step templates structurally miss (e.g. signup succeeds but /me returns stale email).`,
+      };
+    }
   }
 }
 
@@ -2055,6 +2128,10 @@ export function badCaseForClaim(claim: Claim): string {
       return `\`${claim.method} ${claim.route}\` accepted a request it should have rejected (malformed JSON or body missing a required field) — validation was removed or weakened`;
     case "happy-path-with-side-effect":
       return `\`${claim.method} ${claim.route}\` returned 2xx but didn't emit the X-Pinned-Side-Effect header — the endpoint may be a stub returning a happy status without actually performing the ${claim.sideEffectKind} to \`${claim.sideEffectTarget}\``;
+    case "journey": {
+      const summary = claim.steps.map((s) => `${s.method} ${s.route}`).join(" → ");
+      return `journey \`${claim.label}\` regressed at some step in (${summary}) — multi-step session/state contract broken (e.g. signup OK but /me returns stale data; login OK but dashboard shows expired-session warning; checkout OK but order page missing items)`;
+    }
   }
 }
 
@@ -2136,6 +2213,11 @@ export function claimRoute(c: Claim): string | null {
       return c.route;
     case "happy-path-with-side-effect":
       return c.route;
+    case "journey":
+      // Journeys span multiple routes; surface the first step's route
+      // as the "primary" location (matches the human reading of the
+      // journey: signup → dashboard ⇒ /signup is the entry point).
+      return c.steps[0]?.route ?? null;
   }
 }
 
@@ -2177,7 +2259,9 @@ export function claimSlug(claim: Claim): string {
                             ? `changed-${claim.shape}-${claim.filePath}-${claim.newValue}`
                             : claim.template === "form-submit-error-handling"
                               ? `form-error-${claim.filePath}`
-                              : claim.route;
+                              : claim.template === "journey"
+                                ? `journey-${claim.label}-${claim.steps.map((s) => `${s.method}-${s.route}`).join("-")}`
+                                : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -2270,6 +2354,16 @@ export function claimKey(c: Claim): string {
       return `validation-rejects-bad:${c.route}:${[...c.requiredFields].sort().join(",")}`;
     case "happy-path-with-side-effect":
       return `happy-path-with-side-effect:${c.route}:${c.sideEffectTarget}`;
+    case "journey": {
+      // Dedup key: label + ordered step sequence. Two journey claims
+      // with the same label but different steps are NOT duplicates;
+      // two with the same steps but different labels collide here (by
+      // design — the steps are the load-bearing identity).
+      const stepKey = c.steps
+        .map((s) => `${s.method}:${s.route}`)
+        .join("|");
+      return `journey:${c.label}:${stepKey}`;
+    }
   }
 }
 

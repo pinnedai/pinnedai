@@ -181,6 +181,35 @@ describe("pinned: idempotent on " + ROUTE + " (key: " + ID_FIELD + ")", () => {
       ));
     }
 
+    // Body-marker check (same misleading-green close as happy-path tier-2):
+    // a 200 with { error: "..." } / { skipped: true } / { degraded: true }
+    // is a degraded-no-op. Two of those returning byte-identical would
+    // wrongly satisfy the equality assertion below.
+    try {
+      const parsed = firstBody ? JSON.parse(firstBody) as Record<string, unknown> : null;
+      if (parsed && typeof parsed === "object") {
+        if (parsed["error"] !== undefined) {
+          throw new Error(repairPrompt(
+            "first-call-not-2xx",
+            String(first.status),
+            "endpoint returned 2xx but body contains 'error' field — degraded state, not a real success"
+          ));
+        }
+        if (parsed["skipped"] === true || parsed["degraded"] === true) {
+          throw new Error(repairPrompt(
+            "first-call-not-2xx",
+            String(first.status),
+            "endpoint returned 2xx but body says skipped:true or degraded:true — endpoint is in a stub/fallback state"
+          ));
+        }
+      }
+    } catch (e) {
+      // Re-throw repair-prompt errors. Swallow JSON parse errors —
+      // non-JSON 2xx responses (e.g. empty body, plain text) are fine
+      // for idempotency checks.
+      if (e instanceof Error && e.message.includes("PINNED FAILURE")) throw e;
+    }
+
     // 409 / 410 / 422 on the SECOND call is also valid idempotency —
     // the handler explicitly rejected the duplicate. Accept it.
     const DUPLICATE_STATUSES = [409, 410, 422];

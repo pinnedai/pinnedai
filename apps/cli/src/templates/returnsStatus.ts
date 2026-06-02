@@ -123,9 +123,61 @@ describe("pinned: returns-status " + METHOD + " " + ROUTE + " → " + EXPECTED_S
     const body = ${bodyExpr};
     if (body !== undefined) (init as { body: string }).body = body;
     const res = await pinnedFetch(url, init);
+
+    // Route-missing disambiguation (same fix as validation-rejects-bad):
+    // when the expected status is 4xx, a deleted route returning 404/405/501
+    // would silently match an over-broad assertion. EXPECTED_STATUS check
+    // below is exact, but we still surface a clearer failure message if
+    // the route appears missing and our expected isn't itself 404/405/501.
+    const ROUTE_MISSING = [404, 405, 501];
+    if (
+      ROUTE_MISSING.includes(res.status) &&
+      !ROUTE_MISSING.includes(EXPECTED_STATUS)
+    ) {
+      throw new Error([
+        repairPrompt(res.status),
+        "",
+        "[route appears missing: status " + res.status + " — the handler may have been deleted or the method changed]",
+        "",
+      ].join("\\n"));
+    }
+
     if (res.status !== EXPECTED_STATUS) {
       throw new Error(repairPrompt(res.status));
     }
+
+    // Body-marker (tier-2): if the expected status is 2xx, the route
+    // could be returning 200 with { error: "..." } / { skipped: true } /
+    // { degraded: true }. Same misleading-green close as the other
+    // 2xx-asserting templates.
+    if (EXPECTED_STATUS >= 200 && EXPECTED_STATUS < 300) {
+      try {
+        const respBody = await res.clone().text();
+        const json = respBody ? JSON.parse(respBody) as Record<string, unknown> : null;
+        if (json && typeof json === "object") {
+          if (json["error"] !== undefined) {
+            throw new Error([
+              repairPrompt(res.status),
+              "",
+              "[matched expected 2xx, but body contains 'error' field — handler is in a degraded state]",
+              "",
+            ].join("\\n"));
+          }
+          if (json["skipped"] === true || json["degraded"] === true) {
+            throw new Error([
+              repairPrompt(res.status),
+              "",
+              "[matched expected 2xx, but body says skipped:true or degraded:true]",
+              "",
+            ].join("\\n"));
+          }
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message.includes("PINNED FAILURE")) throw e;
+        /* swallow non-JSON parse errors */
+      }
+    }
+
     expect(res.status).toBe(EXPECTED_STATUS);
   });
 

@@ -311,6 +311,8 @@ describe("pinned: auth-required on " + ROUTE, () => {
       console.warn(
         "[pinned] " + ROUTE + " returned 405 with no Allow header; auth-required check skipped " +
           "(route is method-restricted but Pinned couldn't determine the right method to test). " +
+          "On Next.js this is the COMMON case — Next.js's default 405 response omits the Allow header " +
+          "even though RFC 9110 says it SHOULD. Not a Pinned bug. " +
           "If you know the method, set staticVerify on this pin so static-mode catches AI removal."
       );
       return; // exit without asserting
@@ -362,6 +364,47 @@ describe("pinned: auth-required on " + ROUTE, () => {
           "",
         ].join("\\n");
         throw new Error(msg);
+      }
+      // Body-marker (tier-2): same misleading-green close as happy-path
+      // and permission-required dir-3. 2xx with { error: "..." } /
+      // { skipped: true } / { degraded: true } means the handler accepted
+      // the token but didn't actually do its work.
+      try {
+        const body = await res.clone().text();
+        const json = body ? JSON.parse(body) as Record<string, unknown> : null;
+        if (json && typeof json === "object") {
+          if (json["error"] !== undefined) {
+            throw new Error([
+              "",
+              "═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══",
+              "",
+              "Pinned auth-required dir-2 (over-tightening) failed:",
+              "  Claim: " + ORIGINAL_CLAIM,
+              "  Route: " + ROUTE,
+              "  Expected: 2xx + non-error body",
+              "  Actual: 2xx but body contains 'error' field — handler is degraded",
+              "═══════════════════════════════════════════════════════════════",
+              "",
+            ].join("\\n"));
+          }
+          if (json["skipped"] === true || json["degraded"] === true) {
+            throw new Error([
+              "",
+              "═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══",
+              "",
+              "Pinned auth-required dir-2 (over-tightening) failed:",
+              "  Claim: " + ORIGINAL_CLAIM,
+              "  Route: " + ROUTE,
+              "  Expected: 2xx + non-degraded body",
+              "  Actual: 2xx but body says skipped:true or degraded:true",
+              "═══════════════════════════════════════════════════════════════",
+              "",
+            ].join("\\n"));
+          }
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message.includes("PINNED FAILURE")) throw e;
+        /* swallow non-JSON parse errors */
       }
       expect(res.status).toBeGreaterThanOrEqual(200);
       expect(res.status).toBeLessThan(300);

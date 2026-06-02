@@ -53,7 +53,10 @@ export type Suggestion = {
     | "env-required"
     | "cli-exits-zero"
     | "library-returns"
-    | "returns-status";
+    | "returns-status"
+    | "page-renders"
+    | "validation-rejects-bad"
+    | "happy-path-with-side-effect";
   route?: string;
   suggestedPin: string;
 };
@@ -147,6 +150,13 @@ export function isLikelyPublicEndpoint(path: string): boolean {
   // Webhook endpoints — these belong to the idempotent template, not
   // auth-required. The webhook-handler rule fires separately for them.
   if (/\/api\/webhooks?(?:\/|\.|$)/i.test(lower)) return true;
+  // Token-bearing public endpoints — the URL token IS the auth, not
+  // a session header. Examples: email-confirm, magic-link, password-
+  // reset, invite-accept, unsubscribe. These would false-fire as
+  // "auth required" but actually accept anonymous requests with a
+  // signed token in path/body. Discovered on socialideagen 2026-06-02
+  // (/api/confirm was auto-pinned as auth-required incorrectly).
+  if (/\/api\/(?:.*\/)?(?:confirm|verify|unsubscribe|opt-out|opt-in|invite-accept|magic-link|reset-password|forgot-password)(?:\/|\.|$)/i.test(lower)) return true;
   return false;
 }
 
@@ -1858,14 +1868,126 @@ export function detectNewPagesInDiff(diffByFile: DiffByFile): DiffNewPageHit[] {
 // required fields on a route handler. Used by auto-protect to emit a
 // `validation-rejects-bad` candidate pin. Each required field becomes
 // a sub-test (POST with that field omitted → expect 4xx).
+//
+// `bodyShape` (0.2.7+): per-field kind/format extracted from the
+// schema (string vs number vs email vs uuid …). Threaded into the
+// complementary `happy-path-with-side-effect` candidate so the
+// generated test ships a body that actually satisfies the schema —
+// without this, the placeholder buildValidBody() returns 4xx and the
+// pin false-fails on its first run.
+export type FieldShape =
+  | { kind: "string"; min?: number; format?: "email" | "url" | "uuid" | "date" | "datetime" | "cuid" }
+  | { kind: "number"; int?: boolean; min?: number }
+  | { kind: "boolean" }
+  | { kind: "literal"; value: string | number | boolean }
+  | { kind: "enum"; values: string[] }
+  | { kind: "array"; items?: FieldShape }
+  | { kind: "unknown" };
+
 export type DiffNewValidationHit = {
   template: "validation-rejects-bad";
   route: string;
   method: "POST" | "PUT" | "PATCH" | "DELETE";
   filePath: string;
   requiredFields: string[];
+  bodyShape?: Record<string, FieldShape>;
   suggestedPin: string;
 };
+
+// Best-effort: read a single zod chain like `z.string().email().min(5)`
+// and turn it into a FieldShape. Returns `{kind: "unknown"}` for chains
+// we don't recognize — caller falls back to a generic placeholder.
+// Conservative on purpose: we'd rather emit a string fallback than
+// guess a wrong shape and produce confusing 4xx pin failures.
+export function zodChainToShape(chain: string): FieldShape {
+  // `z.literal(<val>)` — peg the body to the exact literal.
+  const lit = /^\s*z\.literal\s*\(\s*("([^"\\]|\\.)*"|'([^'\\]|\\.)*'|true|false|-?\d+(?:\.\d+)?)\s*\)/.exec(chain);
+  if (lit) {
+    const raw = lit[1];
+    if (raw === "true") return { kind: "literal", value: true };
+    if (raw === "false") return { kind: "literal", value: false };
+    if (/^-?\d/.test(raw)) return { kind: "literal", value: Number(raw) };
+    return { kind: "literal", value: raw.slice(1, -1) };
+  }
+  // `z.enum(["a", "b"])` — first value satisfies it.
+  const en = /^\s*z\.enum\s*\(\s*\[([^\]]*)\]\s*\)/.exec(chain);
+  if (en) {
+    const items = en[1]
+      .split(",")
+      .map((s) => s.trim().replace(/^["']/, "").replace(/["']$/, ""))
+      .filter((s) => s.length > 0);
+    if (items.length > 0) return { kind: "enum", values: items };
+  }
+  // `z.array(<inner>)` — empty array satisfies it (none of the
+  // entries are required individually).
+  if (/^\s*z\.array\s*\(/.test(chain)) {
+    return { kind: "array" };
+  }
+  // `z.boolean()`
+  if (/^\s*z\.boolean\s*\(/.test(chain)) {
+    return { kind: "boolean" };
+  }
+  // `z.number()` / `.int()` / `.min(N)` / `.positive()`
+  if (/^\s*z\.number\s*\(/.test(chain)) {
+    const int = /\.int\s*\(/.test(chain) || /\.positive\s*\(/.test(chain);
+    const minMatch = /\.min\s*\(\s*(-?\d+)/.exec(chain);
+    return {
+      kind: "number",
+      ...(int ? { int: true } : {}),
+      ...(minMatch ? { min: Number(minMatch[1]) } : {}),
+    };
+  }
+  // `z.string()` — possibly with .email() / .url() / .uuid() / .cuid() /
+  // .datetime() / .date() / .min(N).
+  if (/^\s*z\.string\s*\(/.test(chain)) {
+    let format: "email" | "url" | "uuid" | "date" | "datetime" | "cuid" | undefined;
+    if (/\.email\s*\(/.test(chain)) format = "email";
+    else if (/\.url\s*\(/.test(chain)) format = "url";
+    else if (/\.uuid\s*\(/.test(chain)) format = "uuid";
+    else if (/\.cuid\s*\(/.test(chain)) format = "cuid";
+    else if (/\.datetime\s*\(/.test(chain)) format = "datetime";
+    else if (/\.date\s*\(/.test(chain)) format = "date";
+    const minMatch = /\.min\s*\(\s*(\d+)/.exec(chain);
+    return {
+      kind: "string",
+      ...(format ? { format } : {}),
+      ...(minMatch ? { min: Number(minMatch[1]) } : {}),
+    };
+  }
+  return { kind: "unknown" };
+}
+
+// Given a FieldShape, produce a value that should satisfy it. Used by
+// happy-path-with-side-effect's buildValidBody(). Kept deterministic
+// so the same schema always emits the same body — predictable for
+// debugging, reproducible across regen.
+export function valueForFieldShape(s: FieldShape): unknown {
+  switch (s.kind) {
+    case "string": {
+      if (s.format === "email") return "pinned-test@example.com";
+      if (s.format === "url") return "https://example.com/pinned";
+      if (s.format === "uuid") return "00000000-0000-4000-8000-000000000000";
+      if (s.format === "cuid") return "c000000000000000000000000";
+      if (s.format === "date") return "2026-01-01";
+      if (s.format === "datetime") return "2026-01-01T00:00:00.000Z";
+      const base = "pinned-test-value";
+      if (s.min && s.min > base.length) return base.padEnd(s.min, "x");
+      return base;
+    }
+    case "number":
+      return s.min !== undefined ? s.min : 1;
+    case "boolean":
+      return false;
+    case "literal":
+      return s.value;
+    case "enum":
+      return s.values[0];
+    case "array":
+      return [];
+    case "unknown":
+      return "pinned-test-value";
+  }
+}
 
 export function detectNewValidationSchemasInDiff(diffByFile: DiffByFile): DiffNewValidationHit[] {
   const out: DiffNewValidationHit[] = [];
@@ -1895,6 +2017,7 @@ export function detectNewValidationSchemasInDiff(diffByFile: DiffByFile): DiffNe
     // Conservative — only fire when we can confidently identify
     // schema with explicit required-field declarations.
     const fields = new Set<string>();
+    const bodyShape: Record<string, FieldShape> = {};
     // zod: `z.object({ name: z.string(), email: z.string().email() })`
     // Strategy: extract the object body, split on top-level commas
     // (respecting parens), then for each entry of shape `field: z.<...>`,
@@ -1908,10 +2031,17 @@ export function detectNewValidationSchemasInDiff(diffByFile: DiffByFile): DiffNe
       // Split on commas that are NOT inside parens (so `z.string().min(3)` stays one entry).
       const entries = splitTopLevelCommas(body);
       for (const entry of entries) {
-        const m = /^\s*([a-zA-Z_][\w]{0,40})\s*:\s*z\./.exec(entry);
+        const m = /^\s*([a-zA-Z_][\w]{0,40})\s*:\s*(z\..+)$/s.exec(entry);
         if (!m) continue;
         if (/\.(?:optional|nullable|nullish)\s*\(\s*\)/.test(entry)) continue;
-        fields.add(m[1]);
+        const fieldName = m[1];
+        const chain = m[2];
+        fields.add(fieldName);
+        // Capture the schema shape (kind/format/min) so a sibling
+        // happy-path-with-side-effect pin can ship a body that satisfies
+        // the schema instead of the placeholder `{ pinnedTest: true }`
+        // which 4xx's on first run.
+        bodyShape[fieldName] = zodChainToShape(chain);
       }
     }
     // yup: `yup.object({ name: yup.string().required() })`
@@ -1944,12 +2074,16 @@ export function detectNewValidationSchemasInDiff(diffByFile: DiffByFile): DiffNe
     seenKeys.add(key);
 
     const requiredFields = Array.from(fields);
+    // Only include bodyShape if we extracted at least one zod shape —
+    // yup/joi paths didn't populate it (room for a future enhancement).
+    const hasShape = Object.keys(bodyShape).length > 0;
     out.push({
       template: "validation-rejects-bad",
       route,
       method,
       filePath,
       requiredFields,
+      ...(hasShape ? { bodyShape } : {}),
       suggestedPin: `${method} ${route} requires fields ${requiredFields.join(", ")}`,
     });
   }
@@ -4216,4 +4350,175 @@ export function renderSuggestionsMarkdown(suggestions: Suggestion[], coverage: C
   lines.push("*[How does this work?](https://pinnedai.dev)*");
 
   return lines.join("\n");
+}
+
+// ────────────────────────────────────────────────────────────
+// Host-conditional detector (0.2.7+)
+// ────────────────────────────────────────────────────────────
+//
+// Flags route handlers that read the request `Host` / `X-Forwarded-Host`
+// / `Referer` header and gate behavior on its value. This is the classic
+// "works in prod, broken in preview" failure pattern:
+//
+//   const host = req.headers.get("host");
+//   if (host === "myapp.com") { /* real path */ }
+//   else { /* fallback/no-op path */ }
+//
+// Pinned-relevant because:
+//   1. Pinned probes against PREVIEW_URL — host is NOT prod, so the
+//      handler takes the no-op branch and any pin asserting the
+//      side-effect fires falsely.
+//   2. Pinned can't tell from a single test whether the handler is
+//      degraded (host gate) or actually broken — same observable.
+//   3. AI agents frequently introduce host gates "for safety" without
+//      announcing them in the PR description — silent prod-vs-preview
+//      divergence.
+//
+// What this detector does:
+//   - Pattern-matches host-reading expressions in added lines
+//   - Within the same diff, looks for the gating branch shape
+//     (if/switch/ternary on the captured value)
+//   - Returns a hit per (filePath, route) so the customer is warned
+//     to either (a) test against a real host, or (b) add a Pinned
+//     override header that bypasses the host gate
+//
+// v0.2.7 scope: SCAN-DIFF SUGGESTION ONLY. No auto-protect pin emission
+// yet (the pin shape is "expects prod-like behavior on preview" — needs
+// the AI to add the wrapper that bypasses the gate, same pattern as
+// the X-Pinned-Side-Effect wrapper). Pin emission lands in v0.3.
+
+export type DiffHostConditionalHit = {
+  template: "host-conditional";
+  filePath: string;
+  route: string | null;
+  hostExpression: string;
+  evidence: string;
+};
+
+// Match expressions that read a host-like REQUEST header. Each pattern
+// is intentionally tight — only fires on patterns that read a request
+// object's host header, NOT on:
+//   - URL parsing (`new URL(x).hostname`, `u.hostname`, `parsed.hostname`)
+//   - Client-side env detection (`window.location.hostname`)
+//   - String interpolation / logging
+//
+// FP-checked across 1200+ files in 10 dyad-apps repos before tightening
+// (initial version produced 5 false positives — all client-side env or
+// SSRF URL parsing, not request-host gating).
+//
+// Each pattern captures the LHS variable name (group 1) so the gating
+// check downstream knows which identifier to look for in conditionals.
+const HOST_READ_PATTERNS: Array<{ re: RegExp; label: string }> = [
+  // Next.js app router: `const x = headers().get("host")` (the
+  // `headers()` call returns a ReadonlyHeaders bound to the active
+  // request — only meaningful inside route handlers, never URL parsing).
+  {
+    re: /(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*headers\s*\(\s*\)\s*\.\s*get\s*\(\s*['"](?:host|x-forwarded-host|referer)['"]/i,
+    label: "headers().get('host') (Next.js app router)",
+  },
+  // Web Request API: `const x = req.headers.get("host")`. Allow common
+  // request-variable names (req, request, ctx.req, c.req); reject any
+  // other LHS (e.g. `parsed.headers.get` from a parsed URL response —
+  // which doesn't expose `.get("host")` but we stay defensive).
+  {
+    re: /(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:req|request|ctx\.req|c\.req)\s*\.\s*headers\s*\.\s*get\s*\(\s*['"](?:host|x-forwarded-host|referer)['"]/i,
+    label: "<req>.headers.get('host') (Web Request)",
+  },
+  // Node-style: `const x = req.headers.host` / `req.headers["x-forwarded-host"]`
+  // Again restricted to request-shaped variables only.
+  {
+    re: /(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:req|request|ctx\.req|c\.req)\s*\.\s*headers\s*(?:\.\s*host\b|\[\s*['"](?:host|x-forwarded-host|referer)['"])/i,
+    label: "req.headers.host / req.headers['x-forwarded-host']",
+  },
+  // Hono: `const x = c.req.header("host")`
+  {
+    re: /(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*c\s*\.\s*req\s*\.\s*header\s*\(\s*['"](?:host|x-forwarded-host|referer)['"]/i,
+    label: ".header('host') (Hono)",
+  },
+  // Express: `const x = req.hostname` (only `req.` prefix, not arbitrary
+  // `u.hostname` / `parsed.hostname` / `window.location.hostname`).
+  {
+    re: /(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:req|request)\s*\.\s*hostname\b/,
+    label: "req.hostname (Express)",
+  },
+];
+
+// Lines we explicitly REJECT even if they match a host-read pattern:
+// client-side context (window.location), URL-parsing (new URL(...).hostname).
+const REJECT_LINE_PATTERNS: RegExp[] = [
+  /\bwindow\s*\.\s*location\b/,
+  /\bnew\s+URL\s*\(/,
+  /\.\s*hostname\s*$/, // bare `something.hostname` (URL parsing) — kept only when LHS is `req`/`request`
+];
+
+// Lines we explicitly REJECT for the "gating" fallback: an `if` that
+// references `hostname` of a URL-parsed value (NOT a request) is not a
+// request-host gate. e.g. `if (url.hostname !== "trusted.com")` is
+// SSRF / vendor-allowlist code, not divergence-relevant.
+const URL_PARSING_GATE_HINTS = /\b(?:URL|url|u|parsed|parsedUrl|resolved|target|origin)\s*\.\s*hostname\b/;
+
+export function detectHostConditionalInDiff(diffByFile: DiffByFile): DiffHostConditionalHit[] {
+  const out: DiffHostConditionalHit[] = [];
+  const seenKeys = new Set<string>();
+  for (const [filePath, addedLines] of diffByFile.entries()) {
+    if (isTestPath(filePath)) continue;
+    const added = addedLines
+      .map((l) => l.replace(/\/\/.*$/, "").replace(/\/\*.*?\*\//g, ""))
+      .join("\n");
+    if (added.length === 0) continue;
+
+    // Skip client-only files entirely (page components, hooks, UI).
+    // Heuristic: extension `.tsx` + no `route.ts` / `route.tsx` /
+    // `api/` / `routes/` / `server/` / `controllers/` in the path
+    // means client-side — out of scope for request-host detection.
+    const isClientFile = filePath.endsWith(".tsx")
+      && !/\/route\.tsx?$/.test(filePath)
+      && !/\/(?:api|routes|server|controllers|handlers)\//.test(filePath);
+    if (isClientFile) continue;
+
+    // Pass 1: find host-read pattern + capture LHS variable name.
+    type Match = { line: string; lhsVar: string; label: string };
+    let matched: Match | null = null;
+    for (const { re, label } of HOST_READ_PATTERNS) {
+      for (const line of addedLines) {
+        if (REJECT_LINE_PATTERNS.some((rx) => rx.test(line))) continue;
+        const m = re.exec(line);
+        if (m) {
+          matched = { line: line.trim(), lhsVar: m[1], label };
+          break;
+        }
+      }
+      if (matched) break;
+    }
+    if (!matched) continue;
+
+    // Pass 2: gating check. Must find `if (<lhsVar> ...)` / `switch (<lhsVar>)` /
+    // ternary referencing the captured LHS variable. We do NOT fall back
+    // to any "host" mention in conditionals — that's where the URL-parsing
+    // false-positives came from.
+    const varName = matched.lhsVar.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const ifVar = new RegExp(`\\b(?:if|switch)\\s*\\([^)]{0,300}\\b${varName}\\b`);
+    const ternaryVar = new RegExp(`\\b${varName}\\b[^;]{0,80}\\?\\s*[^:]{0,150}:`);
+    const hasGating = ifVar.test(added) || ternaryVar.test(added);
+    if (!hasGating) continue;
+
+    // Reject if the gating is on a URL-parsing variable instead of the
+    // request-host LHS. Conservative: skip the file when both shapes are
+    // present and we can't be sure which one the gate references.
+    if (URL_PARSING_GATE_HINTS.test(added) && !ifVar.test(added)) continue;
+
+    const route = deriveRouteFromPath(filePath);
+    const key = `${filePath}|${route ?? ""}`;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+
+    out.push({
+      template: "host-conditional",
+      filePath,
+      route,
+      hostExpression: matched.line.slice(0, 200),
+      evidence: `Handler reads host/referer (${matched.label}) + gates behavior on \`${matched.lhsVar}\`. Pinned probes against PREVIEW_URL (not prod), so the gate likely fires and the handler takes its fallback branch — any pin asserting the side-effect will false-fail.`,
+    });
+  }
+  return out;
 }

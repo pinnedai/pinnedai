@@ -2,6 +2,80 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.7] — 2026-06-02
+
+Six closure fixes from a single dogfood debrief — the "0/4 catches on existing repo" finding on socialideagen pointed at structural gaps the prior 0.2.x releases didn't close. All fixes ship in one batch per the [[dont-defer-buildable-fixes]] rule.
+
+### Added — sanctioned-write marker for auto-protect (closes self-fighting hook)
+
+`pinned auto-protect` (when invoked from the pre-commit hook) now writes a `.pinnedai/regenerate-allow.json` marker recording the sha256 of each file it just modified (`.registry.json`, `PINS.md`, and any newly-authored `*.test.ts`). The subsequent `check-guard-removal` step honors the marker and skips violations on files matching the recorded sha. Before 0.2.7, the hook called its own writes "AI tampering" — `git commit` was blocked any time auto-protect added a pin, with the documented bypass (PINNEDAI_ALLOW_PIN_EDIT=1) as the only escape hatch.
+
+### Added — `--auto-stage` flag replaces blanket `git add`
+
+The pre-commit / pre-push hooks previously ran `git add tests/pinned/ 2>/dev/null || true`, silently bundling ANY change in `tests/pinned/` into the user's commit (including unrelated pin edits in flight). 0.2.7 replaces it with `pinned auto-protect --auto-stage`, which stages ONLY the specific files Pinned just authored this run AND prints a one-line notice listing them. Unrelated tests/pinned/ changes stay where the user left them.
+
+### Improved — tier-1/2/3 assertion pattern applied to all live-HTTP templates
+
+The happy-path-with-side-effect refactor (tier-1 mandatory status + tier-2 body marker + tier-3 SOFT header) is now applied to every other live-HTTP template that had the same wrong-direction or wrong-dimension foot-gun:
+
+- **idempotent** — added body-marker check on the first call. Two byte-identical `200 { error: "..." }` responses no longer falsely satisfy the equality assertion.
+- **page-renders** — added a SOFT_404_MARKERS list (Next.js default 404 body, `<title>404</title>`, "Page Not Found", etc.). A deleted route returning 200 with a not-found page no longer passes.
+- **validation-rejects-bad** — added 404/405/501 disambiguation so deleting a route doesn't silently satisfy "endpoint rejects bad input" (404 is technically in the 4xx range but the route is GONE, not validating).
+- **permission-required direction-3** (right-role → 2xx) — added body-marker check. Same close as happy-path tier-2.
+- **auth-required direction-2** (authed → 2xx) — same body-marker check. A handler that accepts the token but returns `{ error: "..." }` no longer passes the over-tightening direction.
+- **returns-status** — both fixes: 404/405/501 disambiguation when expected is 4xx (clearer failure message when the route is gone), AND body-marker check when expected is 2xx.
+
+Six templates, identical structural risk to the one happy-path round caught. After this batch, the entire live-HTTP template family carries the same safety net.
+
+### Added — schema-derived `bodyShape` for happy-path-with-side-effect
+
+`detectNewValidationSchemasInDiff` now also extracts per-field type/format from the route's zod schema (string vs number vs email vs url vs uuid vs cuid vs date vs datetime, plus min length / int / enum / literal / array). When auto-protect emits the complementary `happy-path-with-side-effect` candidate, the extracted shape rides along on the claim. The generated test's `buildValidBody()` then ships a body that **satisfies** the schema (`pinned-test@example.com` for `z.string().email()`, padded string for `.min(N)`, first enum value for `z.enum([...])`, etc.) instead of a placeholder that 4xx's on first run. Closes the "happy-path pin fails immediately because the customer's schema needs real fields" foot-gun. zod only in 0.2.7; yup/joi follow the same shape, planned for v0.3.
+
+### Added — multi-step `journey` template
+
+New template covering bug classes single-route pins structurally miss: signup-then-`/me`-returns-new-email, login-then-`/dashboard`-renders-without-warnings, checkout-then-order-detail-page-shows-items. Walks N HTTP steps with a shared cookie jar so session-bearing journeys carry state between steps. Per-step assertions: `status` (exact or range), `bodyIncludes`, `bodyForbids`, `setsCookie`, `redirectIncludes`. Tier-2 misleading-green markers (`{ error }`, `{ skipped: true }`, `{ degraded: true }`) checked per-step automatically. Wired into all the exhaustive switches (claim type, dispatcher, claimSlug, claimRoute, claimKey, classifyPinStrength, describeClaimForUser, badCaseForClaim, summarizeClaimForBanner, describeClaim, preflight, coverageFromClaim, claimLabel, backtest path-relevance) AND added to the LLM SYSTEM_PROMPT (entry #8) so cloud-LLM / BYOK customers extract journey claims from natural-language PR descriptions. Auto-detection from diff is deferred to v0.3.
+
+### Added — host-conditional detector
+
+New diff detector flags route handlers that read `req.headers.get("host")` / `req.hostname` / `c.req.header("host")` / `headers().get("x-forwarded-host")` AND gate behavior on the captured value. This is the "works in prod, broken in preview" failure pattern — Pinned probes against PREVIEW_URL, the handler takes its non-prod branch, the happy-path pin false-fails. v0.2.7 surfaces as a WARNING in `pinned auto-protect`'s output (not an auto-pin — the customer's right response varies). FP-checked against 1208 files across 10 dyad-apps repos: initial version had 5/10 false positives (URL parsing, client-side env, SSRF allowlist code); tightened version has **0 false positives, 1 true positive** (socialideagen's `resolveIdeaFromRequest` — exactly the divergence pattern).
+
+### Added — retroactive auto-detect coverage (the #1 buyer blocker)
+
+`pinned init`'s baseline pass now runs the three v0.2.5/v0.2.6 diff-aware detectors (`detectNewPostEndpointsInDiff`, `detectNewPagesInDiff`, `detectNewValidationSchemasInDiff`) against the **current state of every file in the repo**, not just diff-added lines. The killer-demo path *"install on my existing repo → it pins my real endpoints"* now works. Before 0.2.7, an existing-codebase adopter got only `scanDiffFull`'s suggestions (auth surfaces, lockfile, etc.) — business-critical happy-path / validation / page contracts stayed unpinned. Confirmed cost: 0/4 production bugs caught on a real repo today.
+
+### Added — three new templates wired into the LLM proposer (`SYSTEM_PROMPT`)
+
+`page-renders`, `validation-rejects-bad`, `happy-path-with-side-effect` now appear in `apps/cli/src/llmDirect.ts`'s `SYSTEM_PROMPT` as numbered claim shapes 5/6/7. Before 0.2.7, customers using `PINNEDAI_BYOK=anthropic` (or any other BYOK provider) couldn't extract the new templates from natural-language PR descriptions — silent coverage gap. Now they can. Locked in [[new-templates-need-both-deterministic-and-llm]] memory rule: every future template MUST be wired into BOTH paths in the same release.
+
+### Added — `/api/confirm`-style routes added to `isLikelyPublicEndpoint`
+
+Token-bearing public routes (`/api/confirm`, `/api/verify`, `/api/unsubscribe`, `/api/magic-link`, `/api/reset-password`, `/api/forgot-password`, `/api/invite-accept`, `/api/opt-in`, `/api/opt-out`) no longer false-fire as `auth-required` candidates. The URL token IS the auth — these routes correctly accept anonymous requests with a signed token in path/body. Caught on socialideagen 2026-06-02 as a false-positive auto-pin.
+
+### Improved — loud messaging when most/all pins skipped
+
+`pinned guard` previously said *"⊘ Some pins SKIPPED"* in a tone that read as "almost-PASS." It isn't — pins that skip silently provide zero protection. Now:
+
+- **`fullyInactive`** (all pins skipped, none passed) — banner reads: *"⚠ NOT VERIFYING — all N pin(s) skipped this run. Pinned is providing ZERO protection right now. REVIEW is NOT 'almost-PASS'."* Plus the PREVIEW_URL fix line.
+- **`mostlyInactive`** (≥50% skipped) — *"⚠ MOSTLY NOT VERIFYING — N of M pin(s) skipped (X%)."*
+- **Some skipped** (< 50%) — same as before but cleaner counter.
+
+### Improved — Next.js 405 skip message calls out the Allow-header quirk
+
+The auth-required template's 405-no-Allow-header skip path now explicitly notes that Next.js's default 405 response omits the Allow header (not a Pinned bug, framework behavior). Agents/devs reading the warning understand this is the COMMON case on Next.js POST-only routes, not an edge case.
+
+### Added — 3 new acceptance fixtures
+
+`audit/positive-controls/` now has three additional bug→fix fixtures from GPT's list:
+
+- `03-url-literal-typo/nextjs-api-base/` — staging URL accidentally shipped to prod → fix locks the prod URL. `url-literal-preserved` should fire.
+- `04-missing-export/auth-index/` — barrel re-export of `signIn` was forgotten → consumers got runtime undefined → fix adds the re-export. `module-export-stable` / `package-exports-exist` should fire.
+- `05-tsc-clean/strict-implicit-any/` — implicit-any parameter in strict-mode `tsconfig.json` → fix adds the type annotation. `tsc-clean` should fire.
+
+### Locked memory rules from today's session
+
+- `dont-defer-buildable-fixes` — never defer a 1-2 day fix; reserve deferral for >1-week infra blockers
+- `new-templates-need-both-deterministic-and-llm` — every template ships in BOTH paths in the same release (with full checklist)
+
 ## [0.2.6] — 2026-06-02
 
 Closes the remaining v0.2.0 auto-detector gap — `page-renders` and `validation-rejects-bad` now also auto-fire on the diff that introduces them, matching what 0.2.5 did for `happy-path-with-side-effect`. All three workhorse templates from Claude session feedback (named in 0.2.0) now reach customers via auto-protect, not just explicit claims.

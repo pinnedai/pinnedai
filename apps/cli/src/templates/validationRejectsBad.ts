@@ -104,8 +104,17 @@ describe("pinned: validation-rejects-bad " + METHOD + " " + ROUTE, () => {
     }
   });
 
+  // Reject responses that look like "route doesn't exist" instead of
+  // "validation rejected." A bare 404 / 405 in the 4xx range would
+  // otherwise silently satisfy the assertion — a customer who deleted
+  // the route entirely would see this pin still green. Same
+  // wrong-direction failure mode the happy-path tier-2 check closes.
+  function isRouteMissingResponse(status: number): boolean {
+    return status === 404 || status === 405 || status === 501;
+  }
+
   // Sub-test 1: malformed-JSON — POST with a non-JSON body. Endpoint
-  // should reject (400 or 415).
+  // should reject (400 or 415, NOT 404/405).
   it.skipIf(previewMissing && !forceRequire)("rejects malformed JSON body", async () => {
     const url = PREVIEW_URL!.replace(/\\/$/, "") + ROUTE;
     const body = "this-is-not-json";
@@ -114,6 +123,15 @@ describe("pinned: validation-rejects-bad " + METHOD + " " + ROUTE, () => {
       headers: { "Content-Type": "application/json" },
       body,
     });
+    if (isRouteMissingResponse(res.status)) {
+      throw new Error(
+        repairPrompt(
+          "malformed-json",
+          res.status,
+          body + "  [route appears missing: status " + res.status + " — not a validation failure, the handler is gone]"
+        )
+      );
+    }
     if (res.status < 400 || res.status >= 500) {
       throw new Error(repairPrompt("malformed-json", res.status, body));
     }
@@ -123,7 +141,7 @@ describe("pinned: validation-rejects-bad " + METHOD + " " + ROUTE, () => {
 
   // Sub-test 2 (per required field): missing-required — POST with that
   // one field deleted from an otherwise-minimal body. Endpoint should
-  // reject (400 or 422).
+  // reject (400 or 422, NOT 404/405).
   for (const field of REQUIRED_FIELDS) {
     it.skipIf(previewMissing && !forceRequire)(
       "rejects body missing required field: " + field,
@@ -137,6 +155,15 @@ describe("pinned: validation-rejects-bad " + METHOD + " " + ROUTE, () => {
           headers: { "Content-Type": "application/json" },
           body: bodyStr,
         });
+        if (isRouteMissingResponse(res.status)) {
+          throw new Error(
+            repairPrompt(
+              "missing-required:" + field,
+              res.status,
+              bodyStr + "  [route appears missing: status " + res.status + " — not a validation failure, the handler is gone]"
+            )
+          );
+        }
         if (res.status < 400 || res.status >= 500) {
           throw new Error(repairPrompt("missing-required:" + field, res.status, bodyStr));
         }
