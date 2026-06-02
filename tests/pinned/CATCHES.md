@@ -4,7 +4,7 @@ Auto-maintained by [pinnedai](https://pinnedai.dev). Each entry is a regression 
 
 **Do not edit by hand** — this file is rewritten on every `pinned test` run that detects a new catch.
 
-**Lifetime catches:** 8 (showing 8 most recent)
+**Lifetime catches:** 8 unique pins (showing 8 most recent)
 
 ## 2026-06-02 · cli-output-contains on node ./apps/cli/dist/cli.js check --description "Rate-limits /api/users to 60 req/min."
 

@@ -2932,61 +2932,44 @@ async function detectVercelPreviewUrl(cwd: string): Promise<DetectedPreviewUrl |
 // (deploy URL → running dev server → loud warn) and for the
 // in-loop verify paths (pre-commit verify, watch verify, init's
 // "run pins once at end" closing banner).
-async function probeRunningDevServer(cwd: string): Promise<{ url: string; source: "config-http-url" | "framework-default-port" } | null> {
-  // Order: (1) explicit http.url from config, (2) framework-default
-  // port detection. Stops at the first reachable URL.
-  const candidates: Array<{ url: string; source: "config-http-url" | "framework-default-port" }> = [];
-
+async function probeRunningDevServer(cwd: string): Promise<{ url: string; source: "config-http-url" } | null> {
+  // 0.2.14: TIGHTENED scope. Pre-0.2.14 this function scanned ports
+  // 3000/5173/4321/8080/8000 indiscriminately and attached to whatever
+  // localhost server it found. That caused phantom catches when an
+  // UNRELATED app (other dyad project, Docker dashboard, etc) was up
+  // on those ports — Pinned would run the project's pin tests against
+  // someone else's server and report bogus regressions.
+  //
+  // Now: only attaches to the URL the user explicitly configured at
+  // `pinned init` time (config.http.url). If the user picked "off" or
+  // "preview" mode (no local URL), this function returns null and the
+  // caller falls back to the loud "0 verifying" banner — which is the
+  // correct outcome. Better to skip verification than to verify
+  // against the wrong server and lie to the user.
+  //
+  // Trade-off: this removes the "fortuitously catches when they have
+  // their dev server up" magic of 0.2.12. The right replacement is
+  // [[retro-audit-zero-work-zero-anger]]'s L2 rung — attach only
+  // when configured, never via opportunistic port scan.
   try {
     const cfgPath = join(cwd, ".pinnedai", "config.json");
-    if (existsSync(cfgPath)) {
-      const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as {
-        http?: { url?: string; mode?: string };
-      };
-      if (cfg.http?.url) {
-        candidates.push({ url: cfg.http.url, source: "config-http-url" });
-      }
-    }
-  } catch { /* fall through to framework default */ }
-
-  const dev = detectDevScript(cwd);
-  if (dev?.guessedUrl) {
-    candidates.push({ url: dev.guessedUrl, source: "framework-default-port" });
-  }
-  // Common ports as a final fallback (Next.js: 3000, Vite: 5173, Astro: 4321)
-  for (const port of [3000, 5173, 4321, 8080, 8000]) {
-    candidates.push({ url: `http://localhost:${port}`, source: "framework-default-port" });
-  }
-
-  // De-dupe by URL
-  const seen = new Set<string>();
-  const unique = candidates.filter((c) => {
-    const k = c.url.replace(/\/$/, "");
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-
-  for (const cand of unique) {
+    if (!existsSync(cfgPath)) return null;
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as {
+      http?: { url?: string; mode?: string };
+    };
+    if (cfg.http?.mode !== "local" || !cfg.http?.url) return null;
+    const target = cfg.http.url.replace(/\/$/, "");
     try {
-      const probeUrl = cand.url.replace(/\/$/, "") + "/";
-      // Short timeout — we're probing localhost, ~50ms is plenty when
-      // the server is up; if it isn't, fail fast and move on.
-      const res = await fetch(probeUrl, {
+      const res = await fetch(target + "/", {
         method: "GET",
         signal: AbortSignal.timeout(750),
-        // Identify probe so handlers can no-op real side effects if
-        // they choose (documented X-Pinned-Test pattern).
         headers: { "X-Pinned-Probe": "1" },
       });
-      // Any HTTP response means the server is up (even 4xx/5xx — the
-      // app might 404 on `/` but still be serving). Network-level
-      // failure (ECONNREFUSED) throws and we move to the next candidate.
       if (res.status >= 100 && res.status < 600) {
-        return { url: cand.url.replace(/\/$/, ""), source: cand.source };
+        return { url: target, source: "config-http-url" };
       }
-    } catch { /* unreachable — try next */ }
-  }
+    } catch { /* unreachable — return null */ }
+  } catch { /* config unreadable — return null */ }
   return null;
 }
 
@@ -4311,10 +4294,94 @@ program
     "tests/pinned"
   )
   .option("--limit <n>", "Show at most N entries (default: 20)", "20")
+  .option(
+    "--review <claim-id>",
+    "Mark a single catch as a phantom (not a real regression) and remove it from the lifetime count. Use when you confirm a pin fired against the wrong target (e.g. attached to an unrelated localhost server). Repeat for multiple. Pin file is preserved."
+  )
+  .option(
+    "--reset-phantoms",
+    "Aggressive cleanup: drop EVERY catch whose claimId is currently in failingClaimIds AND whose corresponding pin file does not have a true failure when re-run with the current PREVIEW_URL. Use after fixing a probe-scope bug to scrub all ghosts at once."
+  )
   .option("--quiet", "Suppress the pinned banner header.")
-  .action(async (opts: { dir: string; limit: string }) => {
-    printBanner();
+  .action(async (opts: { dir: string; limit: string; review?: string; resetPhantoms?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
     assertInsideDir(opts.dir, process.cwd());
+
+    // --review: drop a specific claimId from catchHistory + caughtClaimIds
+    // + failingClaimIds. Pin file is preserved (it's still a valid pin;
+    // we're just disowning the bogus catch metric).
+    if (opts.review) {
+      const claimId = opts.review;
+      const prev = readLastStatus(opts.dir);
+      if (!prev) {
+        err("✗ No cache to update — `pinned test` has never run.\n");
+        process.exit(1);
+      }
+      const catchHistory = (prev.catchHistory ?? []).filter((r) => r.claimId !== claimId);
+      const caughtClaimIds = (prev.caughtClaimIds ?? Array.from(new Set((prev.catchHistory ?? []).map((r) => r.claimId)))).filter((id) => id !== claimId);
+      const failingClaimIds = (prev.failingClaimIds ?? []).filter((id) => id !== claimId);
+      writeLastStatus(opts.dir, {
+        ...prev,
+        failingClaimIds,
+        failingCount: failingClaimIds.length,
+        status: failingClaimIds.length === 0 ? "green" : prev.status,
+        catchHistory,
+        caughtClaimIds,
+        breaksCaught: caughtClaimIds.length,
+        updatedAt: new Date().toISOString(),
+      });
+      try {
+        const catchesPath = join(opts.dir, "CATCHES.md");
+        const md = renderCatchesMarkdown({ catchHistory, breaksCaught: caughtClaimIds.length });
+        writeFileSync(catchesPath, md);
+      } catch { /* best-effort */ }
+      out(`✓ Reviewed phantom: ${claimId} removed from catchHistory + breaksCaught.`);
+      out(`  Pin file preserved. New breaksCaught: ${caughtClaimIds.length}.`);
+      return;
+    }
+
+    // --reset-phantoms: bulk cleanup. Drop every catch whose claimId is
+    // CURRENTLY in failingClaimIds. Rationale: if the cache says the pin
+    // is currently failing AND we just patched the bug that caused
+    // erroneous attachment, those "failing" records are phantoms — the
+    // underlying behavior was never broken. Pin files stay; only the
+    // tracking metadata gets cleaned.
+    if (opts.resetPhantoms) {
+      const prev = readLastStatus(opts.dir);
+      if (!prev) {
+        out("Nothing to reset — no cache exists.");
+        return;
+      }
+      const ghostIds = new Set(prev.failingClaimIds ?? []);
+      if (ghostIds.size === 0) {
+        out("Nothing to reset — no claims are marked as currently failing.");
+        return;
+      }
+      const catchHistory = (prev.catchHistory ?? []).filter((r) => !ghostIds.has(r.claimId));
+      const caughtClaimIds = (prev.caughtClaimIds ?? Array.from(new Set((prev.catchHistory ?? []).map((r) => r.claimId)))).filter((id) => !ghostIds.has(id));
+      writeLastStatus(opts.dir, {
+        ...prev,
+        failingClaimIds: [],
+        failingCount: 0,
+        status: "green",
+        catchHistory,
+        caughtClaimIds,
+        breaksCaught: caughtClaimIds.length,
+        updatedAt: new Date().toISOString(),
+      });
+      try {
+        const catchesPath = join(opts.dir, "CATCHES.md");
+        const md = renderCatchesMarkdown({ catchHistory, breaksCaught: caughtClaimIds.length });
+        writeFileSync(catchesPath, md);
+      } catch { /* best-effort */ }
+      out(`✓ Reset ${ghostIds.size} phantom catch${ghostIds.size === 1 ? "" : "es"}:`);
+      for (const id of ghostIds) out(`   • ${id}`);
+      out("");
+      out(`New breaksCaught: ${caughtClaimIds.length} (was ${(prev.caughtClaimIds ?? []).length || prev.breaksCaught}).`);
+      out("Pin files preserved. Run \`pinned test\` to re-verify against your real PREVIEW_URL.");
+      return;
+    }
+
     const last = readLastStatus(opts.dir);
     const history = last?.catchHistory ?? [];
     // Dedupe display by claimId — keep the most recent record per

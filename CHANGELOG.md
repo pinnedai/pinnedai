@@ -2,6 +2,43 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.14] — 2026-06-03
+
+P0 hotfix for a trust-damaging bug shipped in 0.2.12.
+
+### Fixed — `probeRunningDevServer` no longer attaches to unrelated localhost servers
+
+The target-resolution waterfall introduced in 0.2.12 (#79) probed ports 3000 / 5173 / 4321 / 8080 / 8000 indiscriminately and attached to whatever localhost server it found first. When a developer had ANY unrelated server up on those ports (another dyad project's Vite dev server, a Docker dashboard, a sleeping Next.js app), Pinned would attach to it, run the project's pin tests against the wrong app, and report bogus "🛟 Pinned caught a regression — N protected behaviors are failing" alerts via the UserPromptSubmit hook.
+
+Confirmed in the wild on `pinnedai`'s own repo immediately after the 0.2.13 publish: 5 pins flagged as "failing" because an unrelated dev server on port 3000 returned 2xx for `/api/admin` instead of 401/403. The pins weren't broken; they were running against the wrong host.
+
+**0.2.14 tightens probe scope:**
+
+- Only attaches when `.pinnedai/config.json` has `http.mode: "local"` AND `http.url` set (the URL the user explicitly configured at `pinned init` time).
+- If `http.mode` is `"off"` or `"preview"`, returns null even if a server is up at common ports.
+- If `http.url` is unreachable, returns null cleanly (no fallback to other ports).
+
+Trade-off: this removes the "fortuitously catches when they happen to have their dev server up" magic. Per [[retro-audit-zero-work-zero-anger]]'s L2 consent rung, attach only when configured, never via opportunistic port scan. Better to skip verification than verify against the wrong server and lie to the user.
+
+### Added — `pinned catches --review <claim-id>` and `pinned catches --reset-phantoms`
+
+For users who got phantom catches from 0.2.12 / 0.2.13:
+
+- **`pinned catches --review <claim-id>`** — drop a single bogus catch from `catchHistory` + `caughtClaimIds` + `failingClaimIds`. Re-renders `CATCHES.md`. Pin file preserved.
+- **`pinned catches --reset-phantoms`** — bulk cleanup. Drops every catch whose claimId is currently in `failingClaimIds`. Resets `status` to "green" and decrements `breaksCaught` accordingly. Run AFTER upgrading to 0.2.14 + verifying the failures aren't real by running pins against the actual configured `PREVIEW_URL`.
+
+### Three-test matrix (this release)
+
+Per the locked rule:
+
+- **Positive**: `http.mode: local` + `http.url: http://localhost:7771` + server up at 7771 → attaches ✓
+- **Negative 1**: no `.pinnedai/config.json` + stranger on port 3000 → returns null ✓ (was the bug)
+- **Negative 2**: `http.mode: off` + stranger on port 3000 → returns null ✓
+- **Negative 3**: `http.url` configured but unreachable → returns null cleanly ✓
+- **CLI flags exposed**: `pinned catches --review` and `--reset-phantoms` both registered ✓
+
+5/5 green. Live cleanup verified on `pinnedai` itself: 13 lifetime catches (5 phantoms) → 8 (real prior catches preserved).
+
 ## [0.2.13] — 2026-06-03
 
 One addition on top of 0.2.12: the agent PostToolUse hook — THE activation wedge per [[agent-loop-activation-wedge]]. Plus the FP-check-everything memory rule upgrade to require positive + negative + dyad-sweep matrix for every feature ship going forward.

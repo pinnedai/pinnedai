@@ -7,9 +7,9 @@
   "recentlyAddedCount": 3,
   "recentlyAddedAt": "2026-06-02T23:23:34.975Z",
   "suggestedCount": 0,
-  "lastCheckedSha": "3f6ce868b4bd08439155801c2921f70015f3aa4c",
-  "lastCheckedDirtyHash": "9dd5775b5ed62722",
-  "updatedAt": "2026-06-02T23:23:34.975Z",
+  "lastCheckedSha": "fa66958b97770aea389e75461b85c89f281a0892",
+  "lastCheckedDirtyHash": "743815cc648cf659",
+  "updatedAt": "2026-06-02T23:41:09.100Z",
   "lastAutoProtectAt": "2026-05-26T15:35:19.295Z",
   "lastAddNotifiedAt": "2026-06-02T07:33:03.111Z",
   "recentlyAddedSummaries": [
@@ -31,8 +31,8 @@
   "lastLessonSummary": "Do not weaken pinned tests to make CI pass.",
   "lessonsLifetime": 6,
   "breaksCaught": 8,
-  "lastCatchAt": "2026-06-02T02:59:49.282Z",
-  "lastCatchClaimId": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2",
+  "lastCatchAt": "2026-06-02T23:23:38.541Z",
+  "lastCatchClaimId": "baseline-20260525-auth-required-api-admin-19rdd0",
   "catchHistory": [
     {
       "caughtAt": "2026-06-02T02:59:49.282Z",
@@ -99,9 +99,9 @@
       "originPr": "v0-1-1"
     }
   ],
-  "checksRun": 46,
-  "verifiedStreak": 11,
-  "skippedCount": 2,
+  "checksRun": 47,
+  "verifiedStreak": 0,
+  "skippedCount": 1,
   "lastVerifiedAt": "2026-06-02T13:55:57.947Z",
   "lastCoveredAt": "2026-06-02T13:55:57.949Z",
   "lastCoveredCount": 49,
