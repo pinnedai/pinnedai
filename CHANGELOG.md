@@ -2,6 +2,24 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.10] — 2026-06-02
+
+Two fixes from the live walk-forward verification on socialideagen (which produced 7 real catches at the buggy commit 6bf2c28 vs the fixed HEAD).
+
+### Added — yup / joi / valibot bodyShape extraction
+
+`detectNewValidationSchemasInDiff` now extracts `bodyShape` (the per-field type + format + min hints) from yup, joi, and valibot schemas, not just zod. The complementary happy-path-with-side-effect pin can now ship a schema-satisfying body for routes guarded by any of the four major validation libraries. Library-specific method mappings:
+
+- **yup**: `.email() .url() .uuid() .datetime() .date() .min(N) .integer() .positive() .oneOf([...])`. Requires `.required()` on the field entry (yup's default is optional).
+- **joi**: `.email() .uri() .guid()/.uuid() .isoDate() .min(N) .integer() .positive() .valid(...)`. Same `.required()` requirement.
+- **valibot**: `v.string([v.email(), v.minLength(N)])` style — sniffs the inner validator array for format + min. Skips fields wrapped in `v.optional(...) / v.nullable(...) / v.nullish(...)`.
+
+Tested on all three libraries; the captured shape correctly drives the happy-path test's `buildValidBody()` so first runs satisfy the schema instead of 4xx-ing on missing fields.
+
+### Fixed — `pinned init` crashed in git worktrees (ENOTDIR on `.git/hooks`)
+
+Surfaced during the socialideagen walk-forward verification. In a git worktree, `.git/` is a FILE containing `gitdir: <main repo>/.git/worktrees/<name>`, not a directory. The hooks installer did `mkdirSync(path.join(repoRoot, ".git", "hooks"), { recursive: true })`, which threw ENOTDIR before any hook was written. 0.2.10 adds `resolveHooksDir(repoRoot)` which: (1) statSyncs `.git` to detect the worktree case, (2) prefers `git rev-parse --git-path hooks` for the canonical answer, (3) falls back to parsing the `.git` file's `gitdir:` line directly when git isn't on PATH. Hooks now install at the worktree's own hooks directory, hookPath + uninstallHook use the resolved path, behavior unchanged for regular repos.
+
 ## [0.2.9] — 2026-06-02
 
 One addition on top of 0.2.8 — closes the socialideagen cold-walk-forward to 4/4 by adding a retroactive journey detector.

@@ -2526,6 +2526,125 @@ export function zodChainToShape(chain: string): FieldShape {
   return { kind: "unknown" };
 }
 
+// Same shape as zodChainToShape but for yup. Yup chains look like
+// `yup.string().email().min(5).required()` — similar method names,
+// different namespace prefix.
+export function yupChainToShape(chain: string): FieldShape {
+  if (/^\s*yup\.boolean\s*\(/.test(chain)) return { kind: "boolean" };
+  if (/^\s*yup\.array\s*\(/.test(chain)) return { kind: "array" };
+  if (/^\s*yup\.number\s*\(/.test(chain)) {
+    const int = /\.integer\s*\(/.test(chain) || /\.positive\s*\(/.test(chain);
+    const minMatch = /\.min\s*\(\s*(-?\d+)/.exec(chain);
+    return {
+      kind: "number",
+      ...(int ? { int: true } : {}),
+      ...(minMatch ? { min: Number(minMatch[1]) } : {}),
+    };
+  }
+  // yup .oneOf(["a","b"]) is the enum equivalent.
+  const oneOf = /\.oneOf\s*\(\s*\[([^\]]*)\]/.exec(chain);
+  if (oneOf) {
+    const items = oneOf[1]
+      .split(",")
+      .map((s) => s.trim().replace(/^["']/, "").replace(/["']$/, ""))
+      .filter((s) => s.length > 0);
+    if (items.length > 0) return { kind: "enum", values: items };
+  }
+  if (/^\s*yup\.string\s*\(/.test(chain)) {
+    let format: "email" | "url" | "uuid" | "date" | "datetime" | "cuid" | undefined;
+    if (/\.email\s*\(/.test(chain)) format = "email";
+    else if (/\.url\s*\(/.test(chain)) format = "url";
+    else if (/\.uuid\s*\(/.test(chain)) format = "uuid";
+    else if (/\.datetime\s*\(/.test(chain)) format = "datetime";
+    else if (/\.date\s*\(/.test(chain)) format = "date";
+    const minMatch = /\.min\s*\(\s*(\d+)/.exec(chain);
+    return {
+      kind: "string",
+      ...(format ? { format } : {}),
+      ...(minMatch ? { min: Number(minMatch[1]) } : {}),
+    };
+  }
+  return { kind: "unknown" };
+}
+
+// Joi: `Joi.string().email().min(5).required()`. Most method names
+// match yup; key differences: .uri() for URLs, .guid()/.uuid() for
+// UUIDs, .valid(...) instead of .oneOf().
+export function joiChainToShape(chain: string): FieldShape {
+  if (/^\s*Joi\.boolean\s*\(/.test(chain)) return { kind: "boolean" };
+  if (/^\s*Joi\.array\s*\(/.test(chain)) return { kind: "array" };
+  if (/^\s*Joi\.number\s*\(/.test(chain)) {
+    const int = /\.integer\s*\(/.test(chain) || /\.positive\s*\(/.test(chain);
+    const minMatch = /\.min\s*\(\s*(-?\d+)/.exec(chain);
+    return {
+      kind: "number",
+      ...(int ? { int: true } : {}),
+      ...(minMatch ? { min: Number(minMatch[1]) } : {}),
+    };
+  }
+  const validValues = /\.valid\s*\(([^)]+)\)/.exec(chain);
+  if (validValues) {
+    const items = validValues[1]
+      .split(",")
+      .map((s) => s.trim().replace(/^["']/, "").replace(/["']$/, ""))
+      .filter((s) => s.length > 0);
+    if (items.length > 0) return { kind: "enum", values: items };
+  }
+  if (/^\s*Joi\.string\s*\(/.test(chain)) {
+    let format: "email" | "url" | "uuid" | "date" | "datetime" | "cuid" | undefined;
+    if (/\.email\s*\(/.test(chain)) format = "email";
+    else if (/\.uri\s*\(/.test(chain)) format = "url";
+    else if (/\.guid\s*\(/.test(chain) || /\.uuid\s*\(/.test(chain)) format = "uuid";
+    else if (/\.isoDate\s*\(/.test(chain)) format = "datetime";
+    const minMatch = /\.min\s*\(\s*(\d+)/.exec(chain);
+    return {
+      kind: "string",
+      ...(format ? { format } : {}),
+      ...(minMatch ? { min: Number(minMatch[1]) } : {}),
+    };
+  }
+  return { kind: "unknown" };
+}
+
+// Valibot: `v.string([v.email(), v.minLength(5)])`. Different shape —
+// validators are passed as an array argument rather than chained.
+export function valibotChainToShape(chain: string): FieldShape {
+  if (/^\s*v\.boolean\s*\(/.test(chain)) return { kind: "boolean" };
+  if (/^\s*v\.array\s*\(/.test(chain)) return { kind: "array" };
+  if (/^\s*v\.number\s*\(/.test(chain)) {
+    const int = /\bv\.integer\s*\(/.test(chain);
+    const minMatch = /\bv\.minValue\s*\(\s*(-?\d+)/.exec(chain);
+    return {
+      kind: "number",
+      ...(int ? { int: true } : {}),
+      ...(minMatch ? { min: Number(minMatch[1]) } : {}),
+    };
+  }
+  const picklist = /^\s*v\.picklist\s*\(\s*\[([^\]]*)\]/.exec(chain);
+  if (picklist) {
+    const items = picklist[1]
+      .split(",")
+      .map((s) => s.trim().replace(/^["']/, "").replace(/["']$/, ""))
+      .filter((s) => s.length > 0);
+    if (items.length > 0) return { kind: "enum", values: items };
+  }
+  if (/^\s*v\.string\s*\(/.test(chain)) {
+    let format: "email" | "url" | "uuid" | "date" | "datetime" | "cuid" | undefined;
+    if (/\bv\.email\s*\(/.test(chain)) format = "email";
+    else if (/\bv\.url\s*\(/.test(chain)) format = "url";
+    else if (/\bv\.uuid\s*\(/.test(chain)) format = "uuid";
+    else if (/\bv\.isoDateTime\s*\(/.test(chain)) format = "datetime";
+    else if (/\bv\.isoDate\s*\(/.test(chain)) format = "date";
+    const minMatch = /\bv\.minLength\s*\(\s*(\d+)/.exec(chain);
+    return {
+      kind: "string",
+      ...(format ? { format } : {}),
+      ...(minMatch ? { min: Number(minMatch[1]) } : {}),
+    };
+  }
+  return { kind: "unknown" };
+}
+
 // Given a FieldShape, produce a value that should satisfy it. Used by
 // happy-path-with-side-effect's buildValidBody(). Kept deterministic
 // so the same schema always emits the same body — predictable for
@@ -2614,14 +2733,25 @@ export function detectNewValidationSchemasInDiff(diffByFile: DiffByFile): DiffNe
       }
     }
     // yup: `yup.object({ name: yup.string().required() })`
+    // 0.2.10+: also populate bodyShape via yupChainToShape so the
+    // complementary happy-path-with-side-effect pin ships a body that
+    // satisfies the schema instead of the placeholder.
     const yupMatch = /yup\.object\s*\(\s*\{([^}]{0,2000})\}\s*\)/g;
     let ym: RegExpExecArray | null;
     while ((ym = yupMatch.exec(added)) !== null) {
       const body = ym[1];
-      const entryRe = /([a-zA-Z_][\w]{0,40})\s*:\s*yup\.\w+\([^)]*\)(?:\.[a-zA-Z]+\([^)]*\))*\.required\(/g;
-      let entry: RegExpExecArray | null;
-      while ((entry = entryRe.exec(body)) !== null) {
-        fields.add(entry[1]);
+      const entries = splitTopLevelCommas(body);
+      for (const entry of entries) {
+        const m = /^\s*([a-zA-Z_][\w]{0,40})\s*:\s*(yup\..+)$/s.exec(entry);
+        if (!m) continue;
+        // Yup defaults to nullable/optional unless .required() is
+        // present, so REQUIRE the .required() call to match the
+        // existing required-field semantics.
+        if (!/\.required\s*\(/.test(entry)) continue;
+        const fieldName = m[1];
+        const chain = m[2];
+        fields.add(fieldName);
+        bodyShape[fieldName] = yupChainToShape(chain);
       }
     }
     // joi: `Joi.object({ name: Joi.string().required() })`
@@ -2629,10 +2759,36 @@ export function detectNewValidationSchemasInDiff(diffByFile: DiffByFile): DiffNe
     let jm: RegExpExecArray | null;
     while ((jm = joiMatch.exec(added)) !== null) {
       const body = jm[1];
-      const entryRe = /([a-zA-Z_][\w]{0,40})\s*:\s*Joi\.\w+\([^)]*\)(?:\.[a-zA-Z]+\([^)]*\))*\.required\(/g;
-      let entry: RegExpExecArray | null;
-      while ((entry = entryRe.exec(body)) !== null) {
-        fields.add(entry[1]);
+      const entries = splitTopLevelCommas(body);
+      for (const entry of entries) {
+        const m = /^\s*([a-zA-Z_][\w]{0,40})\s*:\s*(Joi\..+)$/s.exec(entry);
+        if (!m) continue;
+        if (!/\.required\s*\(/.test(entry)) continue;
+        const fieldName = m[1];
+        const chain = m[2];
+        fields.add(fieldName);
+        bodyShape[fieldName] = joiChainToShape(chain);
+      }
+    }
+    // valibot: `v.object({ name: v.string([v.email()]) })`. Valibot
+    // doesn't have a `.optional()/.nullable()` chained variant — it
+    // wraps the schema: `v.optional(v.string(...))`. We detect required
+    // fields as the inverse: any field whose value is NOT wrapped in
+    // v.optional(...) / v.nullable(...) / v.nullish(...).
+    const valibotMatch = /\bv\.object\s*\(\s*\{([^}]{0,2000})\}\s*\)/g;
+    let vbm: RegExpExecArray | null;
+    while ((vbm = valibotMatch.exec(added)) !== null) {
+      const body = vbm[1];
+      const entries = splitTopLevelCommas(body);
+      for (const entry of entries) {
+        const m = /^\s*([a-zA-Z_][\w]{0,40})\s*:\s*(v\..+)$/s.exec(entry);
+        if (!m) continue;
+        // Skip optional-wrapped values.
+        if (/^\s*[a-zA-Z_][\w]{0,40}\s*:\s*v\.(?:optional|nullable|nullish)\s*\(/.test(entry)) continue;
+        const fieldName = m[1];
+        const chain = m[2];
+        fields.add(fieldName);
+        bodyShape[fieldName] = valibotChainToShape(chain);
       }
     }
 

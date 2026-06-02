@@ -7,9 +7,9 @@
   "recentlyAddedCount": 1,
   "recentlyAddedAt": "2026-06-02T07:33:03.111Z",
   "suggestedCount": 0,
-  "lastCheckedSha": "e44b452cf7509185b172ff53a9487b51271540a7",
-  "lastCheckedDirtyHash": "da0071eac3baf45b",
-  "updatedAt": "2026-06-02T12:58:51.122Z",
+  "lastCheckedSha": "eeaef3fea1700f3c503eb2442e9884dad12668c1",
+  "lastCheckedDirtyHash": "83e04622c19ead43",
+  "updatedAt": "2026-06-02T13:55:55.105Z",
   "lastAutoProtectAt": "2026-05-26T15:35:19.295Z",
   "lastAddNotifiedAt": "2026-06-02T07:33:03.111Z",
   "recentlyAddedSummaries": [
@@ -97,10 +97,20 @@
       "originPr": "v0-1-1"
     }
   ],
-  "checksRun": 44,
-  "verifiedStreak": 9,
+  "checksRun": 45,
+  "verifiedStreak": 10,
   "skippedCount": 3,
-  "lastVerifiedAt": "2026-06-02T09:25:31.840Z",
-  "lastCoveredAt": "2026-06-02T09:25:31.842Z",
-  "lastCoveredCount": 48
+  "lastVerifiedAt": "2026-06-02T12:58:54.623Z",
+  "lastCoveredAt": "2026-06-02T12:58:54.625Z",
+  "lastCoveredCount": 48,
+  "caughtClaimIds": [
+    "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2",
+    "v0-1-1-auth-required-api-admin-export-rw7ne7",
+    "v0-1-1-returns-status-api-signup-15x1ys",
+    "v0-1-1-returns-status-api-users-12hl5q",
+    "v0-1-1-returns-status-api-users-um7t93",
+    "baseline-20260525-lockfile-integrity-lockfile-pnpm-lock-yaml-e7a06ea703b2-tb6mqy",
+    "baseline-20260525-secret-not-public-secret-not-public-vite-12jyea",
+    "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-version-1o1gxj"
+  ]
 }

@@ -18,7 +18,53 @@
 // the end. If they want clean uninstall, we only remove our block.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, chmodSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { join, isAbsolute, resolve } from "node:path";
+
+// Resolve the actual hooks directory for the repo at `repoRoot`. Most
+// repos have `.git/` as a directory and hooks live at `.git/hooks/`.
+// In a git WORKTREE, `.git` is a FILE containing `gitdir: <main repo>/
+// .git/worktrees/<name>`, and the worktree's own hooks live at that
+// resolved directory's `hooks/` subdir.
+//
+// `git rev-parse --git-path hooks` resolves the right path in both
+// cases — but we fall back to a manual parse of the .git file content
+// if git isn't on PATH (some lean CI images).
+function resolveHooksDir(repoRoot: string): string | null {
+  const dotGit = join(repoRoot, ".git");
+  if (!existsSync(dotGit)) return null;
+  // Common case: .git is a directory.
+  try {
+    if (statSync(dotGit).isDirectory()) return join(dotGit, "hooks");
+  } catch {
+    return null;
+  }
+  // Worktree case: .git is a file. Prefer asking git itself.
+  try {
+    const out = execFileSync("git", ["rev-parse", "--git-path", "hooks"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+    }).trim();
+    if (out) {
+      return isAbsolute(out) ? out : resolve(repoRoot, out);
+    }
+  } catch {
+    /* fall through to manual parse */
+  }
+  // Manual parse of the .git file: `gitdir: <path>`.
+  try {
+    const content = readFileSync(dotGit, "utf8").trim();
+    const m = /^gitdir:\s*(.+)$/m.exec(content);
+    if (m) {
+      const gitDir = isAbsolute(m[1]) ? m[1] : resolve(repoRoot, m[1]);
+      return join(gitDir, "hooks");
+    }
+  } catch {
+    /* unreadable .git file */
+  }
+  return null;
+}
 
 const MARKER_START_PREFIX = "# pinnedai:";
 const MARKER_END = "# pinnedai:end";
@@ -162,6 +208,11 @@ const HOOK_BODIES: Record<HookName, string> = {
 };
 
 function hookPath(repoRoot: string, name: HookName): string {
+  // Use the resolved hooks dir (worktree-aware) when possible. Fall
+  // back to the legacy `.git/hooks/` form when not in a git repo at
+  // all — caller distinguishes via the existsSync check at the call site.
+  const hooksDir = resolveHooksDir(repoRoot);
+  if (hooksDir) return join(hooksDir, name);
   return join(repoRoot, ".git", "hooks", name);
 }
 
@@ -177,13 +228,17 @@ export type HookInstallResult =
   | { status: "conflict"; path: string; reason: string };
 
 export function installHook(repoRoot: string, name: HookName): HookInstallResult {
-  const gitDir = join(repoRoot, ".git");
-  if (!existsSync(gitDir)) {
+  // resolveHooksDir handles BOTH the `.git/` directory case AND the
+  // worktree case (`.git` is a file containing `gitdir: <main repo>/
+  // .git/worktrees/<name>`). Pre-0.2.10 we did `mkdirSync(.git/hooks)`
+  // unconditionally, which threw ENOTDIR in worktrees because `.git`
+  // is a file, not a directory. See worktree-init crash 2026-06-02.
+  const hooksDir = resolveHooksDir(repoRoot);
+  if (!hooksDir) {
     return { status: "no-git", path: hookPath(repoRoot, name) };
   }
-  const hooksDir = join(gitDir, "hooks");
   mkdirSync(hooksDir, { recursive: true });
-  const path = hookPath(repoRoot, name);
+  const path = join(hooksDir, name);
   const body = HOOK_BODIES[name];
   const startMarker = markerStart(name);
 
