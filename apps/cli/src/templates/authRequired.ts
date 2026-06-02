@@ -62,10 +62,54 @@ const STATIC_VERIFY = ${JSON.stringify(claim.staticVerify ?? null)};
 // When absent, that direction skips silently.
 const TOKEN_AUTH = process.env.PREVIEW_TEST_TOKEN_AUTH;
 
+// True when ROUTE looks like a real URL path we can fetch. False when
+// the captured value is a wildcard or descriptive token (e.g.
+// "* (middleware)") — those pins are static-mode only; building a URL
+// by concatenating PREVIEW_URL + ROUTE produces invalid URLs that
+// fetch() throws on, surfacing as PINNED_INFRA_FAILURE noise rather
+// than useful signal. Real fetchable paths start with "/" and have no
+// wildcard or whitespace.
+function routeIsFetchable(route: string): boolean {
+  if (!route) return false;
+  if (!route.startsWith("/")) return false;
+  if (/[\\s*]/.test(route)) return false;
+  return true;
+}
+
+// Pick a real HTTP method to test against. When the route is method-
+// restricted (POST-only, PUT-only, etc.), GET returns 405 — and the
+// 405 itself is NOT a regression catch, it's the server correctly
+// rejecting an unsupported method. The validator below handles the
+// retry; this helper extracts the allowed method from the Allow header.
+function pickAllowedMethod(allowHeader: string | null): string | null {
+  if (!allowHeader) return null;
+  const methods = allowHeader
+    .split(",")
+    .map((m) => m.trim().toUpperCase())
+    .filter((m) => m && !["GET", "HEAD", "OPTIONS"].includes(m));
+  return methods[0] || null;
+}
+
 // Auth-response validator — accepts 401/403, 3xx redirects to login,
 // OR 200 with a login form. Returns a structured verdict so the
 // repair prompt can explain WHY a response didn't qualify.
-async function authResponseIsValid(res: Response): Promise<{ ok: boolean; reason: string }> {
+//
+// 405 Method Not Allowed gets special handling. When the route is
+// POST-only / PUT-only / DELETE-only (correct REST design — login
+// is POST, logout is POST, confirm-token is GET-only, etc.) a GET
+// returns 405. This is NOT a regression catch — the server is
+// correctly rejecting an unsupported method, and we have no signal
+// about auth from the response. The caller (the it() block below)
+// re-tests with the right method when Allow header is present.
+async function authResponseIsValid(res: Response): Promise<{ ok: boolean; reason: string; methodRetry?: string | null }> {
+  if (res.status === 405) {
+    const retryMethod = pickAllowedMethod(res.headers.get("allow"));
+    return {
+      ok: false,
+      reason: "405 method-not-allowed — route is method-restricted; auth signal inconclusive on this method",
+      methodRetry: retryMethod,
+    };
+  }
   // Classic API auth — 401/403.
   if (res.status === 401 || res.status === 403) {
     return { ok: true, reason: res.status + " auth-error status" };
@@ -237,10 +281,41 @@ describe("pinned: auth-required on " + ROUTE, () => {
   // Demanding bare 401/403 would force these apps to degrade UX in
   // order to pass the pin. We accept any shape that demonstrates "this
   // endpoint refused to serve protected content without auth."
-  it.skipIf(previewMissing && !forceRequire)("refuses to serve protected content without auth", async () => {
+  const skipLiveCheck = previewMissing || !routeIsFetchable(ROUTE);
+  it.skipIf(skipLiveCheck && !forceRequire)("refuses to serve protected content without auth", async () => {
+    // Wildcard / non-URL routes (e.g. "* (middleware)") only have a
+    // static check; the live HTTP direction is meaningless because
+    // PREVIEW_URL + "* (middleware)" is not a valid URL. The skipIf
+    // guard above already excludes them — this comment documents why.
     const url = PREVIEW_URL!.replace(/\\/$/, "") + ROUTE;
-    const res = await pinnedFetch(url, { method: "GET", redirect: "manual" });
-    const verdict = await authResponseIsValid(res);
+    let res = await pinnedFetch(url, { method: "GET", redirect: "manual" });
+    let verdict = await authResponseIsValid(res);
+
+    // 405 path: the route is method-restricted. Read the Allow header,
+    // retry with the first non-GET/HEAD/OPTIONS method, and use THAT
+    // response for the auth verdict. If no Allow header or no useful
+    // method available, mark inconclusive (skip rather than catch — a
+    // false catch erodes trust more than a missed catch).
+    if (res.status === 405 && verdict.methodRetry) {
+      const retryRes = await pinnedFetch(url, {
+        method: verdict.methodRetry,
+        redirect: "manual",
+        headers: { "content-type": "application/json" },
+        body: verdict.methodRetry === "GET" ? undefined : "{}",
+      });
+      res = retryRes;
+      verdict = await authResponseIsValid(retryRes);
+    } else if (res.status === 405 && !verdict.methodRetry) {
+      // No Allow header or only GET/HEAD/OPTIONS allowed. Can't
+      // determine auth state on this route — log + skip (NOT catch).
+      console.warn(
+        "[pinned] " + ROUTE + " returned 405 with no Allow header; auth-required check skipped " +
+          "(route is method-restricted but Pinned couldn't determine the right method to test). " +
+          "If you know the method, set staticVerify on this pin so static-mode catches AI removal."
+      );
+      return; // exit without asserting
+    }
+
     if (!verdict.ok) {
       throw new Error(repairPrompt(res.status, verdict.reason));
     }
@@ -253,7 +328,8 @@ describe("pinned: auth-required on " + ROUTE, () => {
   // than direction 1 but real — refactors that turn 200s into 403s
   // for the wrong reasons are a known AI mistake class.
   const authTokenMissing = !TOKEN_AUTH;
-  it.skipIf((previewMissing || authTokenMissing) && !forceRequire)(
+  const skipOverTighteningCheck = previewMissing || authTokenMissing || !routeIsFetchable(ROUTE);
+  it.skipIf(skipOverTighteningCheck && !forceRequire)(
     "accepts authenticated requests with 2xx",
     async () => {
       const url = PREVIEW_URL!.replace(/\\/$/, "") + ROUTE;

@@ -2,6 +2,23 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.1.2] — 2026-06-02
+
+Hotfix release for two day-one trust-burning bugs surfaced by real dogfooding on a fresh Next.js project (socialideagen). FP-checked against quantasyte before publish per the new "no detector / template change ships without a real-codebase FP-check" rule.
+
+### Fixed
+
+- **auth-required pin no longer false-catches POST-only routes.** Generated tests previously sent a GET to whatever route was captured. Routes that correctly accept only POST/PUT/DELETE (login, logout, signup, etc.) returned 405 Method Not Allowed, which the validator interpreted as "not 401/403 = regression catch." Now: when the live test gets 405, it reads the `Allow` response header, retries with the first non-GET/HEAD/OPTIONS method (with `content-type: application/json` + `{}` body), and uses the retry response for the auth verdict. If no Allow header is present, logs a warning and skips the assertion instead of false-failing — *missed catches are recoverable; false catches erode trust*.
+- **auth-required pin no longer attempts to fetch wildcard routes.** Auto-protect captures middleware-wide auth as `route = "* (middleware)"`. The previous live-direction code built `PREVIEW_URL + "* (middleware)"`, which `fetch()` rejected as a malformed URL, surfacing as a noisy `PINNED_INFRA_FAILURE`. Now: a new `routeIsFetchable()` guard skips the live HTTP direction when the route is wildcard / non-`/`-prefixed / contains whitespace. The static-mode check (which verifies the auth signature is still present in the middleware source) still runs — that's the real catch path for wildcard pins anyway.
+
+### Why this matters
+
+The Claude session that flagged these wrote: *"on a properly-built Next.js app, 0 of 3 auto-pins verified on the live deploy."* That's the day-one experience for a modal new user. Both fixes are unambiguous code bugs, not design calls. FP-tested by generating real pins via `pinned generate` and grepping the emitted test code for the new guards.
+
+### Tier-model / pricing — unchanged
+
+Local-first + Free remains. No quota changes. v0.2 hosted-AI work continues per the tier-model-final memory.
+
 ## [0.1.1] — 2026-06-01
 
 Friction fixes from real Claude-Code dogfooding on a fresh project.

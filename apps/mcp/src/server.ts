@@ -27,12 +27,43 @@ import {
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
 
 const SERVER_NAME = "pinnedai-mcp";
-const SERVER_VERSION = "0.1.0";
+
+// Path to this server's directory + the package's root. Used to:
+//   1. Locate package.json so SERVER_VERSION stays in sync with what's
+//      published on npm (no more "hardcoded VERSION drifted from
+//      package.json bump" bug — see CHANGELOG entry for pinnedai 0.1.1
+//      and cipherwake's pqcheck 0.16.18 for the recurring pattern).
+//   2. Locate a sibling pinnedai install bundled alongside this server
+//      (used by the MCPB Desktop Extension distribution so the user
+//      doesn't need a separate `npm i pinnedai`). When pinnedai-mcp is
+//      installed via npm without a sibling pinnedai, this path won't
+//      exist and we fall through to the host-machine resolution chain.
+const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
+const SERVER_VERSION = (() => {
+  try {
+    const pkgPath = join(SERVER_DIR, "..", "package.json");
+    return (
+      (JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string })
+        .version || "unknown"
+    );
+  } catch {
+    return "unknown";
+  }
+})();
+const BUNDLED_PINNED_CLI = resolve(
+  SERVER_DIR,
+  "..",
+  "..",
+  "pinnedai",
+  "dist",
+  "cli.js"
+);
 
 // "limit_reached" is reserved for v0.2 when hosted AI calls are
 // metered. v0.1 ships local-only; gating local actions would
@@ -87,13 +118,22 @@ function errorEnv(summary: string, raw?: string): Envelope {
   };
 }
 
-// Resolve the pinned binary. Prefer workspace-local install over npx
-// so we don't pay download cost on every call.
+// Resolve the pinned binary. Lookup order:
+//   1. workspace-local install in the user's repo (no download cost)
+//   2. pinnedai bundled next to this server (MCPB Desktop Extension case
+//      — the .mcpb bundle ships both pinnedai-mcp AND pinnedai so the
+//      tools work the moment Claude Desktop / Cursor install the bundle,
+//      without requiring `npm i pinnedai` in every target repo first)
+//   3. npx fallback (host machine has pinnedai cached or globally
+//      installed). `--no-install` prevents the silent multi-second
+//      download that would otherwise mask real errors.
 function resolvePinned(cwd: string): { cmd: string; args: string[] } {
   const localBin = join(cwd, "node_modules", ".bin", "pinned");
   if (existsSync(localBin)) return { cmd: localBin, args: [] };
   const localDist = join(cwd, "node_modules", "pinnedai", "dist", "cli.js");
   if (existsSync(localDist)) return { cmd: "node", args: [localDist] };
+  if (existsSync(BUNDLED_PINNED_CLI))
+    return { cmd: "node", args: [BUNDLED_PINNED_CLI] };
   return { cmd: "npx", args: ["--no-install", "pinnedai"] };
 }
 

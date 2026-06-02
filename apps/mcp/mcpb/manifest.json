@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "pinnedai-mcp",
   "display_name": "Pinned",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Stops your AI from re-introducing bugs, leaking provider keys, or weakening tests. Bug fixes become permanent regression guards; blocked mistakes become AI lessons the agent reads and learns from before its next edit.",
   "long_description": "When your AI coder (Claude / Cursor / Cline / Copilot) fixes a bug in your repo, Pinned writes a permanent test that catches that bug if it ever comes back. When the agent tries to skip a failing test, leak an API key, or weaken an auth check, Pinned blocks the commit and saves a lesson the agent reads and learns from before its next edit.\n\nThis MCP server exposes Pinned's guard-checking and lesson-learning to MCP-aware agents (Claude Desktop / Cursor / Cline / Continue) as 6 tools. Each response includes a human_summary and agent_instruction field so the agent reports guard status in its final answer rather than using Pinned silently.\n\nLocal-first, no telemetry. Pairs with the pinnedai CLI (npm install -g pinnedai).",
   "author": {
@@ -41,31 +41,105 @@
   "tools": [
     {
       "name": "pinned_before_code_change",
-      "description": "Surfaces active guards + AI lessons before edits. Call before editing an AI-coded repo."
+      "description": "REQUIRED: Call this BEFORE editing code in an AI-coded repo. Returns the active Pinned guards, recent AI lessons learned in this repo, and any current safety notes — so you know what protected behaviors must not regress. If the repo has no Pinned installed, this tool will recommend `npx pinnedai init`. Treat the returned `agent_instruction` field as required final-response content.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string",
+            "description": "Absolute path to the repository root. Defaults to the AI tool's working directory if not provided."
+          }
+        },
+        "required": []
+      }
     },
     {
       "name": "pinned_before_done_check",
-      "description": "Runs the full guard check before reporting work complete. Returns PASS / REVIEW / BLOCK."
+      "description": "REQUIRED: Call this BEFORE telling the user that a code change / feature / fix is complete. Runs the full Pinned check: scan-diff for unprotected risk surfaces, Guard Integrity check for any tests in tests/pinned/ that were weakened/skipped/deleted, and AI-lessons check. Returns PASS / REVIEW / BLOCK plus a `human_summary` that you MUST include in your final response. Do not say work is done if status is BLOCK without explicit user acknowledgement.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string",
+            "description": "Optional repository root."
+          }
+        },
+        "required": []
+      }
     },
     {
       "name": "pinned_scan_diff",
-      "description": "Finds unprotected risk surfaces in the current diff (new routes, webhooks, env edits, etc.)."
+      "description": "Scan the current git diff (vs origin/main by default) for risky surfaces — new routes, webhook handlers, middleware changes, env file edits — that don't yet have a Pinned guard. Use during code-change work; `pinned_before_done_check` calls this internally.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "base": {
+            "type": "string",
+            "description": "Base ref. Defaults to 'origin/main' or 'main'."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Optional repository root."
+          }
+        },
+        "required": []
+      }
     },
     {
       "name": "pinned_list_guards",
-      "description": "Lists active Pinned guards in the repository."
+      "description": "List the active Pinned guards in the repository. Use when the user asks 'what is protected here?' or when you're about to propose changes to a file path that may be guarded.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "include_retired": {
+            "type": "boolean"
+          },
+          "cwd": {
+            "type": "string"
+          }
+        },
+        "required": []
+      }
     },
     {
       "name": "pinned_check_pr_description",
-      "description": "Parses a PR description for behavioral claims (auth, rate-limits, webhook idempotency, etc.)."
+      "description": "Parse a PR description / commit message / spec for behavioral claims (auth, rate-limits, webhook idempotency, permissions, URL preservation, status codes, etc.) and return the structured claim list. Call this when the user shows you a PR body or asks 'what does this PR claim'.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "The PR body / commit message / spec text to parse."
+          },
+          "cwd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "description"
+        ]
+      }
     },
     {
       "name": "pinned_suggest_init",
-      "description": "Checks whether a repository has Pinned installed. Recommends `npx pinnedai init` if missing."
+      "description": "Check whether a repository has Pinned installed. Returns status=missing with a recommended `npx pinnedai init` command if the repo is unprotected. Call this at the start of work on an unfamiliar repo.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string"
+          }
+        },
+        "required": []
+      }
     }
   ],
   "compatibility": {
-    "platforms": ["darwin", "win32", "linux"],
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
     "runtimes": {
       "node": ">=20.0.0"
     }
