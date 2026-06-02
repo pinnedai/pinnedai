@@ -822,12 +822,22 @@ export function formatStatusline(opts: {
   // that couldn't actually verify (no PREVIEW_URL / preview down /
   // missing module file), surface that LOUDLY instead of silently
   // showing ✓. Users need to know protection is OFF, not assume
-  // green = verified. Cyan (informational, not warning red).
+  // green = verified.
+  //
+  // 0.2.12+ split:
+  //   - ALL pins skipped → ⚠ N pins · 0 verifying (YELLOW, alarming —
+  //     same shape user asked for in the M1 roadmap)
+  //   - SOME pins skipped → N pins · X verifying · X skipped (CYAN, info)
+  // This is the headline metric a buyer would judge on. Saying "✓ 8
+  // pins" when none of them actually fire on every run is the worst
+  // lie Pinned can tell.
   if (typeof lastStatus.skippedCount === "number" && lastStatus.skippedCount > 0) {
-    // The "(no preview)" hint points at the docs without bloating the
-    // statusline. Users who see this run `pinned doctor` for the full
-    // explanation + a link to pinnedai.dev/docs/preview-url.
-    return `${prefix} · ${totalPins} pins · ${c.cyan}⊘ ${lastStatus.skippedCount} skipped (no preview)${c.reset}`;
+    const skipped = lastStatus.skippedCount;
+    const verifying = Math.max(0, totalPins - skipped);
+    if (verifying === 0) {
+      return `${prefix} · ${c.yellow}⚠ ${totalPins} pins · 0 verifying (no PREVIEW_URL)${c.reset}`;
+    }
+    return `${prefix} · ${totalPins} pins · ${c.cyan}${verifying} verifying · ${skipped} skipped${c.reset}`;
   }
   // 3. Unpinned risks — patterns Pinned recognized as guardable but
   // hasn't pinned yet. Plain-English: "risk" → "could be guarded".

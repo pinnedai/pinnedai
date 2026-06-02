@@ -92,8 +92,8 @@ importers:
         specifier: ^1.29.0
         version: 1.29.0(zod@3.25.76)
       pinnedai:
-        specifier: ^0.1.0
-        version: 0.1.2(vitest@2.1.9(@types/node@20.19.9))
+        specifier: ^0.2.13
+        version: 0.2.13(vitest@2.1.9(@types/node@20.19.9))
       zod:
         specifier: ^3.25.0
         version: 3.25.76
@@ -2643,8 +2643,8 @@ packages:
     resolution: {integrity: sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==}
     engines: {node: '>=12'}
 
-  pinnedai@0.1.2:
-    resolution: {integrity: sha512-dbVOX2alhDw6/f/mxhJ5xYTQgPGaZUVsxjELzey4kRSIJjVvO1mk5UvJRfqafVutW6F2V44vqvfVhtLHMVYATg==}
+  pinnedai@0.2.13:
+    resolution: {integrity: sha512-GDHOIZi7RZC64LhQTH8D//OQU1PZQNV29/aRlJrlGtKVl3g0uwRr/np75jGHrQ0wXMOrC13xY/ughEpL7WxmZw==}
     engines: {node: '>=20'}
     hasBin: true
     peerDependencies:
@@ -5619,7 +5619,7 @@ snapshots:
 
   picomatch@4.0.4: {}
 
-  pinnedai@0.1.2(vitest@2.1.9(@types/node@20.19.9)):
+  pinnedai@0.2.13(vitest@2.1.9(@types/node@20.19.9)):
     dependencies:
       commander: 12.1.0
     optionalDependencies:

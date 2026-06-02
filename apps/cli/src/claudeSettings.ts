@@ -220,6 +220,53 @@ export function installClaudeStatusline(repoRoot: string): ClaudeInstallResult {
   return { status: "installed", path };
 }
 
+// 0.2.12+: counterpart to installClaudeStatusline. Removes the
+// Pinned-managed statusline entry from .claude/settings.json. Three
+// shapes to handle, mirroring the install logic:
+//   1. Plain Pinned command — delete statusLine entirely (Claude
+//      reverts to its default).
+//   2. Compose wrapper — read the "other" command from the wrapper,
+//      restore it as the bare statusLine command, delete the wrapper
+//      script file.
+//   3. Third-party command (Pinned was never the statusline) — no-op.
+//
+// Returns "removed" when we actually changed something, "absent" when
+// nothing pinned-shaped was present.
+export function uninstallClaudeStatusline(repoRoot: string): "removed" | "absent" {
+  const path = settingsPath(repoRoot);
+  const settings = readSettings(path);
+  const current = settings.statusLine?.command;
+  if (!current) return "absent";
+
+  // Case 1: plain Pinned command.
+  if (current.includes("pinned") && current.includes("statusline") && !isComposeWrapper(current)) {
+    delete (settings as { statusLine?: unknown }).statusLine;
+    writeSettingsAtomic(path, settings);
+    return "removed";
+  }
+
+  // Case 2: compose wrapper combining Pinned with another tool.
+  if (isComposeWrapper(current)) {
+    const otherCmd = readComposeWrapperOtherCmd(repoRoot);
+    if (otherCmd) {
+      settings.statusLine = { type: "command", command: otherCmd, padding: settings.statusLine?.padding };
+    } else {
+      delete (settings as { statusLine?: unknown }).statusLine;
+    }
+    writeSettingsAtomic(path, settings);
+    // Best-effort delete of the wrapper script file.
+    try {
+      const wrapperPath = `${repoRoot}/.pinnedai/statusline-combined.sh`;
+      const fs = require("node:fs") as typeof import("node:fs");
+      if (fs.existsSync(wrapperPath)) fs.unlinkSync(wrapperPath);
+    } catch { /* non-fatal */ }
+    return "removed";
+  }
+
+  // Case 3: third-party command, never Pinned-managed.
+  return "absent";
+}
+
 export function installClaudeFailureHook(repoRoot: string): ClaudeInstallResult {
   const path = settingsPath(repoRoot);
   const settings = readSettings(path);

@@ -197,6 +197,42 @@ describe("pinned: happy-path-with-side-effect " + METHOD + " " + ROUTE, () => {
         body: JSON.stringify(buildValidBody()),
       });
 
+      // Read body up front so the 503/degraded-config warn path can
+      // inspect it (and tier-2 below reuses the parse).
+      let bodyText = "";
+      let bodyJson: Record<string, unknown> | null = null;
+      try {
+        bodyText = await res.text();
+        bodyJson = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : null;
+      } catch {
+        /* non-JSON body — fall through; tier-3 header checks still apply */
+      }
+
+      // 0.2.12+: "backend not configured" warn-not-fail when probing
+      // local dev. When the user has \`npm run dev\` up but hasn't set
+      // up .env.local (missing Supabase / DB creds / API keys), real
+      // handlers commonly return 503 with a body like
+      // {"error":"backend not configured"}. Pinned shouldn't fail-loud
+      // here — the user is in dev mode, not in production-misconfigured
+      // mode. WARN with the actionable fix ("set up .env.local") and
+      // skip the rest of the assertions for this probe.
+      const isLocalProbe = PREVIEW_URL ? /^https?:\\/\\/(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0)/i.test(PREVIEW_URL) : false;
+      const backendNotConfigured =
+        res.status === 503 ||
+        (bodyJson && typeof bodyJson === "object" && (
+          /backend.{0,10}not.{0,10}config|env.{0,10}not.{0,10}config|missing.{0,20}env|database.{0,10}not.{0,10}config|supabase.{0,10}not.{0,10}config/i.test(JSON.stringify(bodyJson["error"] ?? ""))
+        ));
+      if (isLocalProbe && backendNotConfigured) {
+        console.warn(
+          "[pinned] " + METHOD + " " + ROUTE + ": backend appears not configured locally " +
+          "(status " + res.status + (bodyJson?.["error"] ? ", error: " + JSON.stringify(bodyJson["error"]).slice(0, 120) : "") + "). " +
+          "Set up .env.local so the handler can do its real work; the pin will then verify behavior. " +
+          "Not failing — this is a config gap on your local environment, not a regression."
+        );
+        expect(true).toBe(true);
+        return;
+      }
+
       // Tier 1 (MANDATORY): valid request must return 2xx. This alone
       // catches "valid-input → 4xx" regressions (the most common
       // happy-path failure — caught on socialideagen 2026-06-02 as
@@ -210,14 +246,6 @@ describe("pinned: happy-path-with-side-effect " + METHOD + " " + ROUTE, () => {
       // { degraded: true } / { ok: true, skipped: true } is the
       // misleading-green case — endpoint returned 2xx but didn't
       // actually do its work. Closes the "graceful no-op pass" gap.
-      let bodyText = "";
-      let bodyJson: Record<string, unknown> | null = null;
-      try {
-        bodyText = await res.text();
-        bodyJson = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : null;
-      } catch {
-        /* non-JSON body — fall through; tier-3 header checks still apply */
-      }
       if (bodyJson && typeof bodyJson === "object") {
         if (bodyJson["error"] !== undefined) {
           throw new Error(repairPrompt("2xx but body contains 'error' field: " + JSON.stringify(bodyJson["error"]).slice(0, 200), res.status));

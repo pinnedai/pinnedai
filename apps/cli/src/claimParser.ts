@@ -608,6 +608,28 @@ export type JourneyStep = {
   body?: Record<string, unknown>;
   headers?: Record<string, string>;
   followRedirects?: boolean;
+  // 0.2.12+: capture a value from this step's response for use in
+  // later steps. The value lands in a journey-local string map and
+  // is substituted into any later step's string fields (route, body
+  // values, headers, expect.bodyIncludes/bodyForbids/setsCookie/
+  // redirectIncludes) via `${name}` placeholders. Common shapes:
+  //   - capture confirmation token from the signup response body so
+  //     a later `GET /api/confirm/${token}` step uses the real token
+  //   - capture a Set-Cookie value's payload (the cookie body, not
+  //     just whether it was set) so a later assertion can verify the
+  //     SAME cookie made it through
+  //   - capture the redirect Location so a later step navigates to it
+  capture?: {
+    // Local name to bind the value under. Must be a simple identifier
+    // (letters/digits/underscore); referenced as `${name}` in later
+    // string fields.
+    name: string;
+    from:
+      | { kind: "body-json"; path: string }       // dot-notation, e.g. "data.id"
+      | { kind: "header"; name: string }          // response header by name (case-insensitive)
+      | { kind: "cookie"; name: string }          // Set-Cookie value by cookie name
+      | { kind: "redirect-location" };             // Location header from a 3xx redirect
+  };
   expect: {
     status?: { min: number; max: number } | number;
     bodyIncludes?: string[];

@@ -111,6 +111,19 @@ describe("pinned: idempotent on " + ROUTE + " (key: " + ID_FIELD + ")", () => {
         ].join("\\n"));
       }
       if (result?.kind === "signature-missing") {
+        // 0.2.11+: soften when live HTTP check available — same
+        // pattern as auth-required. Live byte-identical-response check
+        // is the real verification of the idempotency contract.
+        if (process.env.PREVIEW_URL) {
+          console.warn(
+            "[pinned] idempotent " + ROUTE + ": captured signature no longer in source " +
+            "(\\"" + sv.signature.slice(0, 80) + "\\" in " + sv.filePath + "). " +
+            "Not failing because PREVIEW_URL is set and the live HTTP check is the " +
+            "authoritative verification. If the live check passes, this is a benign refactor."
+          );
+          expect(true).toBe(true);
+          return;
+        }
         throw new Error([
           "",
           "═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══",
@@ -126,8 +139,12 @@ describe("pinned: idempotent on " + ROUTE + " (key: " + ID_FIELD + ")", () => {
           "changed. The original fix introduced the snippet above; it's",
           "no longer present in the file.",
           "",
-          "Restore the idempotency check, OR — if the route legitimately no",
-          "longer needs dedupe — retire the pin:",
+          "If this was an intentional refactor that preserves dedupe behavior,",
+          "set PREVIEW_URL so the live HTTP check (two POSTs → byte-identical)",
+          "becomes the verification; the static check will then warn-only.",
+          "",
+          "Otherwise, restore the idempotency check, OR — if the route legitimately",
+          "no longer needs dedupe — retire the pin:",
           "  pinned retire " + ORIGINAL_PR + " --reason=\\"...\\"",
           "═══════════════════════════════════════════════════════════════",
           "",

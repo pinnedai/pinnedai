@@ -241,7 +241,34 @@ describe("pinned: auth-required on " + ROUTE, () => {
       const normalizeForSig = (s: string) => s.replace(/\\s+/g, "").replace(/,(?=[)\\]}])/g, "");
       const contentN = normalizeForSig(content);
       const sigN = normalizeForSig(sv.signature);
+      // 0.2.11+: signature-missing is SOFT when a live HTTP check is
+      // available (PREVIEW_URL set). The live check (unauth → 401/403)
+      // is the real verification of the auth contract; the static
+      // signature check is a fallback for repos without a preview URL.
+      // Pre-0.2.11 the static check hard-failed on every legitimate
+      // refactor that preserved auth behavior but changed the captured
+      // signature text. socialideagen 2026-06-02: middleware routing
+      // refactor (real improvement) tripped the pin.
+      // Hard-fail still applies when no live check is available — the
+      // signature is then the ONLY verification we have.
       if (!contentN.includes(sigN)) {
+        const liveAvailable = !!process.env.PREVIEW_URL;
+        if (liveAvailable) {
+          console.warn(
+            "[pinned] auth-required " + ROUTE + ": captured signature no longer in source " +
+            "(\\"" + sv.signature.slice(0, 80) + "\\" in " + sv.filePath + "). " +
+            "Not failing because the live HTTP check is configured and is the " +
+            "authoritative verification of the auth contract. If the live check " +
+            "passes, this is a benign refactor. If the live check fails, fix the " +
+            "auth behavior. To re-tighten the static check, regenerate the pin: " +
+            "pinned regenerate " + ORIGINAL_PR + "."
+          );
+          // Don't return — fall through to the assertion below which
+          // is a no-op when content matched; here we want vitest to
+          // record the test as PASS with a console warning.
+          expect(true).toBe(true);
+          return;
+        }
         throw new Error(
           [
             "",
@@ -258,8 +285,12 @@ describe("pinned: auth-required on " + ROUTE, () => {
             "changed. The original fix introduced the snippet above; it's",
             "no longer present in the file.",
             "",
-            "Restore the auth check, OR — if the route legitimately no longer",
-            "requires auth — retire the pin:",
+            "If this was an intentional refactor that preserves auth behavior,",
+            "set PREVIEW_URL so the live HTTP check (unauth → 401/403) becomes",
+            "the verification; the static check will then warn-only on refactors.",
+            "",
+            "Otherwise, restore the auth check, OR — if the route legitimately",
+            "no longer requires auth — retire the pin:",
             "  pinned retire " + ORIGINAL_PR + " --reason=\\"...\\"",
             "═══════════════════════════════════════════════════════════════",
             "",

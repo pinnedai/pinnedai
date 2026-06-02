@@ -138,12 +138,49 @@ describe("pinned: journey " + JOURNEY_LABEL, () => {
     if (PREVIEW_URL) pinnedAssertNonProductionUrl(PREVIEW_URL, "journey");
   });
 
+  // 0.2.12+: captured-value substitution. A step's \`capture\` field
+  // extracts a value from its response (body json path / response
+  // header / Set-Cookie body / Location header) into a local map.
+  // Later steps reference captured values via \${name} in any string
+  // field (route, body values, headers, expect substrings). Walks the
+  // step recursively before issuing the request so all references are
+  // resolved at exec time. Unknown names are left as literal \${...}.
+  function applyCaptures(value: unknown, captures: Record<string, string>): unknown {
+    if (typeof value === "string") {
+      return value.replace(/\\$\\{([a-zA-Z_][\\w]*)\\}/g, (_, name) => {
+        return Object.prototype.hasOwnProperty.call(captures, name) ? captures[name] : "$" + "{" + name + "}";
+      });
+    }
+    if (Array.isArray(value)) return value.map((v) => applyCaptures(v, captures));
+    if (value && typeof value === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value)) out[k] = applyCaptures(v, captures);
+      return out;
+    }
+    return value;
+  }
+
+  function dotPath(obj: unknown, path: string): unknown {
+    const parts = path.split(".");
+    let cur: unknown = obj;
+    for (const p of parts) {
+      if (!cur || typeof cur !== "object") return undefined;
+      cur = (cur as Record<string, unknown>)[p];
+    }
+    return cur;
+  }
+
   it.skipIf(previewMissing && !forceRequire)(JOURNEY_LABEL, async () => {
     const base = PREVIEW_URL!.replace(/\\/$/, "");
     const jar = new Map<string, string>();
+    const captures: Record<string, string> = {};
 
     for (let i = 0; i < STEPS.length; i++) {
-      const step = STEPS[i];
+      const rawStep = STEPS[i];
+      // Substitute captured values into every string field BEFORE
+      // using the step. Step's own \`capture\` config is untouched
+      // (it's metadata, not a target of interpolation).
+      const step = applyCaptures(rawStep, captures) as typeof rawStep;
       const url = base + step.route;
       const headers: Record<string, string> = {
         ...(step.headers ?? {}),
@@ -166,6 +203,44 @@ describe("pinned: journey " + JOURNEY_LABEL, () => {
       const setCookie = res.headers.get("set-cookie");
       for (const c of parseSetCookie(setCookie)) {
         jar.set(c.name, c.value);
+      }
+
+      // 0.2.12+: extract capture into the locals map BEFORE assertions
+      // so a later assertion can reference a value from earlier-step
+      // capture (e.g. step 0 captures signupId, step 1 asserts the
+      // /thanks body includes signupId via bodyIncludes: ["\${signupId}"]).
+      const rawStepDef = rawStep as typeof rawStep & {
+        capture?: {
+          name: string;
+          from: { kind: string; path?: string; name?: string };
+        };
+      };
+      if (rawStepDef.capture) {
+        const cap = rawStepDef.capture;
+        let extracted: string | undefined;
+        try {
+          if (cap.from.kind === "header" && cap.from.name) {
+            extracted = res.headers.get(cap.from.name) ?? undefined;
+          } else if (cap.from.kind === "cookie" && cap.from.name) {
+            extracted = jar.get(cap.from.name);
+          } else if (cap.from.kind === "redirect-location") {
+            extracted = res.headers.get("location") ?? undefined;
+          } else if (cap.from.kind === "body-json" && cap.from.path) {
+            const clonedBody = await res.clone().text();
+            if (clonedBody) {
+              const parsed = JSON.parse(clonedBody);
+              const v = dotPath(parsed, cap.from.path);
+              if (typeof v === "string" || typeof v === "number") extracted = String(v);
+            }
+          }
+        } catch { /* swallow extraction errors — captured value stays undefined */ }
+        if (extracted !== undefined) {
+          captures[cap.name] = extracted;
+        } else {
+          throw new Error(
+            repairPrompt(i, step, "capture \\"" + cap.name + "\\" extraction failed (from " + cap.from.kind + ")", "later steps that reference \\${" + cap.name + "} will be wrong")
+          );
+        }
       }
 
       // Status assertion.

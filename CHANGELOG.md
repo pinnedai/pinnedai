@@ -2,6 +2,138 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.13] — 2026-06-03
+
+One addition on top of 0.2.12: the agent PostToolUse hook — THE activation wedge per [[agent-loop-activation-wedge]]. Plus the FP-check-everything memory rule upgrade to require positive + negative + dyad-sweep matrix for every feature ship going forward.
+
+### Added — Agent PostToolUse hook (THE activation wedge)
+
+Two new commands wire the agent-loop verification path:
+
+- **`pinned install-claude-hook`** — registers Pinned as a PostToolUse hook in Claude Code's `settings.json` (project-local by default; `--global` writes to `~/.claude/settings.json` with its own confirmation per the consent ladder). Shows the exact `before`/`after` JSON diff + explains what the hook does + the safety contract BEFORE asking for `[y/N]`. Backs up the previous settings to `settings.json.pinned-backup`. Marker-bounded so `pinned uninstall` removes exactly Pinned's entry without touching any other PostToolUse hooks the user has configured (Cipherwake, custom tools, etc.).
+
+- **`pinned hook-postedit`** — the runtime handler the hook calls. Reads Claude's tool-input JSON from stdin, identifies the file path(s) edited (Edit / Write / MultiEdit), maps them to routes via `deriveRouteFromPath`, looks up active pins covering those routes, probes for a running dev server, runs the affected pins via `vitest`, and writes a structured `🛟 pinned: …` line to stdout that Claude reads + surfaces in its next turn. Three observable outcomes:
+  - **No pin covers the edited route** → soft suggestion: `"consider \`pinned check\` to add one"`.
+  - **Pin exists, no dev server up** → soft note: `"start your dev server so Pinned can verify the next edit"`.
+  - **Pin exists, dev server up, vitest run** → either `"✓ N guard(s) still pass"` (green) OR `"🛟 N guard(s) FAILED — your change broke a protected contract"` (red, with the failing pin names + repair-prompt pointer).
+
+Safety contract (verified by smoke test):
+- The hook NEVER crashes the agent — empty stdin, malformed payloads, missing pins, missing dev server all exit silently with code 0.
+- The hook NEVER auto-starts the app — only attaches to an already-running localhost dev server (per [[retro-audit-zero-work-zero-anger]]'s L2 rung).
+- The hook NEVER edits source files — read-only verification.
+- 1-second stdin failsafe + configurable 15s vitest timeout prevent the hook from ever hanging the agent.
+
+`pinned uninstall` now also removes the PostToolUse hook entry (marker-bounded via the `pinned hook-postedit` command string), leaving any other PostToolUse hooks in place.
+
+### MCP 0.1.4
+
+Dep refresh — `pinnedai-mcp` now bundles `pinnedai ^0.2.13` so MCPB / Smithery users get the full 0.2.12 + 0.2.13 batch (retro audit, family sweep, agent PostToolUse hook, dev-server attach, init-runs-once, watch verifies, retire cache cleanup, four-template static-verify softening, auth FP fix, schema-derived body across zod/yup/joi/valibot, journey capture step, fixture-token docs, host-conditional actionable suggestions, clean uninstall).
+
+### Memory rule upgrade — three-test matrix required per feature
+
+`fp-check-everything-with-real-tests.md` extended with operational rule that EVERY feature ship now requires:
+1. Positive case (feature fires when it should)
+2. Negative case (feature doesn't fire when it shouldn't)
+3. FP sweep against the 10 dyad-apps repos (0 false positives or documented limitations)
+
+Commit message must include the matrix results. Pure UX wiring (banner copy, prompt text) exempt; behavioral changes always require the matrix.
+
+## [0.2.12] — 2026-06-03
+
+Largest release this iteration — closes the M1/M2/M3/P2 roadmap blocks + the headline activation wedge + a pattern-driven family sweep.
+
+### Added — `pinned audit` (the L0 activation, read-only retro scan)
+
+THE first-touch experience per [[retro-audit-zero-work-zero-anger]]. `npx pinnedai audit` runs against any repo and surfaces:
+
+- **Regressions ALREADY shipped** in recent git history that Pinned would have caught (host-conditional added, auth check removed, validation removed — all from existing precision-bound detectors)
+- **Unprotected critical flows** (write endpoints, host-conditional handlers) with no Pinned coverage
+- **Risk families** — single root cause spanning N route consumers, surfaced from one signal
+
+Safety contract (verified): NO install, NO app execution, NO config writes, NO network egress beyond `git log` / `git show`. The lowest-friction, lowest-risk activation surface — Snyk/Sonar-style first touch. Replaces "install + manufacture a regression + watch it catch" with "point at my repo, see what already broke." Old `pinned audit --learned` is now `pinned audit-learned` (same flags, same behavior).
+
+### Added — pattern-driven family sweep
+
+Per [[pattern-driven-family-sweep]]: move protection from catch/diff-driven to PATTERN-driven. `pinned audit` now builds an import/usage graph + resolves multi-consumer risk families. When `host-conditional` fires on `lib/host.ts:resolveIdeaFromRequest`, the audit lists every route handler that imports that specific function — those routes share the divergence risk through the single root. Acceptance on socialideagen: detects host-conditional family + 3 route consumers at `6bf2c28`. New scanDiff exports: `buildImportGraph`, `findFamilyMembers`, `findAllImportersOfFile`, `extractExportedNames`. Host-conditional detector now also returns `affectedExport` (the exported function name containing the host-read) for precise family scoping.
+
+### Added — auto-detect PREVIEW_URL via Vercel API + loud "0 verifying" banner
+
+M1 from the locked agent-loop / never-silent roadmap. `pinned init` now: (1) reads `.vercel/project.json` + uses `VERCEL_TOKEN` to query Vercel's REST API for the latest preview deployment, (2) suggests it as the PREVIEW_URL the user should set, (3) prints a LOUD warning banner when no verification target is available so the user can never walk away thinking pins are running when they're skipping. Statusline upgrade: when ALL pins skip, surfaces `⚠ N pins · 0 verifying (no PREVIEW_URL)` in yellow; partial skip stays cyan.
+
+### Added — `pinned init` runs pins once at the end (first value before they leave)
+
+After init completes, automatically runs pin tests against an available target (PREVIEW_URL or a detected running localhost dev server) and shows the result inline — green or a real catch — in under 60 seconds. Never auto-boots the app (per [[retro-audit-zero-work-zero-anger]]'s consent ladder); only attaches to a server the user already has running.
+
+### Added — attach to running dev server (never auto-boot)
+
+L2 of the consent ladder. `pinned test` now probes localhost (via `.pinnedai/config.json` http.url, framework-default port, or common ports 3000/5173/4321/8080/8000) for an already-running dev server. If found, attaches and uses it as the PREVIEW_URL automatically. If not found, fails gracefully back to the existing "0 verifying" banner. Never spawns `npm run dev` unless the user explicitly opted into `http.mode: local` at init time.
+
+### Added — `X-Pinned-Test: 1` side-effect-skip docs
+
+Extended `docs/test-fixtures.md` with the `X-Pinned-Test` header pattern. Handler can detect the header and no-op real side effects (emails, queue messages, billing events, analytics writes) while still verifying the meaningful behavior. The header is public/no-secret; it controls suppression only, never authorization. Pairs with the existing `X-Pinned-Secret` pattern for privileged-data access.
+
+### Added — journey capture step + interpolation
+
+Per M2. New optional `capture: { name, from }` field on `JourneyStep` extracts a value from the step's response into a journey-local map. Later steps reference captured values via `${name}` interpolation in any string field (route, body, headers, expect assertions). `from` supports `body-json` (dot-path), `header`, `cookie`, and `redirect-location`. Catches confirmation-token-from-DB flows when paired with the fixture-token pattern.
+
+### Improved — backend-not-configured → warn instead of fail (#84)
+
+Happy-path's tier-2 body-marker check now relaxes to WARN when (a) the probe target is `localhost*` AND (b) the response is 503 OR contains a "backend not configured" / "env not configured" / "missing env" marker. The user is in dev mode, not a production-misconfigured mode — pointing them at `.env.local` is the right next step, not failing the pin. Real misleading-green (production target with `{skipped:true}`) still hard-fails.
+
+### Fixed — auth-required false-positive on routing middleware
+
+`detectAuthChecksInDiff` previously emitted an `auth-required` pin for any file containing `pathname.startsWith("/admin")` — including socialideagen's middleware.ts, which uses that check to ALLOW-LIST admin paths through (`return NextResponse.next()`), not GATE them. The path-startsWith patterns are now tagged WEAK; the detector requires a co-occurring CONFIRMER signal (401/403 status return, redirect to /login, session/cookie/token read, throw of an Unauthorized error) before treating the weak match as an auth signal. FP-checked: 0 hits on socialideagen's routing middleware (previously fired), still fires correctly on quantasyte (8 real admin checks) and quantapact (1 real `request.headers.get("authorization")`). 9 real hits across 1163 files, 0 false positives.
+
+### Fixed — static-verify hard-fail on legitimate refactor (4 templates)
+
+The four static-verify-bearing templates (`auth-required`, `idempotent`, `permission-required`, `returns-status`) all hard-failed when the captured source signature couldn't be found in the file — even if the behavior was preserved by a refactor. Trust-damaging on every legit lint/format/restructure commit. 0.2.12 softens: when `PREVIEW_URL` is set (live HTTP check is the real verification), signature-missing now WARNS via `console.warn` and the test passes. Hard-fail still applies when PREVIEW_URL is unset.
+
+### Fixed — host-conditional warnings are now actionable
+
+P2. When `pinned auto-protect` flags a host-conditional handler AND active pins exist for the same route, the warning now names the specific pin file(s) that will likely false-fail AND prints the exact `PREVIEW_URL=… npx vitest run …` command to verify. Closes the loop from "warning detected" → "concrete next step."
+
+### Fixed — `pinned retire` now refreshes status cache + cleans catch history
+
+M3. Pre-0.2.12, the retired pin's `catchHistory` entries + `caughtClaimIds` set + `failingClaimIds` all stayed in the cache after retire — so the UserPromptSubmit hook kept reporting the retired pin as a live catch ("this would have shipped..."), inflating `breaksCaught` with false-positive ghosts. 0.2.12: retire now (a) removes the claimId from `failingClaimIds`, (b) strips records from `catchHistory`, (c) removes from `caughtClaimIds` so `breaksCaught` (derived from set size) decrements, (d) re-renders `CATCHES.md` from the cleaned history. Headline metric stays honest.
+
+### Added — `pinned watch` also verifies on file-quiet (#82)
+
+The background watcher previously only ran `auto-protect` after file-quiet. 0.2.12 also probes for a running localhost dev server after each auto-protect cycle and, if one is up, runs `vitest run tests/pinned/` against it with a 30s cap. Surfaces RED catches in the watch output as they happen (`🔴 N pin(s) FAILED — Pinned caught a regression on watch verify`). Never spawns a server — only attaches to ones the user has running. Silent when no server is up (the watch's auto-pin role is unaffected).
+
+### Added — `pinned uninstall` (clean complete removal, trust pass)
+
+Per [[retro-audit-zero-work-zero-anger]]: *"people trust tools they know they can fully remove."* New command removes EVERY trace of Pinned from the project: hook blocks (pre-commit, pre-push, post-commit — marker-bounded removal preserves the user's own hook content), AI-coder rules blocks in CLAUDE.md / .cursorrules / .clinerules / AGENTS.md / .windsurfrules, Claude statusline entry (with compose-wrapper awareness — restores the third-party command if Pinned was composed alongside another tool), `.github/workflows/pinned.yml`, the `.pinnedai/` and `.pinned/` directories. Pin tests in `tests/pinned/` are PRESERVED by default; pass `--tests` to also remove them. Global writes (`~/.claude/settings.json` statusline, `~/.config/pinnedai/` prefs) require `--global`. Always shows what will be removed BEFORE deleting; asks for confirm (`--yes` skips for scripts). `--dry-run` previews without modifying anything. New `uninstallClaudeStatusline()` helper in claudeSettings.ts mirrors the install logic.
+
+### Renamed — `pinned audit --learned` → `pinned audit-learned`
+
+To free `pinned audit` for the headline retro-scan command (above). Same flags, same behavior — `--learned` is now a no-op on the new command (preserved for backwards compat). Existing scripts referencing `pinned audit --learned` should switch to `pinned audit-learned`.
+
+### Internal
+
+- New scanDiff exports: `buildImportGraph`, `findFamilyMembers`, `findAllImportersOfFile`, `extractExportedNames`, `deriveRouteFromPath`, plus `WEAK_AUTH_PATTERNS` + `AUTH_CONFIRMER_PATTERNS` for the auth tightening.
+- `probeRunningDevServer(cwd)` private helper in cli.ts — probes localhost for a running dev server (read-only, never spawns).
+- `detectVercelPreviewUrl(cwd)` private helper in cli.ts — reads `.vercel/project.json` + queries Vercel API with VERCEL_TOKEN.
+- `uninstallClaudeStatusline(repoRoot)` in claudeSettings.ts — compose-wrapper-aware removal of Pinned's statusline entry.
+- Memory updates (4 new entries): `tier-model-refinements-2026-06-02`, `agent-loop-activation-wedge`, `retro-audit-zero-work-zero-anger`, `pattern-driven-family-sweep`.
+
+## [0.2.11] — 2026-06-02
+
+Two trust-damaging false-positives fixed after a third dogfood pass on socialideagen.
+
+### Fixed — auth-required false-positive on routing middleware
+
+`detectAuthChecksInDiff` previously emitted an `auth-required` pin for any file containing `pathname.startsWith("/admin")` — including socialideagen's middleware.ts, which uses that check to ALLOW-LIST admin paths through (`return NextResponse.next()`), not to GATE them. The path-startsWith patterns are now tagged WEAK; the detector requires a co-occurring CONFIRMER signal in the same file (401/403 status return, redirect to /login, throw of an Unauthorized/Forbidden error, session/cookie/token read) before treating the weak match as an auth signal. FP-checked: 0 hits on socialideagen's routing middleware (previously fired), still fires correctly on quantasyte (8 real admin route checks) and quantapact (1 real `request.headers.get("authorization")` gate). Total: 9 real hits across 1163 files in 10 dyad-apps repos, 0 false positives.
+
+### Fixed — static-verify hard-fail on legitimate refactor
+
+The four static-verify-bearing templates (auth-required, idempotent, permission-required, returns-status) all hard-failed when the captured source signature couldn't be found in the file — even if the behavior was preserved by a refactor. Trust-damaging on every legit lint/format/restructure commit. 0.2.11 softens: when `PREVIEW_URL` is set (live HTTP check is configured), signature-missing now WARNS via `console.warn` and the test passes. The live check (unauth → 401/403, two POSTs → byte-identical, three-direction role check, status code match) is the authoritative verification of behavior; the static signature is a fallback for repos without live verification. When PREVIEW_URL is unset, hard-fail still applies — the signature is then the only verification available.
+
+The repair-prompt message in the hard-fail case now tells the user: "set PREVIEW_URL so the live HTTP check becomes the verification; the static check will then warn-only."
+
+### MCP 0.1.3
+
+Dep refresh — `pinnedai-mcp` now bundles `pinnedai ^0.2.11` instead of `^0.1.0`. MCPB users (Smithery / Claude Desktop) get the full set of detectors / templates / fixes from the last 11 releases.
+
 ## [0.2.10] — 2026-06-02
 
 Two fixes from the live walk-forward verification on socialideagen (which produced 7 real catches at the buggy commit 6bf2c28 vs the fixed HEAD).

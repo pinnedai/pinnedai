@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "pinnedai-mcp",
   "display_name": "Pinned",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Stops your AI from re-introducing bugs, leaking provider keys, or weakening tests. Bug fixes become permanent regression guards; blocked mistakes become AI lessons the agent reads and learns from before its next edit.",
   "long_description": "When your AI coder (Claude / Cursor / Cline / Copilot) fixes a bug in your repo, Pinned writes a permanent test that catches that bug if it ever comes back. When the agent tries to skip a failing test, leak an API key, or weaken an auth check, Pinned blocks the commit and saves a lesson the agent reads and learns from before its next edit.\n\nThis MCP server exposes Pinned's guard-checking and lesson-learning to MCP-aware agents (Claude Desktop / Cursor / Cline / Continue) as 6 tools. Each response includes a human_summary and agent_instruction field so the agent reports guard status in its final answer rather than using Pinned silently.\n\nLocal-first, no telemetry. Pairs with the pinnedai CLI (npm install -g pinnedai).",
   "author": {

@@ -137,6 +137,19 @@ describe("pinned: permission-required " + ROLE + " on " + ROUTE, () => {
         ].join("\\n"));
       }
       if (result?.kind === "signature-missing") {
+        // 0.2.11+: soften when live HTTP check available — same
+        // pattern as auth-required. Three-direction live check is the
+        // real verification of the permission contract.
+        if (process.env.PREVIEW_URL) {
+          console.warn(
+            "[pinned] permission-required " + ROUTE + ": captured signature no longer in source " +
+            "(\\"" + sv.signature.slice(0, 80) + "\\" in " + sv.filePath + "). " +
+            "Not failing because PREVIEW_URL is set and the three-direction live HTTP check " +
+            "(no-auth/wrong-role/right-role) is the authoritative verification."
+          );
+          expect(true).toBe(true);
+          return;
+        }
         throw new Error([
           "",
           "═══ PINNED FAILURE — paste this into Claude Code / Cursor ═══",
@@ -153,8 +166,12 @@ describe("pinned: permission-required " + ROLE + " on " + ROUTE, () => {
           "removed or changed. The original fix introduced the snippet",
           "above; it's no longer present in the file.",
           "",
-          "Restore the authorization check, OR — if the route legitimately no",
-          "longer needs role-gating — retire the pin:",
+          "If this was an intentional refactor that preserves role gating,",
+          "set PREVIEW_URL + the three role tokens (PREVIEW_TEST_TOKEN_NON_<ROLE>,",
+          "PREVIEW_TEST_TOKEN_<ROLE>); the static check will then warn-only.",
+          "",
+          "Otherwise, restore the authorization check, OR — if the route legitimately",
+          "no longer needs role-gating — retire the pin:",
           "  pinned retire " + ORIGINAL_PR + " --reason=\\"...\\"",
           "═══════════════════════════════════════════════════════════════",
           "",

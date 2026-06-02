@@ -30,6 +30,7 @@ import {
   describeClaimForUser,
   detectBugFixPhrase,
   claimSlug,
+  claimRoute,
 } from "./claimParser.js";
 import type { Claim } from "./claimParser.js";
 import { classifyPinStrength, type PinStrength } from "./claimParser.js";
@@ -2353,6 +2354,156 @@ program
       out("");
       out("Set PINNEDAI_SKIP_HOOK=1 on any git command to bypass auto-protect for one commit.");
     }
+
+    // M1 (0.2.12+): verification-target check. If HTTP mode is OFF or
+    // PREVIEW_URL isn't set in the local shell, surface a LOUD banner
+    // so the user doesn't walk away thinking pins are running when
+    // they're skipping. Try to auto-detect a Vercel preview URL
+    // (when VERCEL_TOKEN + .vercel/project.json present) and suggest
+    // it — saves the user the "find your URL" step.
+    const finalHttpCfg = httpResolution.http;
+    const previewUrlSet = !!process.env.PREVIEW_URL;
+    const httpVerifying = finalHttpCfg.mode === "local" || (finalHttpCfg.mode === "preview" && previewUrlSet);
+
+    // 0.2.12+ M1++ #83: first-value before-they-leave. If a verification
+    // target is available (env-set PREVIEW_URL, or a running localhost
+    // dev server we can attach to), run pins once and show the result
+    // inline so the user sees green (or a real catch) before they walk
+    // away from init. Per [[retro-audit-zero-work-zero-anger]]: never
+    // auto-boot the app — only attach if already running.
+    let firstValueRan = false;
+    let firstValueTarget: string | null = null;
+    let firstValueSource = "";
+    if (httpVerifying || !previewUrlSet) {
+      // Even when httpVerifying=true, we don't have PREVIEW_URL exported
+      // here unless the env set it. Try to attach to a running dev server
+      // so we can run pins right now — read-only probe, no boot.
+      try {
+        if (process.env.PREVIEW_URL) {
+          firstValueTarget = process.env.PREVIEW_URL;
+          firstValueSource = "PREVIEW_URL env";
+        } else {
+          const running = await probeRunningDevServer(cwd);
+          if (running) {
+            firstValueTarget = running.url;
+            firstValueSource = "running dev server (" + running.source + ")";
+          }
+        }
+      } catch { /* probe failure is non-fatal */ }
+
+      if (firstValueTarget) {
+        out("");
+        out("◆ Running pins once now (against " + firstValueTarget + " via " + firstValueSource + "):");
+        out("");
+        try {
+          const { execFileSync } = await import("node:child_process");
+          // 60s cap — first run shouldn't block the terminal forever.
+          const startedAt = Date.now();
+          const result = execFileSync(
+            "npx",
+            ["--no-install", "vitest", "run", "tests/pinned/", "--reporter=basic"],
+            {
+              cwd,
+              env: { ...process.env, PREVIEW_URL: firstValueTarget },
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+              timeout: 60_000,
+              maxBuffer: 8 * 1024 * 1024,
+            }
+          );
+          const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+          // Parse the basic-reporter footer: "Tests N passed (N)" / "N failed".
+          const m = /Tests\s+(?:(\d+)\s+failed)?[\s|]+(?:(\d+)\s+skipped)?[\s|]+(?:(\d+)\s+passed)?/.exec(result);
+          const failed = m?.[1] ? parseInt(m[1], 10) : 0;
+          const skipped = m?.[2] ? parseInt(m[2], 10) : 0;
+          const passed = m?.[3] ? parseInt(m[3], 10) : 0;
+          if (failed > 0) {
+            out("🔴 " + failed + " pin(s) FAILED — Pinned caught a regression on first run.");
+            out("   Run \`pinned test\` for the full output + repair prompts.");
+          } else if (passed > 0 && skipped === 0) {
+            out("✓ " + passed + " pin(s) green. First-value confirmed in " + elapsedSec + "s.");
+          } else if (passed > 0 && skipped > 0) {
+            out("✓ " + passed + " verified, " + skipped + " skipped. First-value confirmed in " + elapsedSec + "s.");
+          } else {
+            out("⚠ pins ran but reporter output was unrecognized — run \`pinned test\` for details.");
+          }
+          firstValueRan = true;
+        } catch (e) {
+          // Non-fatal: init still succeeded. Show the command they
+          // can run manually.
+          const msg = (e as { stdout?: string; message?: string }).stdout
+            ?? (e as Error).message
+            ?? "unknown";
+          if (typeof msg === "string" && /\bTests\b/.test(msg) && /\bfailed\b/.test(msg)) {
+            // vitest exits non-zero on test failure; treat that as a real catch.
+            const m = /Tests\s+(?:(\d+)\s+failed)?/.exec(msg);
+            const failed = m?.[1] ? parseInt(m[1], 10) : 1;
+            out("🔴 " + failed + " pin(s) FAILED — Pinned caught a regression on first run.");
+            out("   Run \`pinned test\` for the full output + repair prompts.");
+            firstValueRan = true;
+          } else {
+            out("⚠ first-run skipped: " + (typeof msg === "string" ? msg.split("\n")[0].slice(0, 120) : "unknown"));
+            out("   You can run it yourself: PREVIEW_URL=" + firstValueTarget + " pinned test");
+          }
+        }
+      }
+    }
+
+    if (!httpVerifying && !firstValueRan) {
+      let detected: DetectedPreviewUrl | null = null;
+      try {
+        detected = await detectVercelPreviewUrl(cwd);
+      } catch {
+        /* detection failure is non-fatal */
+      }
+
+      out("");
+      out("⚠️  ────────────────────────────────────────────────────────────");
+      out("⚠️  PINNED IS NOT VERIFYING — HTTP pins will skip");
+      out("⚠️  ────────────────────────────────────────────────────────────");
+      out("");
+      if (finalHttpCfg.mode === "off") {
+        out("   HTTP mode is OFF. Every HTTP-shaped pin (rate-limit,");
+        out("   auth-required, happy-path, page-renders, validation-rejects-bad,");
+        out("   journey, permission-required, returns-status, idempotent) will");
+        out("   SKIP on every run. Pinned is providing ZERO behavioral coverage");
+        out("   for the routes it pinned.");
+      } else if (finalHttpCfg.mode === "preview" && !previewUrlSet) {
+        out("   HTTP mode is `preview` but the PREVIEW_URL env var is not set.");
+        out("   Without it, every HTTP pin SKIPs. Pinned is providing ZERO");
+        out("   behavioral coverage for the routes it pinned right now.");
+      }
+      out("");
+      if (detected) {
+        out(`   ✓ Auto-detected ${detected.source.replace("vercel-", "")}: ${detected.url}`);
+        out("");
+        out("   To verify your pins right now:");
+        out(`     export PREVIEW_URL=${detected.url}`);
+        out(`     ${detectPackageManager(cwd) === "pnpm" ? "pnpm" : "npm"} exec pinned test`);
+        out("");
+        out("   To verify automatically in CI, set the same value as the");
+        out("   PREVIEW_URL env var for your `pinned test` job.");
+      } else {
+        out("   Fix it (3 paths, pick one):");
+        out("");
+        out("   1. Local dev server — fastest if you have `npm run dev`:");
+        out("        pinned config --set http.mode=local");
+        out("");
+        out("   2. Vercel preview — best for CI:");
+        out("        # Local: export VERCEL_TOKEN=<token>, re-run `pinned init`");
+        out("        #        for auto-detection (this banner suggests a URL).");
+        out("        # CI:    set PREVIEW_URL=<preview-deploy-url> on the");
+        out("        #        `pinned test` job.");
+        out("");
+        out("   3. Any deployed app:");
+        out("        export PREVIEW_URL=https://your-staging-or-preview-url");
+        out("        pinned test");
+      }
+      out("");
+      out("   See https://pinnedai.dev/docs/preview-url for the full guide.");
+      out("");
+      out("⚠️  ────────────────────────────────────────────────────────────");
+    }
   });
 
 // ---------- ai-rules install ----------
@@ -2697,6 +2848,148 @@ function resolveHttpDefaults(
 // Sniff package.json for a `scripts.dev` (or `scripts.start`) entry +
 // guess the default port for the detected framework. Returns null when
 // no usable script is found.
+// Auto-detect a working preview URL from common deploy-platform
+// metadata. Saves the user the manual step of "find your latest
+// preview URL and paste it." 0.2.12+: Vercel-only; Netlify/Fly/CF
+// Pages follow same shape — punt to future work.
+//
+// Returns null when:
+//   - .vercel/project.json missing (no link)
+//   - VERCEL_TOKEN env not set (can't query API)
+//   - API call fails or returns no deployments
+//
+// When found, the URL is shown in the init banner so the user can
+// either (a) export it as PREVIEW_URL and run pins immediately, or
+// (b) copy the URL into their CI's PREVIEW_URL env var for ongoing
+// verification.
+type DetectedPreviewUrl = {
+  url: string;
+  source: "vercel-latest-preview" | "vercel-latest-production";
+};
+
+async function detectVercelPreviewUrl(cwd: string): Promise<DetectedPreviewUrl | null> {
+  const projectJsonPath = join(cwd, ".vercel", "project.json");
+  if (!existsSync(projectJsonPath)) return null;
+
+  let projectId: string | undefined;
+  let orgId: string | undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(projectJsonPath, "utf8")) as { projectId?: string; orgId?: string };
+    projectId = parsed.projectId;
+    orgId = parsed.orgId;
+  } catch {
+    return null;
+  }
+  if (!projectId || !orgId) return null;
+
+  const token = process.env.VERCEL_TOKEN;
+  if (!token) return null;
+
+  const apiUrl =
+    `https://api.vercel.com/v6/deployments` +
+    `?projectId=${encodeURIComponent(projectId)}` +
+    `&teamId=${encodeURIComponent(orgId)}` +
+    `&limit=10&state=READY`;
+  try {
+    const res = await fetch(apiUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+      // Short timeout — init shouldn't block on a slow Vercel API call.
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      deployments?: Array<{ url: string; target?: string | null }>;
+    };
+    const list = data.deployments ?? [];
+    if (list.length === 0) return null;
+    // Prefer preview (non-production) over production for verification —
+    // production deploys may be cached behind CDN + load-balancers in
+    // ways that make pin tests flaky.
+    const preview = list.find((d) => d.target !== "production");
+    const picked = preview ?? list[0];
+    return {
+      url: `https://${picked.url.replace(/^https?:\/\//, "")}`,
+      source: preview ? "vercel-latest-preview" : "vercel-latest-production",
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Attach to an already-running dev server (never auto-boot). Per
+// [[retro-audit-zero-work-zero-anger]]: the dev's "consent" to live
+// HTTP verification is them already having the dev server up. We
+// probe the configured URL (from .pinnedai/config.json's http.url
+// OR the framework-detected guess) and return it if reachable; we
+// NEVER spawn `npm run dev` or any process.
+//
+// Why this is the safe default:
+//   - If their dev server is up, they invoked it themselves → consent.
+//   - If their dev server isn't up, we don't try to start it →
+//     no surprise side effects (DB writes, real emails, port conflicts).
+//
+// 0.2.12+: foundation for the target-resolution waterfall
+// (deploy URL → running dev server → loud warn) and for the
+// in-loop verify paths (pre-commit verify, watch verify, init's
+// "run pins once at end" closing banner).
+async function probeRunningDevServer(cwd: string): Promise<{ url: string; source: "config-http-url" | "framework-default-port" } | null> {
+  // Order: (1) explicit http.url from config, (2) framework-default
+  // port detection. Stops at the first reachable URL.
+  const candidates: Array<{ url: string; source: "config-http-url" | "framework-default-port" }> = [];
+
+  try {
+    const cfgPath = join(cwd, ".pinnedai", "config.json");
+    if (existsSync(cfgPath)) {
+      const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as {
+        http?: { url?: string; mode?: string };
+      };
+      if (cfg.http?.url) {
+        candidates.push({ url: cfg.http.url, source: "config-http-url" });
+      }
+    }
+  } catch { /* fall through to framework default */ }
+
+  const dev = detectDevScript(cwd);
+  if (dev?.guessedUrl) {
+    candidates.push({ url: dev.guessedUrl, source: "framework-default-port" });
+  }
+  // Common ports as a final fallback (Next.js: 3000, Vite: 5173, Astro: 4321)
+  for (const port of [3000, 5173, 4321, 8080, 8000]) {
+    candidates.push({ url: `http://localhost:${port}`, source: "framework-default-port" });
+  }
+
+  // De-dupe by URL
+  const seen = new Set<string>();
+  const unique = candidates.filter((c) => {
+    const k = c.url.replace(/\/$/, "");
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  for (const cand of unique) {
+    try {
+      const probeUrl = cand.url.replace(/\/$/, "") + "/";
+      // Short timeout — we're probing localhost, ~50ms is plenty when
+      // the server is up; if it isn't, fail fast and move on.
+      const res = await fetch(probeUrl, {
+        method: "GET",
+        signal: AbortSignal.timeout(750),
+        // Identify probe so handlers can no-op real side effects if
+        // they choose (documented X-Pinned-Test pattern).
+        headers: { "X-Pinned-Probe": "1" },
+      });
+      // Any HTTP response means the server is up (even 4xx/5xx — the
+      // app might 404 on `/` but still be serving). Network-level
+      // failure (ECONNREFUSED) throws and we move to the next candidate.
+      if (res.status >= 100 && res.status < 600) {
+        return { url: cand.url.replace(/\/$/, ""), source: cand.source };
+      }
+    } catch { /* unreachable — try next */ }
+  }
+  return null;
+}
+
 function detectDevScript(
   cwd: string
 ): { startCmd: string; guessedUrl: string } | null {
@@ -3231,6 +3524,346 @@ async function promptYSN(question: string): Promise<"Y" | "S" | "N"> {
     process.stdin.on("data", onData);
   });
 }
+
+// ---------- audit (0.2.12+) ----------
+// THE first-touch activation experience. Per [[retro-audit-zero-work-zero-anger]]:
+// L0 of the consent ladder. Read-only static scan of code + git history.
+// No install, no execution, no network, no config writes. The single
+// command `npx pinnedai audit` runs against ANY repo and surfaces:
+//   - unprotected critical flows (write endpoints, pages, auth surfaces
+//     that have no Pinned coverage)
+//   - regressions ALREADY SHIPPED in recent git history that Pinned
+//     would have caught
+// Output: human-readable summary (default) or structured --json.
+//
+// Safety contract: this command MUST NOT
+//   - install hooks, statusline, claude rules, or any config
+//   - spawn the user's app or any subprocess beyond `git log` / `git show`
+//   - send anything off-machine (no LLM, no telemetry, no fetch)
+// All four are tested by exercising `pinned audit` against a real repo
+// and asserting no .git/hooks/* edits, no .pinned/ writes, no fetch().
+program
+  .command("audit")
+  .description(
+    "Read-only retro audit: walks recent git history + scans current code, reports unprotected critical flows + regressions Pinned would have caught. NO install, NO app execution, NO network. Safe to run against any repo."
+  )
+  .option(
+    "--commits <n>",
+    "Scan the last N commits for shipped regressions (default 30).",
+    "30"
+  )
+  .option(
+    "--json",
+    "Emit structured JSON instead of the human report."
+  )
+  .option("--quiet", "Suppress the pinned banner header.")
+  .action(async (opts: { commits: string; json?: boolean; quiet?: boolean }) => {
+    if (!opts.json && !opts.quiet) printBanner();
+    const cwd = process.cwd();
+    const commitCount = Math.max(1, Math.min(parseInt(opts.commits, 10) || 30, 500));
+
+    type AuditFinding = {
+      kind: "regression-shipped" | "unprotected-flow";
+      severity: "high" | "medium" | "low";
+      detector: string;
+      summary: string;
+      commit?: string;
+      commitSubject?: string;
+      file?: string;
+      route?: string | null;
+    };
+
+    const findings: AuditFinding[] = [];
+
+    // Pass 1 — current-tree scan: unprotected critical flows
+    const tree: Map<string, string> = new Map();
+    const treeLines: Map<string, string[]> = new Map();
+    try {
+      const allFiles = walkRepo(cwd);
+      for (const p of allFiles) {
+        try {
+          const content = readFileSync(join(cwd, p), "utf8");
+          tree.set(p, content);
+          treeLines.set(p, content.split("\n"));
+        } catch { /* unreadable — skip */ }
+      }
+    } catch {
+      /* repo walk failure is non-fatal — the next pass still runs */
+    }
+
+    // Existing pinned coverage (so we don't flag protected routes)
+    let pinnedRoutes = new Set<string>();
+    try {
+      const reg = existsSync(join(cwd, "tests/pinned"))
+        ? readRegistry(join(cwd, "tests/pinned"))
+        : { version: 1 as const, claims: [] };
+      for (const e of reg.claims) {
+        if (e.status !== "active") continue;
+        const r = claimRoute(e.claim);
+        if (r) pinnedRoutes.add(r);
+      }
+    } catch { /* no pinned/ dir — every flow is unprotected */ }
+
+    const {
+      detectRetroactiveWriteEndpoints: drwe,
+      detectHostConditionalInDiff: dhost,
+      detectAuthChecksInDiff,
+      detectValidationAddedInDiff,
+      buildImportGraph,
+      findFamilyMembers,
+      deriveRouteFromPath: deriveRouteFromPathExported,
+    } = await import("./scanDiff.js");
+
+    // 0.2.12+ #88: build the import graph once. Used below to expand
+    // single-file detections (e.g. host-conditional fired on lib/host.ts)
+    // into FAMILIES of route handlers that consume the affected export.
+    // Per [[pattern-driven-family-sweep]]: protect by risk surface, not
+    // catch history.
+    const importGraph = buildImportGraph(tree);
+
+    // Unprotected write endpoints
+    try {
+      for (const h of drwe(tree)) {
+        if (pinnedRoutes.has(h.route)) continue;
+        findings.push({
+          kind: "unprotected-flow",
+          severity: "high",
+          detector: "retroactive-write-endpoint",
+          summary: `${h.method} ${h.route} ${h.writeShape.kind === "email" ? "sends email via" : h.writeShape.kind === "queue" ? "enqueues via" : `writes to "${h.writeShape.target}" via`} ${h.writeShape.library} — no Pinned coverage`,
+          file: h.filePath,
+          route: h.route,
+        });
+      }
+    } catch { /* detector errors don't block other findings */ }
+
+    // Host-conditional handlers — single host gate often spans N routes.
+    // Resolve the family + add it to the summary.
+    type HostFamily = { rootFile: string; affectedExport: string; routes: Array<{ filePath: string; route: string | null }> };
+    const hostFamilies: HostFamily[] = [];
+    try {
+      for (const h of dhost(treeLines)) {
+        // The single-file hit (kept for backwards compat — same as before)
+        findings.push({
+          kind: "unprotected-flow",
+          severity: "medium",
+          detector: "host-conditional",
+          summary: `${h.filePath} reads host header + gates behavior on it (${h.hostExpression.slice(0, 80)}) — divergence risk between prod and preview`,
+          file: h.filePath,
+          route: h.route,
+        });
+
+        // 0.2.12+ #88: resolve the family. When the detector knows
+        // which exported function contains the host-read, find every
+        // route that imports THAT specific export. Those routes share
+        // the same divergence risk — happy-path guards on all of them
+        // are warranted from this single signal.
+        if (h.affectedExport) {
+          const consumers = findFamilyMembers(h.filePath, h.affectedExport, importGraph);
+          const routes = consumers
+            .map((c) => ({ filePath: c.importer, route: deriveRouteFromPathExported(c.importer) }))
+            .filter((r) => r.route !== null);
+          if (routes.length > 0) {
+            hostFamilies.push({ rootFile: h.filePath, affectedExport: h.affectedExport, routes });
+          }
+        }
+      }
+    } catch { /* skip */ }
+
+    // Pass 2 — git history scan: regressions ALREADY SHIPPED
+    let log: Array<{ sha: string; subject: string }> = [];
+    try {
+      const out = execFileSync("git", ["log", "--format=%h|%s", `-n${commitCount}`], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      log = out.split("\n")
+        .filter((l) => l.includes("|"))
+        .map((l) => {
+          const idx = l.indexOf("|");
+          return { sha: l.slice(0, idx), subject: l.slice(idx + 1) };
+        });
+    } catch {
+      /* not a git repo or git unavailable — pass 2 skipped */
+    }
+
+    for (const c of log) {
+      let added = new Map<string, string[]>();
+      let removed = new Map<string, string[]>();
+      try {
+        const diff = execFileSync("git", ["show", c.sha, "--unified=0", "--format="], {
+          cwd,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          maxBuffer: 8 * 1024 * 1024,
+        });
+        // Parse diff into per-file added + removed line maps
+        let currentFile: string | null = null;
+        for (const line of diff.split("\n")) {
+          if (line.startsWith("+++ b/")) {
+            currentFile = line.slice(6);
+            if (!added.has(currentFile)) added.set(currentFile, []);
+            if (!removed.has(currentFile)) removed.set(currentFile, []);
+          } else if (currentFile && line.startsWith("+") && !line.startsWith("+++")) {
+            added.get(currentFile)!.push(line.slice(1));
+          } else if (currentFile && line.startsWith("-") && !line.startsWith("---")) {
+            removed.get(currentFile)!.push(line.slice(1));
+          }
+        }
+      } catch { continue; }
+
+      // Detector 1: host-conditional ADDED in this commit
+      try {
+        const hits = dhost(added);
+        for (const h of hits) {
+          findings.push({
+            kind: "regression-shipped",
+            severity: "high",
+            detector: "host-conditional",
+            summary: `Added host-conditional gate to ${h.filePath} (${h.hostExpression.slice(0, 60)}) — likely breaks behavior on hosts that don't match`,
+            commit: c.sha,
+            commitSubject: c.subject,
+            file: h.filePath,
+            route: h.route,
+          });
+        }
+      } catch { /* skip */ }
+
+      // Detector 2: auth check REMOVED in this commit
+      try {
+        const addedHits = detectAuthChecksInDiff(added);
+        const removedHits = detectAuthChecksInDiff(removed);
+        const addedRoutes = new Set(addedHits.map((h) => h.route));
+        for (const h of removedHits) {
+          if (addedRoutes.has(h.route)) continue; // refactor (replaced, not removed)
+          findings.push({
+            kind: "regression-shipped",
+            severity: "high",
+            detector: "auth-removed",
+            summary: `Auth check on ${h.route} appears removed (signature ${h.signature.slice(0, 60)}) — verify with \`git show ${c.sha}\``,
+            commit: c.sha,
+            commitSubject: c.subject,
+            file: h.filePath,
+            route: h.route,
+          });
+        }
+      } catch { /* skip */ }
+
+      // Detector 3: validation REMOVED in this commit
+      try {
+        const addedHits = detectValidationAddedInDiff(added);
+        const removedHits = detectValidationAddedInDiff(removed);
+        const addedFiles = new Set(addedHits.map((h) => h.filePath));
+        for (const h of removedHits) {
+          if (addedFiles.has(h.filePath)) continue;
+          findings.push({
+            kind: "regression-shipped",
+            severity: "medium",
+            detector: "validation-removed",
+            summary: `Validation signature on ${h.filePath} appears removed (${h.signature.slice(0, 60)}) — verify with \`git show ${c.sha}\``,
+            commit: c.sha,
+            commitSubject: c.subject,
+            file: h.filePath,
+          });
+        }
+      } catch { /* skip */ }
+    }
+
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({
+        repoRoot: cwd,
+        scannedCommits: log.length,
+        scannedFiles: tree.size,
+        findings,
+      }, null, 2) + "\n");
+      return;
+    }
+
+    // Human report
+    const regressions = findings.filter((f) => f.kind === "regression-shipped");
+    const unprotected = findings.filter((f) => f.kind === "unprotected-flow");
+
+    out("");
+    out("◆ Pinned · RETRO AUDIT");
+    out("");
+    out(`Scanned ${log.length} commit${log.length === 1 ? "" : "s"} + ${tree.size} source file${tree.size === 1 ? "" : "s"}.`);
+    out("");
+
+    if (regressions.length > 0) {
+      out(`🔴 Regressions ALREADY shipped (${regressions.length}) — Pinned would have caught these:`);
+      out("");
+      for (const f of regressions.slice(0, 10)) {
+        const sevIcon = f.severity === "high" ? "🔴" : f.severity === "medium" ? "🟡" : "🔵";
+        out(`  ${sevIcon} ${f.summary}`);
+        if (f.commit) out(`     ${f.commit}  ${f.commitSubject ?? ""}`);
+        if (f.file) out(`     ${f.file}`);
+        out("");
+      }
+      if (regressions.length > 10) {
+        out(`  …and ${regressions.length - 10} more (use --json for the full list)`);
+        out("");
+      }
+    }
+
+    if (unprotected.length > 0) {
+      out(`⚠ Unprotected critical flows (${unprotected.length}) — no Pinned coverage right now:`);
+      out("");
+      for (const f of unprotected.slice(0, 10)) {
+        out(`  • ${f.summary}`);
+        if (f.file) out(`     ${f.file}`);
+        out("");
+      }
+      if (unprotected.length > 10) {
+        out(`  …and ${unprotected.length - 10} more`);
+        out("");
+      }
+    }
+
+    // 0.2.12+ #88: pattern-driven family view. When a host-conditional
+    // (or other multi-consumer) detector fires, surface the FAMILY
+    // (all routes that import the affected export) so the user sees
+    // the full blast radius from a single signal. This is the upgrade
+    // from "pin what was diffed" to "protect the risk surface."
+    if (hostFamilies.length > 0) {
+      out(`🌐 Risk families (${hostFamilies.length}) — one root cause, N route consumers:`);
+      out("");
+      for (const fam of hostFamilies) {
+        out(`  ${fam.rootFile}:${fam.affectedExport} — ${fam.routes.length} route consumer${fam.routes.length === 1 ? "" : "s"}:`);
+        for (const r of fam.routes.slice(0, 8)) {
+          out(`    • ${r.route ?? r.filePath}  (${r.filePath})`);
+        }
+        if (fam.routes.length > 8) {
+          out(`    • …and ${fam.routes.length - 8} more`);
+        }
+        out("");
+        out(`    These ${fam.routes.length} route${fam.routes.length === 1 ? " shares" : "s share"} the same divergence risk through ${fam.rootFile}.`);
+        out(`    A happy-path pin on each catches the family from this single signal.`);
+        out("");
+      }
+    }
+
+    if (regressions.length === 0 && unprotected.length === 0) {
+      out("✓ No obvious regressions found in recent history.");
+      out("✓ No unprotected critical flows detected.");
+      out("");
+      out("This is a deterministic scan — it catches the obvious classes (auth removal,");
+      out("validation removal, host-conditional addition, unprotected write endpoints).");
+      out("Subtle behavioral regressions need live verification — see `pinned init` to set up.");
+      out("");
+      return;
+    }
+
+    out("─────────────────────────────────────────────");
+    out("");
+    out("This is a read-only scan. Pinned didn't install anything,");
+    out("run your app, or send your code anywhere. To protect against");
+    out("future regressions of this shape:");
+    out("");
+    out("  npx pinnedai init       # one-time setup, asks before installing anything");
+    out("");
+    out("See https://pinnedai.dev for the full activation guide.");
+    out("");
+  });
 
 // ---------- list ----------
 // Daily-loop visibility — every dev should know what constraints
@@ -5593,8 +6226,28 @@ program
     // Host-conditional warnings (0.2.7+). Surface AFTER the pin
     // counts so the user sees the divergence-risk note when their
     // newly-added pin would otherwise false-fail on first PREVIEW_URL run.
+    //
+    // P2 (0.2.12+): when a host-conditional warning fires, look up
+    // whether the affected route ALSO has an active happy-path or
+    // journey pin. If yes, surface a concrete "this pin is likely
+    // affected — here's the exact command to verify" suggestion. The
+    // host gate is the most common reason these pins false-fail; the
+    // suggestion gives the user the closed-loop next step instead of
+    // a generic warning.
     const hostWarnings = classified.warnings?.hostConditional;
     if (hostWarnings && hostWarnings.length > 0 && !opts.quiet) {
+      // Index active pins by route so we can cross-reference each
+      // host-conditional warning to specific pin files that may break.
+      const activeReg = existsSync(opts.dir) ? readRegistry(opts.dir) : { version: 1 as const, claims: [] };
+      const pinsByRoute = new Map<string, Array<{ filename: string; template: string }>>();
+      for (const e of activeReg.claims) {
+        if (e.status !== "active") continue;
+        const route = claimRoute(e.claim);
+        if (!route) continue;
+        if (!pinsByRoute.has(route)) pinsByRoute.set(route, []);
+        pinsByRoute.get(route)!.push({ filename: e.filename, template: e.claim.template });
+      }
+
       out("");
       out(
         `⚠ Host-conditional handler${hostWarnings.length === 1 ? "" : "s"} detected (${hostWarnings.length})`
@@ -5611,16 +6264,37 @@ program
       out(
         `   false-fail on first run.`
       );
+      out("");
       for (const w of hostWarnings.slice(0, 5)) {
         out(`   • ${w.filePath}${w.route ? `  (${w.route})` : ""}`);
+        // Concrete suggestion: which active pin(s) will likely fail.
+        if (w.route && pinsByRoute.has(w.route)) {
+          const affectedPins = pinsByRoute.get(w.route)!.filter((p) =>
+            p.template === "happy-path-with-side-effect" ||
+            p.template === "journey" ||
+            p.template === "returns-status"
+          );
+          if (affectedPins.length > 0) {
+            out(`     ↳ Likely affects:`);
+            for (const p of affectedPins.slice(0, 3)) {
+              out(`         tests/pinned/${p.filename} (${p.template})`);
+            }
+            const exampleFile = affectedPins[0].filename;
+            out(`     ↳ Verify now:`);
+            out(`         PREVIEW_URL=<your-preview> npx vitest run tests/pinned/${exampleFile}`);
+            out(`         (RED = host gate is closing on the preview host — add a Pinned bypass to your gate)`);
+          }
+        }
       }
       if (hostWarnings.length > 5) {
         out(`   • …and ${hostWarnings.length - 5} more`);
       }
+      out("");
       out(
-        `   See https://pinnedai.dev/docs/host-conditional for the wrapper that`
+        `   See https://pinnedai.dev/docs/host-conditional for the wrapper pattern that`
       );
-      out(`   makes Pinned probes follow the prod branch.`);
+      out(`   makes Pinned probes follow the prod branch (same shape as the test-fixture`);
+      out(`   pattern in https://pinnedai.dev/docs/test-fixtures).`);
     }
   });
 
@@ -5814,14 +6488,65 @@ program
       const chunks: Buffer[] = [];
       child.stdout?.on("data", (c: Buffer) => chunks.push(c));
       child.stderr?.on("data", (c: Buffer) => chunks.push(c));
-      child.on("close", () => {
-        running = false;
+      child.on("close", async () => {
         const output = Buffer.concat(chunks).toString("utf8").trim();
         const ts = new Date().toLocaleTimeString();
         // Only print non-empty / non-trivial output.
         if (output && !/No changed files vs|No new behaviors/.test(output)) {
           process.stdout.write(`[${ts}] ${output}\n`);
         }
+
+        // 0.2.12+ M1++ #82: also VERIFY on file-quiet. Only fires when
+        // a dev server is already running on localhost — never spawns
+        // one. Per [[retro-audit-zero-work-zero-anger]]'s L2 rung: the
+        // dev's running server IS their consent. If no server is up,
+        // silently skip (the watch only auto-pins; the verify is a
+        // bonus when feasible). Warn-only output — never blocks the
+        // user's edit cycle.
+        let verifyRan = false;
+        try {
+          if (!process.env.PREVIEW_URL) {
+            const probed = await probeRunningDevServer(root);
+            if (probed) {
+              process.stdout.write(`[${ts}] ◆ Running pins against ${probed.url} (attached to running ${probed.source})...\n`);
+              const { execFileSync } = await import("node:child_process");
+              try {
+                const result = execFileSync(
+                  "npx",
+                  ["--no-install", "vitest", "run", "tests/pinned/", "--reporter=basic"],
+                  {
+                    cwd: root,
+                    env: { ...process.env, PREVIEW_URL: probed.url },
+                    encoding: "utf8",
+                    stdio: ["ignore", "pipe", "pipe"],
+                    timeout: 30_000,
+                    maxBuffer: 4 * 1024 * 1024,
+                  }
+                );
+                const m = /Tests\s+(?:(\d+)\s+failed)?[\s|]+(?:(\d+)\s+skipped)?[\s|]+(?:(\d+)\s+passed)?/.exec(result);
+                const failed = m?.[1] ? parseInt(m[1], 10) : 0;
+                const passed = m?.[3] ? parseInt(m[3], 10) : 0;
+                if (failed > 0) {
+                  process.stdout.write(`[${ts}] 🔴 ${failed} pin(s) FAILED — Pinned caught a regression on watch verify. Run \`pinned test\` for repair prompts.\n`);
+                } else if (passed > 0) {
+                  process.stdout.write(`[${ts}] ✓ ${passed} pin(s) green.\n`);
+                }
+              } catch (e) {
+                const msg = (e as { stdout?: string }).stdout ?? "";
+                if (/\bfailed\b/.test(msg)) {
+                  const m = /Tests\s+(?:(\d+)\s+failed)?/.exec(msg);
+                  const failed = m?.[1] ? parseInt(m[1], 10) : 1;
+                  process.stdout.write(`[${ts}] 🔴 ${failed} pin(s) FAILED — Pinned caught a regression. Run \`pinned test\` for repair prompts.\n`);
+                }
+                // Silent on other errors — watch isn't allowed to crash.
+              }
+              verifyRan = true;
+            }
+          }
+        } catch { /* probe failure is silent */ }
+
+        void verifyRan;
+        running = false;
       });
     };
 
@@ -6571,6 +7296,27 @@ program
         // existing "not verified" message. Better than blocking the
         // whole `pinned test` run on a flaky dev server.
       }
+    } else if (!process.env.PREVIEW_URL && (httpCfg.mode === "off" || httpCfg.mode === "preview")) {
+      // 0.2.12+ target-resolution waterfall (rung 2): when PREVIEW_URL
+      // isn't set AND the user didn't opt into local auto-start, probe
+      // for an already-running localhost dev server and ATTACH to it
+      // if found. Never auto-boot — the probe is read-only.
+      //
+      // Their running dev server IS their consent; Pinned just makes
+      // requests against it. If nothing is running, we fall through
+      // to "0 verifying" (the loud warning already in `pinned status`).
+      //
+      // Per [[retro-audit-zero-work-zero-anger]]: this is the safe
+      // version of "make pins always run by default" — it costs the
+      // user nothing AND requires no setup. The first time they have
+      // `npm run dev` up, Pinned starts catching things automatically.
+      try {
+        const running = await probeRunningDevServer(process.cwd());
+        if (running) {
+          childEnv.PREVIEW_URL = running.url;
+          out(`◆ pinned: attached to running dev server at ${running.url} (${running.source})`);
+        }
+      } catch { /* probe failure is non-fatal */ }
     }
 
     const { spawnSync } = await import("node:child_process");
@@ -7478,6 +8224,257 @@ program
     }
   });
 
+// Full `pinned uninstall` — per [[retro-audit-zero-work-zero-anger]]:
+// "people trust tools they know they can fully remove." This command
+// removes EVERY trace of Pinned from the current project:
+// hooks, statusline entries, AI-coder rule blocks, the .pinnedai/
+// directory, .pinned/ai-lessons, the GitHub workflow file. Pin tests
+// in tests/pinned/ are PRESERVED by default — they're part of the
+// user's test suite — unless --tests is passed.
+//
+// Global writes (~/.claude/settings.json statusline, ~/.config/pinnedai)
+// require --global to also remove. Per-project is the default scope.
+program
+  .command("uninstall")
+  .description(
+    "Cleanly remove every trace of Pinned from this project. Shows what will be removed and asks before deleting. Pin test files in tests/pinned/ are preserved by default (use --tests to remove them too)."
+  )
+  .option("--dry-run", "Show what would be removed without deleting anything.")
+  .option("--tests", "Also delete tests/pinned/ (registry, PINS.md, every pin test). Default: preserved.")
+  .option("--global", "Also remove global state (~/.claude/settings.json statusline entry, ~/.config/pinnedai install prefs).")
+  .option("--yes", "Skip the confirmation prompt (use in scripts).")
+  .option("--quiet", "Suppress non-error output.")
+  .action(async (opts: { dryRun?: boolean; tests?: boolean; global?: boolean; yes?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const cwd = process.cwd();
+
+    type Removal = { kind: "file" | "block" | "dir"; path: string; detail?: string; act: () => void };
+    const planned: Removal[] = [];
+
+    // 1. Git hooks — uninstall the Pinned-marked block from each.
+    const { uninstallHook } = await import("./gitHooks.js");
+    for (const name of ["pre-commit", "pre-push", "post-commit"] as const) {
+      planned.push({
+        kind: "block",
+        path: `.git/hooks/${name}`,
+        detail: "Pinned-managed block within hook",
+        act: () => { uninstallHook(cwd, name); },
+      });
+    }
+
+    // 2. AI-coder rules blocks (CLAUDE.md, .cursorrules, etc.) — same
+    // marker-bounded removal as `uninstall-agent-rules`.
+    const { KNOWN_AGENT_TARGETS, unwireAgent } = await import("./agentConfig.js");
+    for (const t of KNOWN_AGENT_TARGETS) {
+      const abs = join(cwd, t.path);
+      if (existsSync(abs)) {
+        planned.push({
+          kind: "block",
+          path: t.path,
+          detail: "Pinned-managed rules block",
+          act: () => { unwireAgent(abs); },
+        });
+      }
+    }
+
+    // 3. Claude Code statusline entry (project-local .claude/settings.json).
+    const localClaudeSettings = join(cwd, ".claude", "settings.json");
+    if (existsSync(localClaudeSettings)) {
+      try {
+        const { uninstallClaudeStatusline } = await import("./claudeSettings.js");
+        planned.push({
+          kind: "block",
+          path: ".claude/settings.json",
+          detail: "Pinned statusline entry (compose-aware)",
+          act: () => { uninstallClaudeStatusline(cwd); },
+        });
+      } catch { /* helper missing — skip */ }
+
+      // 3b. PostToolUse hook entry (if installed by `pinned install-claude-hook`).
+      try {
+        const settings = JSON.parse(readFileSync(localClaudeSettings, "utf8")) as {
+          hooks?: { PostToolUse?: Array<{ hooks?: Array<{ command?: string }> }> };
+        };
+        const post = settings.hooks?.PostToolUse ?? [];
+        const hasPinnedHook = post.some((h) =>
+          (h.hooks ?? []).some((step) =>
+            typeof step.command === "string" && step.command.includes("pinned hook-postedit")
+          )
+        );
+        if (hasPinnedHook) {
+          planned.push({
+            kind: "block",
+            path: ".claude/settings.json",
+            detail: "Pinned PostToolUse hook entry",
+            act: () => {
+              try {
+                const s = JSON.parse(readFileSync(localClaudeSettings, "utf8")) as {
+                  hooks?: { PostToolUse?: Array<{ hooks?: Array<{ command?: string }> }> };
+                };
+                if (s.hooks?.PostToolUse) {
+                  s.hooks.PostToolUse = s.hooks.PostToolUse.filter((h) =>
+                    !(h.hooks ?? []).some((step) =>
+                      typeof step.command === "string" && step.command.includes("pinned hook-postedit")
+                    )
+                  );
+                  if (s.hooks.PostToolUse.length === 0) delete s.hooks.PostToolUse;
+                  if (s.hooks && Object.keys(s.hooks).length === 0) delete (s as { hooks?: unknown }).hooks;
+                  writeFileSync(localClaudeSettings, JSON.stringify(s, null, 2) + "\n");
+                }
+              } catch { /* leave file as-is on error */ }
+            },
+          });
+        }
+      } catch { /* unreadable settings — skip */ }
+    }
+
+    // 4. GitHub Action workflow file.
+    const ghWorkflow = join(cwd, ".github", "workflows", "pinned.yml");
+    if (existsSync(ghWorkflow)) {
+      planned.push({
+        kind: "file",
+        path: ".github/workflows/pinned.yml",
+        detail: "Pinned CI workflow",
+        act: () => { try { (require("node:fs") as typeof import("node:fs")).unlinkSync(ghWorkflow); } catch {} },
+      });
+    }
+
+    // 5. .pinnedai/ directory (config, marker files, install prefs).
+    const pinnedaiDir = join(cwd, ".pinnedai");
+    if (existsSync(pinnedaiDir)) {
+      planned.push({
+        kind: "dir",
+        path: ".pinnedai/",
+        detail: "config + transient markers",
+        act: () => { try { (require("node:fs") as typeof import("node:fs")).rmSync(pinnedaiDir, { recursive: true, force: true }); } catch {} },
+      });
+    }
+
+    // 6. .pinned/ directory (AI lessons).
+    const pinnedDir = join(cwd, ".pinned");
+    if (existsSync(pinnedDir)) {
+      planned.push({
+        kind: "dir",
+        path: ".pinned/",
+        detail: "AI lessons (ai-lessons.md, lessons.json)",
+        act: () => { try { (require("node:fs") as typeof import("node:fs")).rmSync(pinnedDir, { recursive: true, force: true }); } catch {} },
+      });
+    }
+
+    // 7. tests/pinned/ — opt-in (--tests). Default: preserved.
+    const pinsDir = join(cwd, "tests", "pinned");
+    if (existsSync(pinsDir)) {
+      if (opts.tests) {
+        planned.push({
+          kind: "dir",
+          path: "tests/pinned/",
+          detail: "EVERY pin test, registry, PINS.md, CATCHES.md",
+          act: () => { try { (require("node:fs") as typeof import("node:fs")).rmSync(pinsDir, { recursive: true, force: true }); } catch {} },
+        });
+      }
+    }
+
+    // 8. Global writes (opt-in via --global).
+    if (opts.global) {
+      const globalClaudeSettings = join(process.env.HOME ?? "", ".claude", "settings.json");
+      if (existsSync(globalClaudeSettings)) {
+        try {
+          const { uninstallClaudeStatuslineGlobal } = await import("./claudeSettings.js") as { uninstallClaudeStatuslineGlobal?: () => void };
+          if (uninstallClaudeStatuslineGlobal) {
+            planned.push({
+              kind: "block",
+              path: "~/.claude/settings.json",
+              detail: "Pinned global statusline entry",
+              act: () => { uninstallClaudeStatuslineGlobal(); },
+            });
+          }
+        } catch { /* skip */ }
+      }
+      const globalPrefs = join(process.env.HOME ?? "", ".config", "pinnedai");
+      if (existsSync(globalPrefs)) {
+        planned.push({
+          kind: "dir",
+          path: "~/.config/pinnedai/",
+          detail: "global install prefs",
+          act: () => { try { (require("node:fs") as typeof import("node:fs")).rmSync(globalPrefs, { recursive: true, force: true }); } catch {} },
+        });
+      }
+    }
+
+    // Print the plan.
+    if (planned.length === 0) {
+      out("Pinned doesn't appear to be installed in this project. Nothing to remove.");
+      if (!opts.global) {
+        out("(Use --global to also check ~/.claude/settings.json + ~/.config/pinnedai/.)");
+      }
+      return;
+    }
+
+    out("");
+    out("◆ Pinned uninstall — the following will be removed:");
+    out("");
+    for (const p of planned) {
+      const sigil = p.kind === "block" ? "✂" : p.kind === "dir" ? "🗑" : "🗑";
+      out(`  ${sigil} ${p.path}${p.detail ? "  (" + p.detail + ")" : ""}`);
+    }
+    out("");
+    if (!opts.tests && existsSync(pinsDir)) {
+      out("✓ Preserved: tests/pinned/ (your pin tests stay in the test suite).");
+      out("  Use --tests to also remove them.");
+      out("");
+    }
+    if (!opts.global) {
+      out("→ Scope: this project only. Use --global to also check ~/.claude/, ~/.config/pinnedai/.");
+      out("");
+    }
+
+    if (opts.dryRun) {
+      out("(--dry-run: no files modified.)");
+      return;
+    }
+
+    if (!opts.yes) {
+      process.stdout.write("Proceed with removal? [y/N] ");
+      const answer = await new Promise<string>((resolve) => {
+        let buf = "";
+        process.stdin.setEncoding("utf8");
+        process.stdin.resume();
+        const onData = (chunk: string) => {
+          buf += chunk;
+          if (buf.includes("\n")) {
+            process.stdin.removeListener("data", onData);
+            process.stdin.pause();
+            resolve(buf.trim().toLowerCase());
+          }
+        };
+        process.stdin.on("data", onData);
+      });
+      if (answer !== "y" && answer !== "yes") {
+        out("");
+        out("Aborted. Nothing was removed.");
+        return;
+      }
+    }
+
+    out("");
+    for (const p of planned) {
+      try {
+        p.act();
+        out(`  ✓ ${p.path}`);
+      } catch (e) {
+        err(`  ✗ ${p.path} — ${(e as Error).message}\n`);
+      }
+    }
+    out("");
+    out("◆ Pinned has been uninstalled.");
+    if (!opts.tests && existsSync(pinsDir)) {
+      out("  tests/pinned/ preserved (re-install will pick them up).");
+    }
+    if (!opts.global) {
+      out("  Global writes (if any) preserved. Run `pinned uninstall --global` to also remove those.");
+    }
+  });
+
 program
   .command("uninstall-agent-rules")
   .description("Remove the Pinned-managed rules block from all agent config files. Files themselves are preserved.")
@@ -7707,18 +8704,341 @@ program
 // High-confidence findings would auto-pin in observe mode (Pro
 // feature in the eventual cloud version); v0.1 just SURFACES them.
 
+// ─── Agent PostToolUse hook (0.2.12+ #80) ────────────────────────
+// THE wedge per [[agent-loop-activation-wedge]]: when the agent edits
+// a file, Pinned verifies the affected pins automatically and injects
+// the result back into the agent's context. The agent sees its own
+// regression IMMEDIATELY and self-corrects; the human watches Pinned
+// catch the agent.
+//
+// Two commands wire this:
+//   • pinned install-claude-hook  — registers the hook in Claude
+//     Code's settings.json (consent-gated; shows the diff first)
+//   • pinned hook-postedit        — the actual runtime handler;
+//     reads tool-input JSON from stdin, runs affected pins, writes
+//     a structured result to stdout for the agent to read.
+//
+// Consent per [[retro-audit-zero-work-zero-anger]]: install is L1
+// (explicit yes). At runtime the hook only verifies against an
+// already-running dev server (never auto-boots); silent when nothing
+// is up so it never adds latency to agent edits.
 program
-  .command("audit")
-  .description("Audit the repo for sibling code paths that may share a learned mistake pattern.")
-  .option("--learned", "Use patterns Pinned has learned (currently: auth-required + returns-status).")
+  .command("hook-postedit")
+  .description(
+    "Runtime handler for Claude Code's PostToolUse hook. Reads tool-input JSON from stdin, runs the affected pins against a detected dev server, writes a structured result to stdout. Not meant for direct user invocation — installed by `pinned install-claude-hook`."
+  )
+  .option("--dir <path>", "Pinned tests directory (default: tests/pinned).", "tests/pinned")
+  .option("--timeout <ms>", "Max wall-clock time for the verify step (default: 15000).", (v) => parseInt(v, 10), 15000)
+  .action(async (opts: { dir: string; timeout: number }) => {
+    // Read tool-input from stdin. Claude Code passes a JSON object
+    // describing the tool call: {tool_name, tool_input, tool_response}.
+    // We tolerate a missing/short stdin (agent might invoke us without
+    // a payload during testing — exit silently).
+    let stdinRaw = "";
+    try {
+      stdinRaw = await new Promise<string>((resolve) => {
+        let buf = "";
+        const onData = (chunk: Buffer) => { buf += chunk.toString("utf8"); };
+        process.stdin.on("data", onData);
+        process.stdin.on("end", () => resolve(buf));
+        // Failsafe: if no data arrives in 1s, give up — the hook
+        // must NEVER hang the agent.
+        setTimeout(() => resolve(buf), 1000);
+      });
+    } catch { /* exit silently below */ }
+
+    let payload: { tool_name?: string; tool_input?: Record<string, unknown> } = {};
+    try {
+      payload = JSON.parse(stdinRaw || "{}");
+    } catch { /* malformed payload — exit silently */ }
+
+    // Extract edited file paths. Claude Code's Edit/Write/MultiEdit
+    // tools all carry `file_path` (or an array of edits with the same
+    // field). We collect every path mentioned.
+    const editedFiles = new Set<string>();
+    const input = payload.tool_input ?? {};
+    const filePath = (input as { file_path?: string }).file_path;
+    if (typeof filePath === "string") editedFiles.add(filePath);
+    const edits = (input as { edits?: Array<{ file_path?: string }> }).edits;
+    if (Array.isArray(edits)) {
+      for (const e of edits) {
+        if (typeof e.file_path === "string") editedFiles.add(e.file_path);
+      }
+    }
+    if (editedFiles.size === 0) return; // nothing to verify
+
+    const cwd = process.cwd();
+    const pinnedDir = join(cwd, opts.dir);
+    if (!existsSync(pinnedDir)) return; // no pins installed — silent
+
+    // Map edited files → routes. Convert absolute paths to repo-relative
+    // before running deriveRouteFromPath.
+    const { deriveRouteFromPath } = await import("./scanDiff.js");
+    const affectedRoutes = new Set<string>();
+    for (const f of editedFiles) {
+      const rel = f.startsWith(cwd + sep) ? f.slice(cwd.length + 1) : f;
+      const route = deriveRouteFromPath(rel);
+      if (route) affectedRoutes.add(route);
+    }
+    if (affectedRoutes.size === 0) return; // edits didn't touch routable code
+
+    // Find active pin files that cover any of those routes.
+    let reg;
+    try { reg = readRegistry(pinnedDir); } catch { return; }
+    const affectedPinFiles: string[] = [];
+    for (const e of reg.claims) {
+      if (e.status !== "active") continue;
+      const r = claimRoute(e.claim);
+      if (!r) continue;
+      if (affectedRoutes.has(r)) {
+        affectedPinFiles.push(`tests/pinned/${e.filename}`);
+      }
+    }
+    if (affectedPinFiles.length === 0) {
+      // No pin covers the edited route — emit a soft suggestion the
+      // agent will read (and Pinned-aware agents act on).
+      process.stdout.write(
+        `🛟 pinned: edit touched route(s) ${Array.from(affectedRoutes).join(", ")} but no Pinned guard covers them. Consider \`pinned check --description "<what this route should do>"\` to add one.\n`
+      );
+      return;
+    }
+
+    // Probe for a running dev server. If none, emit a soft note (the
+    // hook is best-effort — don't fail loudly because the agent is
+    // editing while no server is up).
+    let previewUrl = process.env.PREVIEW_URL;
+    if (!previewUrl) {
+      try {
+        const probed = await probeRunningDevServer(cwd);
+        if (probed) previewUrl = probed.url;
+      } catch { /* swallow */ }
+    }
+    if (!previewUrl) {
+      process.stdout.write(
+        `🛟 pinned: ${affectedPinFiles.length} guard(s) cover the route(s) you just edited, but no dev server is running on localhost. Start your dev server (npm run dev) so Pinned can verify the next edit automatically.\n`
+      );
+      return;
+    }
+
+    // Run the affected pins against the dev server.
+    try {
+      const { execFileSync } = await import("node:child_process");
+      const startedAt = Date.now();
+      let result: string;
+      try {
+        result = execFileSync(
+          "npx",
+          ["--no-install", "vitest", "run", ...affectedPinFiles, "--reporter=basic"],
+          {
+            cwd,
+            env: { ...process.env, PREVIEW_URL: previewUrl },
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: opts.timeout,
+            maxBuffer: 4 * 1024 * 1024,
+          }
+        );
+      } catch (e) {
+        result = ((e as { stdout?: string; stderr?: string }).stdout ?? "")
+          + ((e as { stdout?: string; stderr?: string }).stderr ?? "");
+      }
+      const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+      // Extract failure summaries from vitest's basic reporter output.
+      const failed = (result.match(/^❯\s+.*$/gm) ?? []).map((l) => l.trim()).filter((l) => /\.test\.ts$/.test(l));
+      const passSummary = /Tests\s+(\d+)\s+passed/.exec(result);
+      const failSummary = /Tests\s+(\d+)\s+failed/.exec(result);
+      const failures = failSummary ? parseInt(failSummary[1], 10) : 0;
+      const passes = passSummary ? parseInt(passSummary[1], 10) : 0;
+
+      if (failures > 0) {
+        // Inject a Pinned-prefixed message the agent will see in its
+        // next turn. Keep it COMPACT — agents have limited context.
+        process.stdout.write(
+          `🛟 pinned: ${failures} guard${failures === 1 ? "" : "s"} FAILED after your edit to ${Array.from(affectedRoutes).join(", ")}. ` +
+          `Pinned ran the affected pin(s) against ${previewUrl} (attached to your dev server) — your change broke a protected contract.\n\n` +
+          `Failing pin(s):\n` +
+          failed.slice(0, 3).map((l) => `  • ${l}`).join("\n") +
+          (failed.length > 3 ? `\n  • …and ${failed.length - 3} more\n` : "\n") +
+          `\nRun \`pinned test\` to see the full repair prompt(s). Fix the broken contract OR retire the pin if the change is intentional. Do not weaken/skip the pin's assertions.\n`
+        );
+      } else if (passes > 0) {
+        // Brief positive confirmation. Agents that report this in their
+        // final answer give the user visible reassurance.
+        process.stdout.write(
+          `🛟 pinned: ✓ ${passes} guard(s) for ${Array.from(affectedRoutes).join(", ")} still pass after your edit (verified in ${elapsedSec}s against ${previewUrl}).\n`
+        );
+      }
+    } catch (e) {
+      // Hook MUST NEVER crash the agent. Swallow + emit nothing.
+      void e;
+    }
+  });
+
+// Installer for the PostToolUse hook. Per the consent ladder this is
+// an L1 step — explicit yes, show-and-confirm the exact diff, marker-
+// bounded so uninstall is clean. Per-project default; --global behind
+// its own confirmation (writes to ~/.claude/settings.json).
+program
+  .command("install-claude-hook")
+  .description(
+    "Register the Pinned PostToolUse hook in Claude Code's settings.json. After Claude edits a file, Pinned auto-verifies the affected pins against your running dev server and injects the result into Claude's next turn. Shows the exact change before writing; per-project by default."
+  )
+  .option("--global", "Install into ~/.claude/settings.json instead of <project>/.claude/settings.json.")
+  .option("--yes", "Skip the confirmation prompt (use in scripts).")
+  .option("--dry-run", "Show what would change without writing.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (opts: { global?: boolean; yes?: boolean; dryRun?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const targetDir = opts.global
+      ? join(process.env.HOME ?? "", ".claude")
+      : join(process.cwd(), ".claude");
+    const settingsFile = join(targetDir, "settings.json");
+
+    type ClaudeHook = { matcher?: string; hooks?: Array<{ type: string; command: string }> };
+    type ClaudeSettings = {
+      hooks?: { PostToolUse?: ClaudeHook[] };
+    } & Record<string, unknown>;
+
+    let existing: ClaudeSettings = {};
+    if (existsSync(settingsFile)) {
+      try { existing = JSON.parse(readFileSync(settingsFile, "utf8")) as ClaudeSettings; } catch {
+        err(`✗ Failed to parse ${settingsFile}.\n  Fix or delete the file, then retry.\n`);
+        process.exit(1);
+      }
+    }
+
+    // Build the desired hook entry. Marker-bounded by the command
+    // string itself ("pinned hook-postedit") so `pinned uninstall` can
+    // remove EXACTLY our entry without touching the user's other hooks.
+    const PINNED_HOOK_CMD = "npx --no-install pinnedai hook-postedit";
+    // Compose-safe addition: if an existing PostToolUse array exists,
+    // preserve its entries; only add ours if not already present.
+    const desired = JSON.parse(JSON.stringify(existing)) as ClaudeSettings;
+    desired.hooks = desired.hooks ?? {};
+    const existingArr = desired.hooks.PostToolUse ?? [];
+    // Match on Edit|Write|MultiEdit — those are Claude's file-mutating tools.
+    const pinnedEntry: ClaudeHook = {
+      matcher: "Edit|Write|MultiEdit",
+      hooks: [{ type: "command", command: PINNED_HOOK_CMD }],
+    };
+    // Is Pinned's hook already present?
+    const alreadyPresent = existingArr.some((h) =>
+      (h.hooks ?? []).some((step) =>
+        typeof step.command === "string" && step.command.includes("pinned hook-postedit")
+      )
+    );
+    if (alreadyPresent) {
+      out(`✓ Pinned PostToolUse hook is already installed in ${relative(process.cwd(), settingsFile)}.`);
+      out(`  Nothing to do.`);
+      return;
+    }
+    desired.hooks.PostToolUse = [...existingArr, pinnedEntry];
+
+    const beforeJson = JSON.stringify(existing, null, 2);
+    const afterJson = JSON.stringify(desired, null, 2);
+
+    out("");
+    out(`◆ Pinned PostToolUse hook — proposed change to ${relative(process.cwd(), settingsFile)}:`);
+    out("");
+    if (opts.global) {
+      out("⚠️  --global: writing to YOUR SHELL'S global Claude settings (~/.claude/settings.json).");
+      out("   This affects EVERY project Claude Code opens, not just this one.");
+      out("");
+    }
+    out("─── before ────────────────────────────────────────────────");
+    for (const line of beforeJson.split("\n").slice(0, 25)) out(`  ${line}`);
+    if (beforeJson.split("\n").length > 25) out(`  …(truncated)`);
+    out("");
+    out("─── after ─────────────────────────────────────────────────");
+    for (const line of afterJson.split("\n").slice(0, 35)) out(`  ${line}`);
+    if (afterJson.split("\n").length > 35) out(`  …(truncated)`);
+    out("");
+    out("What this does:");
+    out("  • Claude calls `pinned hook-postedit` after every file edit");
+    out("    (Edit / Write / MultiEdit).");
+    out("  • Pinned identifies the route(s) affected by the edit.");
+    out("  • Looks for pins covering those routes.");
+    out("  • If a dev server is running on localhost, runs those pins");
+    out("    against it; if not, silent no-op (never adds latency).");
+    out("  • Writes a short result to stdout — Claude reads it and");
+    out("    surfaces it in its next turn.");
+    out("");
+    out("Safety:");
+    out("  • Never auto-starts your app. Probe-only.");
+    out("  • Never edits source files. Read-only verification.");
+    out("  • Marker-bounded — `pinned uninstall` removes exactly our");
+    out("    entry, leaving any other PostToolUse hooks untouched.");
+    out("");
+
+    if (opts.dryRun) {
+      out("(--dry-run: no files modified.)");
+      return;
+    }
+
+    if (!opts.yes) {
+      process.stdout.write("Install this hook? [y/N] ");
+      const answer = await new Promise<string>((resolve) => {
+        let buf = "";
+        process.stdin.setEncoding("utf8");
+        process.stdin.resume();
+        const onData = (chunk: string) => {
+          buf += chunk;
+          if (buf.includes("\n")) {
+            process.stdin.removeListener("data", onData);
+            process.stdin.pause();
+            resolve(buf.trim().toLowerCase());
+          }
+        };
+        process.stdin.on("data", onData);
+      });
+      if (answer !== "y" && answer !== "yes") {
+        out("");
+        out("Aborted. Nothing was written.");
+        return;
+      }
+    }
+
+    try {
+      mkdirSync(targetDir, { recursive: true });
+      // Backup the original (if any) before overwrite.
+      if (existsSync(settingsFile)) {
+        try {
+          writeFileSync(settingsFile + ".pinned-backup", beforeJson);
+        } catch { /* non-fatal */ }
+      }
+      writeFileSync(settingsFile, afterJson + "\n");
+      out("");
+      out(`✓ Installed Pinned PostToolUse hook to ${relative(process.cwd(), settingsFile)}.`);
+      if (existsSync(settingsFile + ".pinned-backup")) {
+        out(`  Backup of previous settings: ${relative(process.cwd(), settingsFile + ".pinned-backup")}`);
+      }
+      out("");
+      out("Next steps:");
+      out("  • Start your dev server (npm run dev). Pinned will attach automatically.");
+      out("  • Restart Claude Code so it picks up the new hook config.");
+      out("  • Edit a file Claude pinned. The hook fires automatically.");
+      out("  • Remove anytime: `pinned uninstall` (project) or `pinned uninstall --global`.");
+    } catch (e) {
+      err(`✗ Failed to write ${settingsFile}: ${(e as Error).message}\n`);
+      process.exit(1);
+    }
+  });
+
+// Sibling-path audit using learned patterns. Renamed from `audit` to
+// `audit-learned` in 0.2.12 to free `audit` for the headline retro-scan
+// command. Same flags, same behavior; existing scripts referencing
+// `pinned audit --learned` should switch to `pinned audit-learned`.
+program
+  .command("audit-learned")
+  .description("Audit the repo for sibling code paths that may share a learned mistake pattern (formerly `pinned audit --learned`).")
+  .option("--learned", "(no-op; preserved for backwards compatibility — this command always runs the learned-pattern audit)")
   .option("--category <cat>", "Only audit one category: auth | validation")
   .option("--verbose", "Show low-confidence findings too.")
   .option("--json", "Emit machine-readable JSON.")
   .action(async (opts: { learned?: boolean; category?: string; verbose?: boolean; json?: boolean }) => {
-    if (!opts.learned) {
-      err("audit currently supports --learned only. Run: pinned audit --learned");
-      process.exit(1);
-    }
+    // `--learned` is now implicit (the command is named for it); flag
+    // kept as no-op so existing scripts keep working when migrated.
+    void opts.learned;
     const cwd = process.cwd();
     const { findUnprotectedSiblings, AUTH_CHECK_PATTERNS } = await import("./scanDiff.js");
     const { readLessons } = await import("./aiLessons.js");
@@ -7922,10 +9242,65 @@ program
     );
     writeRegistry(opts.dir, registry);
 
+    // M3 (0.2.12+): refresh the status cache so hooks/statusline
+    // immediately reflect the retire. Pre-0.2.12, the cached
+    // catchHistory / breaksCaught / failingClaimIds still listed the
+    // retired pin, so the UserPromptSubmit hook kept reporting it as
+    // a live catch ("this would have shipped..."). Trust-damaging on
+    // every retire of a false-positive pin.
+    //
+    // Three cleanups:
+    //   1. failingClaimIds: remove if present (the pin can't fail
+    //      again — it's retired).
+    //   2. catchHistory: strip records for this claimId (lifetime
+    //      ledger should only contain real catches; if you retired
+    //      the pin because it was a false positive, its "catch"
+    //      doesn't deserve a place in the ledger).
+    //   3. caughtClaimIds: remove from the unique-set so breaksCaught
+    //      (derived from set.size in 0.2.8+) decrements accordingly.
+    //   4. Re-render CATCHES.md from the cleaned history.
+    try {
+      const prev = readLastStatus(opts.dir);
+      if (prev) {
+        const failingClaimIds = (prev.failingClaimIds ?? []).filter((id) => id !== claimId);
+        const catchHistory = (prev.catchHistory ?? []).filter((r) => r.claimId !== claimId);
+        const caughtClaimIds = (prev.caughtClaimIds ?? Array.from(new Set((prev.catchHistory ?? []).map((r) => r.claimId)))).filter((id) => id !== claimId);
+        const totalPinsAfter = countActivePins(registry);
+        const skippedCount = Math.min(prev.skippedCount ?? 0, totalPinsAfter);
+        writeLastStatus(opts.dir, {
+          ...prev,
+          failingCount: failingClaimIds.length,
+          failingClaimIds,
+          totalPins: totalPinsAfter,
+          // status flips green if the retire eliminated the only failing pin.
+          status: failingClaimIds.length === 0 ? "green" : prev.status,
+          catchHistory,
+          caughtClaimIds,
+          breaksCaught: caughtClaimIds.length,
+          skippedCount,
+          updatedAt: new Date().toISOString(),
+        });
+        // Re-render CATCHES.md so the lifetime ledger reflects the
+        // cleaned history.
+        const catchesPath = join(opts.dir, "CATCHES.md");
+        try {
+          const catchesMd = renderCatchesMarkdown({ catchHistory, breaksCaught: caughtClaimIds.length });
+          writeFileSync(catchesPath, catchesMd);
+        } catch { /* best-effort */ }
+      }
+    } catch (e) {
+      // Cache refresh failure is non-fatal — the pin IS retired, the
+      // registry IS updated. The cache will self-correct on the next
+      // `pinned test` run. But surface a hint so the user knows the
+      // hook might briefly lie until then.
+      err(`  ! status cache refresh failed (will recover on next \`pinned test\`): ${(e as Error).message}\n`);
+    }
+
     out(`- ${relative(process.cwd(), src)}`);
     out(`+ ${relative(process.cwd(), dest)}`);
     out(`+ ${relative(process.cwd(), join(retiredDir, `${claimId}.audit.json`))}`);
     out(`~ ${relative(process.cwd(), join(opts.dir, "PINS.md"))}`);
+    out(`~ ${relative(process.cwd(), join(opts.dir, ".last-status.json"))} (catch history + counts refreshed)`);
     out("");
     out("Commit the move so the audit trail is preserved in git history.");
   });

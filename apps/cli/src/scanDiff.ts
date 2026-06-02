@@ -696,10 +696,57 @@ export const AUTH_CHECK_PATTERNS: RegExp[] = [
   // 1c4c2df both did this kind of fix). The path identifier can be
   // url.pathname, nextUrl.pathname, a destructured `path` local, or
   // a plain pathname variable.
+  //
+  // 0.2.11+: tagged WEAK in detectAuthChecksInDiff via WEAK_AUTH_PATTERNS
+  // below. A `pathname.startsWith("/admin")` alone doesn't prove the
+  // middleware GATES on it — it might just be allow-listing the path
+  // through (socialideagen's middleware.ts shape: routing, not auth).
+  // The detector now requires a co-occurring CONFIRMER (401/403/redirect-
+  // to-login/session-read) in the same file before treating these as
+  // auth signals.
   /\b(?:path|pathname|url\.pathname|nextUrl\.pathname|request\.nextUrl\.pathname)\.startsWith\s*\(\s*['"]\/(?:admin|account|api\/admin|api\/account|dashboard|internal)/i,
   /\b(?:path|pathname|url\.pathname|nextUrl\.pathname)\s*===?\s*['"]\/(?:admin|account|api\/admin|api\/account|dashboard|internal)/i,
   // Common explicit pattern: throwing on missing token / session
   /\bif\s*\(\s*!\s*(?:token|session|user|auth|userId|sessionId)\s*\)\s*[\{\(].*?(?:throw|return|res\.status\s*\(\s*40[13])/,
+];
+
+// Subset of AUTH_CHECK_PATTERNS that, when matched ALONE, doesn't
+// prove the file does auth gating — only routing. Used by
+// detectAuthChecksInDiff to require a CONFIRMER pattern in the same
+// file before emitting an auth-required hit. Hard-learned via
+// socialideagen 2026-06-02: middleware.ts did `pathname.startsWith
+// ("/admin")` to allow-list /admin through (return NextResponse.next),
+// NOT to gate it. Pre-0.2.11 we emitted an auth-required pin for it;
+// the pin then false-failed on every legitimate middleware refactor.
+const WEAK_AUTH_PATTERNS: RegExp[] = [
+  /\b(?:path|pathname|url\.pathname|nextUrl\.pathname|request\.nextUrl\.pathname)\.startsWith\s*\(\s*['"]\/(?:admin|account|api\/admin|api\/account|dashboard|internal)/i,
+  /\b(?:path|pathname|url\.pathname|nextUrl\.pathname)\s*===?\s*['"]\/(?:admin|account|api\/admin|api\/account|dashboard|internal)/i,
+];
+
+// Confirmer signals — when a WEAK match also has one of these in the
+// same file, the path-startsWith is gating (real auth), not routing.
+// Order: real status returns / redirects / session reads / not-found
+// throws / explicit 4xx response shapes.
+const AUTH_CONFIRMER_PATTERNS: RegExp[] = [
+  // status 401 / 403 returns (covers NextResponse, plain Response,
+  // express res.status, fastify reply.code, hono c.status).
+  /\b(?:status|code)\s*\(\s*40[13]\b/,
+  /\bnew\s+Response\s*\([^)]*?,\s*\{[^}]*?status\s*:\s*40[13]\b/,
+  /\bNextResponse\.json\s*\([^)]+?,\s*\{[^}]*?status\s*:\s*40[13]\b/,
+  /\bResponse\.json\s*\([^)]+?,\s*\{[^}]*?status\s*:\s*40[13]\b/,
+  // Throwing unauth/forbidden errors (express middleware idiom).
+  /\bthrow\s+new\s+\w*?(?:Unauthorized|Forbidden|UnauthenticatedError)\b/i,
+  // Redirect to login / signin / auth path — common gate pattern.
+  /\b(?:redirect|NextResponse\.redirect)\s*\(\s*[`'"][^`'"]*?\/(?:login|signin|sign-in|auth\b)/i,
+  // Session / cookie / token reads inside the same file — strong
+  // evidence the path check is paired with credential validation.
+  /\b(?:cookies|getServerSession|getSession|getUser|getToken|currentUser)\s*\(/,
+  /\bheaders\s*\(\s*\)\s*\.\s*get\s*\(\s*['"](?:authorization|cookie)\b/i,
+  /\b(?:req|request)\s*\.\s*headers\s*[\[\.]?\s*['"]?(?:authorization|cookie)\b/i,
+  // Explicit "if (!token/session/user) → return/throw" — the strong
+  // pattern in AUTH_CHECK_PATTERNS (already included there but kept
+  // here for completeness as a confirmer).
+  /\bif\s*\(\s*!\s*(?:token|session|user|auth|userId|sessionId)\b/,
 ];
 
 export type DiffByFile = Map<string, string[]>;
@@ -1620,10 +1667,11 @@ export function detectAuthChecksInDiff(diffByFile: DiffByFile): DiffAuthCheckHit
       .join("\n");
     if (added.length === 0) continue;
 
-    let firstHit: { signature: string } | null = null;
+    let firstHit: { signature: string; isWeak: boolean } | null = null;
     for (const re of AUTH_CHECK_PATTERNS) {
       const m = re.exec(added);
       if (m) {
+        const isWeak = WEAK_AUTH_PATTERNS.some((wre) => wre.source === re.source && wre.flags === re.flags);
         // Capture the FULL added line containing the match instead of
         // just the matched substring. Full-line signatures are
         // dramatically less collision-prone than bare matches like
@@ -1632,11 +1680,22 @@ export function detectAuthChecksInDiff(diffByFile: DiffByFile): DiffAuthCheckHit
         // appeared in the parent file (false-pass at parent, no
         // catch). Trim before storing so whitespace drift on the
         // file side doesn't break the includes() check downstream.
-        firstHit = { signature: extractFullLineFromMatch(added, m.index, m[0]) };
+        firstHit = { signature: extractFullLineFromMatch(added, m.index, m[0]), isWeak };
         break;
       }
     }
     if (!firstHit) continue;
+    // 0.2.11+ FP guard: a WEAK pattern alone (e.g. `pathname.startsWith
+    // ("/admin")`) doesn't prove the file gates on the path — it might
+    // just be allow-listing it through. Require a CONFIRMER pattern in
+    // the same file (401/403 return, redirect to login, session/cookie
+    // read, etc.) before treating the weak match as an auth signal.
+    // Without this, socialideagen's routing middleware got an auth pin
+    // that then false-failed on every legitimate refactor.
+    if (firstHit.isWeak) {
+      const hasConfirmer = AUTH_CONFIRMER_PATTERNS.some((re) => re.test(added));
+      if (!hasConfirmer) continue;
+    }
 
     const key = route;
     if (seenRoutes.has(key)) continue;
@@ -4458,7 +4517,7 @@ const RULES: RiskRule[] = [
 
 // Derive a likely API route from a changed file path. Used to check
 // which existing pins guard the touched code (pin coverage).
-function deriveRouteFromPath(path: string): string | null {
+export function deriveRouteFromPath(path: string): string | null {
   // Use (?:^|/) instead of ^ so monorepo paths like
   // `apps/api/src/routes/contact.ts` are also recognized. The
   // separate detectReturnsStatusPins filter already used this form;
@@ -5118,6 +5177,13 @@ export type DiffHostConditionalHit = {
   route: string | null;
   hostExpression: string;
   evidence: string;
+  // 0.2.12+: name of the exported function in the same file that
+  // CONTAINS the host-read. Used by the family-sweep to scope
+  // "consumers of this export" → propose family guards for routes
+  // that import this specific function (not unrelated exports from
+  // the same module). Null when the file isn't a module or the
+  // detector couldn't pair the read with an export.
+  affectedExport?: string;
 };
 
 // Match expressions that read a host-like REQUEST header. Each pattern
@@ -5237,13 +5303,207 @@ export function detectHostConditionalInDiff(diffByFile: DiffByFile): DiffHostCon
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
 
+    // 0.2.12+: identify which exported function in this file actually
+    // contains the host-read. Scan backwards from the matched line to
+    // the nearest `export function NAME` or `export const NAME = `
+    // declaration. The family-sweep uses this so it only proposes
+    // guards for routes that import THIS function (not unrelated
+    // exports from the same module like getOrigin which doesn't gate).
+    let affectedExport: string | undefined;
+    const matchedLineIdx = addedLines.findIndex((l) => l.includes(matched.line.slice(0, 60)));
+    if (matchedLineIdx >= 0) {
+      for (let i = matchedLineIdx; i >= 0; i--) {
+        const line = addedLines[i];
+        const fn = /^\s*export\s+(?:async\s+)?(?:function|const|let|var)\s+([a-zA-Z_$][\w$]*)/.exec(line);
+        if (fn) {
+          affectedExport = fn[1];
+          break;
+        }
+      }
+    }
+
     out.push({
       template: "host-conditional",
       filePath,
       route,
       hostExpression: matched.line.slice(0, 200),
+      ...(affectedExport ? { affectedExport } : {}),
       evidence: `Handler reads host/referer (${matched.label}) + gates behavior on \`${matched.lhsVar}\`. Pinned probes against PREVIEW_URL (not prod), so the gate likely fires and the handler takes its fallback branch — any pin asserting the side-effect will false-fail.`,
     });
   }
   return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Import/usage graph for pattern-driven family sweep (0.2.12+)
+// ────────────────────────────────────────────────────────────
+//
+// Per [[pattern-driven-family-sweep]]: when a detector fires on a
+// "root" file (e.g. lib/host.ts contains a host-conditional read), the
+// REAL blast radius is every route handler that IMPORTS the affected
+// function from that root. The family-resolver needs an import graph
+// to enumerate consumers.
+//
+// We build a single graph keyed on a NORMALIZED module specifier so
+// path aliases (`@/lib/host`), relative paths (`../../lib/host`), and
+// bare paths (`lib/host`) all match the same root file. The
+// normalization rule: strip leading prefixes (`@/`, `./`, `../`), strip
+// any extension, return the last two path segments. So `@/lib/host`,
+// `../../src/lib/host.ts`, `lib/host.ts` all normalize to `lib/host`.
+//
+// File path normalization (for the detector's filePath) uses the same
+// rule on the relative path → so a hit on `lib/host.ts` produces key
+// `lib/host`, matching every importer's normalized spec.
+
+export type ImportSite = {
+  // Repo-relative path of the file doing the import.
+  importer: string;
+  // Name as it's bound locally (after `as` rename if any).
+  localName: string;
+  // Original exported name from the source module.
+  exportedName: string;
+  // The raw import specifier as it appeared in the source.
+  rawSpec: string;
+};
+
+// Map<normalized-module-key, ImportSite[]>. Multiple files importing
+// the same module aggregate into one array.
+export type ImportGraph = Map<string, ImportSite[]>;
+
+function normalizeModuleSpec(spec: string): string {
+  // Strip leading prefixes.
+  let s = spec.trim().replace(/^@\//, "").replace(/^\.\.?\//, "");
+  // Walk up any remaining ../
+  while (s.startsWith("../")) s = s.slice(3);
+  while (s.startsWith("./")) s = s.slice(2);
+  // Strip extension.
+  s = s.replace(/\.(?:ts|tsx|js|jsx|mjs|cjs)$/, "");
+  // Strip leading "src/" since alias usage often elides it.
+  s = s.replace(/^src\//, "");
+  return s;
+}
+
+function normalizeFilePathToModuleKey(filePath: string): string {
+  return normalizeModuleSpec(filePath);
+}
+
+export function buildImportGraph(filesByPath: Map<string, string>): ImportGraph {
+  const graph: ImportGraph = new Map();
+  // Two import patterns we care about:
+  //   1. Named: `import { a, b as c } from "<spec>"`
+  //   2. Default: `import X from "<spec>"`
+  // We skip type-only imports (they don't reflect runtime usage) +
+  // namespace imports (`import * as X`) — both can extend later.
+  const NAMED_IMPORT_RE = /import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+["']([^"']+)["']/g;
+  const DEFAULT_IMPORT_RE = /import\s+([a-zA-Z_$][\w$]*)\s+from\s+["']([^"']+)["']/g;
+
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    // Strip comments to avoid `// import { foo } from "bar"` false matches.
+    const stripped = content
+      .replace(/\/\/.*$/gm, "")
+      .replace(/\/\*[\s\S]*?\*\//g, "");
+
+    // Named imports.
+    for (const m of stripped.matchAll(NAMED_IMPORT_RE)) {
+      // Skip type-only — the keyword is captured by the `(?:type\s+)?`
+      // group but we re-check the original substring since some
+      // toolchains write `import {type Foo}` inline. Conservative.
+      if (/\btype\s+/.test(m[0])) {
+        // If the WHOLE import is type-only, skip; but `import { type A, B }`
+        // (mixed) keeps the non-type ones. For now we drop the whole match —
+        // the worst case is missing some legitimate value imports, which is
+        // acceptable for FP precision.
+        continue;
+      }
+      const rawSpec = m[2];
+      const key = normalizeModuleSpec(rawSpec);
+      const list = graph.get(key) ?? [];
+      for (const rawName of m[1].split(",")) {
+        const piece = rawName.trim();
+        if (!piece) continue;
+        // `foo as bar` syntax.
+        const asMatch = /^([a-zA-Z_$][\w$]*)\s+as\s+([a-zA-Z_$][\w$]*)$/.exec(piece);
+        const exportedName = asMatch ? asMatch[1] : piece;
+        const localName = asMatch ? asMatch[2] : piece;
+        // Skip "type X" prefixes inside the braces.
+        if (/^type\s+/.test(exportedName)) continue;
+        list.push({ importer: filePath, localName, exportedName, rawSpec });
+      }
+      graph.set(key, list);
+    }
+
+    // Default imports (less common for utility modules, but handle them).
+    for (const m of stripped.matchAll(DEFAULT_IMPORT_RE)) {
+      if (/\btype\s+/.test(m[0])) continue;
+      const localName = m[1];
+      const rawSpec = m[2];
+      const key = normalizeModuleSpec(rawSpec);
+      const list = graph.get(key) ?? [];
+      list.push({ importer: filePath, localName, exportedName: "default", rawSpec });
+      graph.set(key, list);
+    }
+  }
+
+  return graph;
+}
+
+// Given a root file (where a pattern detector fired) and an export
+// name from that file (the function/identifier responsible for the
+// flagged behavior), return all importing files. Caller can then
+// cross-reference with deriveRouteFromPath to find route handlers.
+export function findFamilyMembers(
+  rootFile: string,
+  exportedName: string,
+  graph: ImportGraph
+): ImportSite[] {
+  const key = normalizeFilePathToModuleKey(rootFile);
+  const importers = graph.get(key) ?? [];
+  return importers.filter((s) => s.exportedName === exportedName);
+}
+
+// Convenience: find all importers of ANY export from a root file.
+// Used when a detector fires on the file as a whole (host-conditional)
+// rather than on a specific exported function — we then enumerate
+// every route that touches that file at all.
+export function findAllImportersOfFile(
+  rootFile: string,
+  graph: ImportGraph
+): ImportSite[] {
+  const key = normalizeFilePathToModuleKey(rootFile);
+  return graph.get(key) ?? [];
+}
+
+// Extract names exported from a TypeScript/JavaScript file. Used to
+// pair detector matches against specific exports (e.g. host-conditional
+// fires on a file → which exported function actually does the
+// host-reading? → use the function's name as the family key).
+//
+// Conservative: matches the most common export shapes
+// (named function/const/let/var exports, export-from re-exports).
+// Misses: `module.exports = { ... }` CommonJS, dynamic exports,
+// computed names. Both are rare in modern TS/Next.js code.
+export function extractExportedNames(content: string): string[] {
+  const stripped = content
+    .replace(/\/\/.*$/gm, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  const out = new Set<string>();
+  // `export function name(...)` / `export async function name(...)` /
+  // `export const name = ...` / `export let name = ...` / `export class name`
+  const named = /export\s+(?:async\s+)?(?:function|const|let|var|class|type|interface)\s+([a-zA-Z_$][\w$]*)/g;
+  for (const m of stripped.matchAll(named)) out.add(m[1]);
+  // `export { a, b as c }` re-exports + direct named re-exports.
+  const reexport = /export\s+\{([^}]+)\}/g;
+  for (const m of stripped.matchAll(reexport)) {
+    for (const piece of m[1].split(",")) {
+      const trimmed = piece.trim();
+      if (!trimmed) continue;
+      const asMatch = /\s+as\s+([a-zA-Z_$][\w$]*)$/.exec(trimmed);
+      const name = asMatch ? asMatch[1] : trimmed.replace(/^type\s+/, "");
+      if (/^[a-zA-Z_$][\w$]*$/.test(name)) out.add(name);
+    }
+  }
+  // `export default function name` / `export default <expr>` — these are
+  // hard to name without parsing; skip for now.
+  return Array.from(out);
 }

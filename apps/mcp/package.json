@@ -1,6 +1,6 @@
 {
   "name": "pinnedai-mcp",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "MCP server for Pinned — lets Claude Desktop, Cursor, Cline, and any MCP-aware AI tool call Pinned at the right lifecycle moments. Exposes pinned_before_code_change, pinned_before_done_check, pinned_scan_diff, pinned_list_guards, pinned_check_pr_description, pinned_suggest_init with structured responses agents must report in their final answer.",
   "type": "module",
   "license": "Apache-2.0",
@@ -45,7 +45,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "pinnedai": "^0.1.0",
+    "pinnedai": "^0.2.13",
     "zod": "^3.25.0"
   },
   "devDependencies": {

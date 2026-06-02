@@ -227,6 +227,19 @@ describe("pinned: returns-status " + METHOD + " " + ROUTE + " → " + EXPECTED_S
       const contentN = normalizeForSig(content);
       const sigN = normalizeForSig(sv.signature);
       if (!contentN.includes(sigN)) {
+        // 0.2.11+: soften when live HTTP check available — same
+        // pattern as auth-required. Live status check is the real
+        // verification of the validation contract.
+        if (process.env.PREVIEW_URL) {
+          console.warn(
+            "[pinned] returns-status " + METHOD + " " + ROUTE + ": captured signature no longer in source " +
+            "(\\"" + sv.signature.slice(0, 80) + "\\" in " + sv.filePath + "). " +
+            "Not failing because PREVIEW_URL is set and the live HTTP check " +
+            "(returns " + EXPECTED_STATUS + " on " + CONDITION + ") is the authoritative verification."
+          );
+          expect(true).toBe(true);
+          return;
+        }
         throw new Error(
           [
             "",
@@ -242,6 +255,10 @@ describe("pinned: returns-status " + METHOD + " " + ROUTE + " → " + EXPECTED_S
             "The validation that protects " + ROUTE + " was removed or",
             "rewritten. The original fix introduced the snippet above; it's",
             "no longer present in the file.",
+            "",
+            "If this was an intentional refactor that preserves the status",
+            "contract, set PREVIEW_URL so the live HTTP check becomes the",
+            "verification; the static check will then warn-only.",
             "═══════════════════════════════════════════════════════════════",
             "",
           ].join("\\n")
