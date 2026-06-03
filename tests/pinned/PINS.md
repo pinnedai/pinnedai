@@ -65,6 +65,7 @@ Auto-maintained by [pinnedai](https://pinnedai.dev). Each row is a permanent CI 
 | `cli node ./apps/cli/dist/cli.js sweep --help` (exits 0) | [auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-sweep-help-84d0gc.test.ts](auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-sweep-help-84d0gc.test.ts) | `auto-20260603` | [@michaelzon](https://github.com/michaelzon) | 2026-06-03 |
 | `cli node ./apps/cli/dist/cli.js add-browser --help` (exits 0) | [auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-add-browser-help-1e77ol.test.ts](auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-add-browser-help-1e77ol.test.ts) | `auto-20260603` | [@michaelzon](https://github.com/michaelzon) | 2026-06-03 |
 | `cli node ./apps/cli/dist/cli.js record-interaction --help` (exits 0) | [auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-record-interaction-help-16e6mc.test.ts](auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-record-interaction-help-16e6mc.test.ts) | `auto-20260603` | [@michaelzon](https://github.com/michaelzon) | 2026-06-03 |
+| `cli node ./apps/cli/dist/cli.js record-server-action --help` (exits 0) | [auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-record-server-action-help-1dfx6p.test.ts](auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-record-server-action-help-1dfx6p.test.ts) | `auto-20260603` | [@michaelzon](https://github.com/michaelzon) | 2026-06-03 |
 
 ## Retired
 

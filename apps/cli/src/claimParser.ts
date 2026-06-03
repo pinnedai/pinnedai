@@ -282,6 +282,13 @@ export function classifyPinStrength(
       // browser-reachable PREVIEW_URL. Marked behavioral when reachable
       // (the interaction IS a real behavior); unverified otherwise.
       return httpVerifiable ? "behavioral" : "unverified";
+    case "server-action-write":
+      // 0.2.18+ direct-invoke Server Action verifier. Imports the
+      // action module + calls the export with a fixture. No PREVIEW_URL
+      // needed — it runs against the customer's code in-process —
+      // but does need a fixture (recorded via `pinned record-
+      // server-action`) and any env the action depends on.
+      return "behavioral";
   }
 }
 
@@ -692,6 +699,51 @@ export type InteractionBaselineClaim = {
   raw: string;
 };
 
+// 0.2.18+: Server Action write pin. Closes the App-Router mutation
+// blind spot — Next.js Server Actions are exported async functions
+// with a "use server" directive that perform writes (DB inserts /
+// upserts / outbound POSTs / etc) without a stable HTTP URL. The pin
+// imports the action directly + calls it with a fixture payload +
+// asserts the success shape.
+//
+// Pin shape: imports the named export from `actionModule` (relative
+// to repo root), calls it with `fixturePayload` (JSON-encoded by the
+// recorder), asserts the result matches `successShape` (default
+// `{ ok: true }`). Fails if the action throws, returns a falsy `ok`,
+// or returns a different shape than the recorded baseline.
+//
+// Until `pinned record-server-action` is run, the test is `.skip`'d
+// with a clear "no fixture recorded yet" message — same auth-gated
+// posture as interaction-baseline's "no baseline recorded yet" mode.
+export type ServerActionWriteClaim = {
+  template: "server-action-write";
+  // Path to the module exporting the action, relative to repo root.
+  // The emitted test resolves this to a relative import.
+  actionModule: string;
+  // The named export to call (e.g. "saveIdea").
+  exportName: string;
+  // Captured by the detector for explainability — what write the
+  // action performs (informational; doesn't change the test logic).
+  writeTarget: string;
+  writeLibrary: string;
+  writeKind: "db-insert" | "db-update" | "db-upsert" | "db-delete" | "email" | "queue" | "http-post" | "file-upload" | "unknown";
+  // Optional fixture payload — JSON object that, when passed as
+  // `input`, makes the action succeed. Recorded via
+  // `pinned record-server-action --fixture <path>`. When absent, the
+  // emitted test skips with a clear "run record" message.
+  fixturePayload?: unknown;
+  // Optional success-shape assertion. Defaults to `{ ok: true }` when
+  // absent — matches the conventional Server Action return shape.
+  // Recorder can extend this to assert specific fields (e.g. slug).
+  successShape?: Record<string, unknown>;
+  // Optional auth-gate name (informational, used in the test header
+  // comment so the reader knows the action is auth-gated).
+  authGate?: string;
+  // Optional schema name (informational).
+  schemaName?: string;
+  raw: string;
+};
+
 export type Claim =
   | RateLimitClaim
   | AuthRequiredClaim
@@ -721,7 +773,8 @@ export type Claim =
   | ValidationRejectsBadClaim
   | HappyPathWithSideEffectClaim
   | JourneyClaim
-  | InteractionBaselineClaim;
+  | InteractionBaselineClaim
+  | ServerActionWriteClaim;
 
 // A route token: must start with ASCII `/`, must not contain whitespace,
 // trailing punctuation, OR dangerous Unicode characters (RTL-override,
@@ -2145,6 +2198,19 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         promise: `Interaction ${c.action} on \`${c.selector}\` at \`${c.page}\` still produces the same observable effect (${c.observe.kind}) as the recorded baseline.`,
         check: `(BETA, opt-in) Renders ${c.page} via Playwright, performs ${c.action} on ${c.selector}, observes ${c.observe.kind}, compares to baseline. WARN-only on drift; catches tagged confidence:"review" so they don't inflate the GA metric.`,
       };
+    case "server-action-write": {
+      const verb =
+        c.writeKind === "email" ? "sends an email" :
+        c.writeKind === "queue" ? "enqueues a job" :
+        c.writeKind === "http-post" ? "POSTs to an external service" :
+        `${c.writeKind === "db-insert" ? "creates" : c.writeKind === "db-update" ? "updates" : c.writeKind === "db-upsert" ? "upserts" : c.writeKind === "db-delete" ? "deletes" : "writes to"} a ${c.writeTarget} record`;
+      const authNote = c.authGate ? ` (gated by ${c.authGate}())` : "";
+      return {
+        title: `Server Action \`${c.exportName}\`${authNote} ${verb}`,
+        promise: `\`${c.exportName}\` in \`${c.actionModule}\` still ${verb} with a valid payload, instead of silently early-returning, dropping validation, or losing the write path.`,
+        check: `Imports the action directly from \`${c.actionModule}\` + calls \`${c.exportName}(fixture)\` with a recorded payload. Asserts the return shape matches the success baseline (default \`{ ok: true }\`). Catches: removed validation, removed write, return-early on the success path, throw on valid input.`,
+      };
+    }
   }
 }
 
@@ -2278,6 +2344,8 @@ export function badCaseForClaim(claim: Claim): string {
     }
     case "interaction-baseline":
       return `🛟 BETA: interaction "${claim.action} ${claim.selector}" on \`${claim.page}\` no longer produces the same observable effect (${claim.observe.kind}) — the handler may be removed/broken, the selector may have changed, or the page no longer renders this element`;
+    case "server-action-write":
+      return `Server Action \`${claim.exportName}\` in \`${claim.actionModule}\` no longer succeeds with a valid payload — the action may early-return (auth/validation broken), throw on the fixture, or skip its ${claim.writeKind} to ${claim.writeTarget}`;
   }
 }
 
@@ -2366,6 +2434,10 @@ export function claimRoute(c: Claim): string | null {
       return c.steps[0]?.route ?? null;
     case "interaction-baseline":
       return c.page;
+    case "server-action-write":
+      // No HTTP route — Server Actions are RPC-opaque. Surface the
+      // module path so PINS.md groups them by source file.
+      return c.actionModule;
   }
 }
 
@@ -2411,7 +2483,9 @@ export function claimSlug(claim: Claim): string {
                                 ? `journey-${claim.label}-${claim.steps.map((s) => `${s.method}-${s.route}`).join("-")}`
                                 : claim.template === "interaction-baseline"
                                   ? `interaction-${claim.action}-${claim.page}-${claim.selector}`
-                                  : claim.route;
+                                  : claim.template === "server-action-write"
+                                    ? `server-action-${claim.actionModule}-${claim.exportName}`
+                                    : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -2516,6 +2590,8 @@ export function claimKey(c: Claim): string {
     }
     case "interaction-baseline":
       return `interaction-baseline:${c.page}:${c.selector}:${c.action}:${c.observe.kind}`;
+    case "server-action-write":
+      return `server-action-write:${c.actionModule}:${c.exportName}`;
   }
 }
 

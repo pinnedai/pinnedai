@@ -268,6 +268,22 @@ function preflight(claim: Claim, cwd: string): string | null {
       // BETA Playwright install check) handles the "can't actually
       // verify right now" case.
       return null;
+    case "server-action-write": {
+      // Action module must exist on disk for the direct-invoke pin to
+      // be importable. Without the module, vitest will surface a more
+      // confusing "cannot find module" error than this preflight skip.
+      const full = join(cwd, claim.actionModule);
+      if (!existsSync(full)) {
+        return `action module ${claim.actionModule} doesn't exist — pin is saved, will verify once it lands`;
+      }
+      // No fixture recorded yet → the emitted test skips itself with a
+      // clear "run pinned record-server-action" message; treating that
+      // as a preflight skip avoids duplicate noise in `pinned test`.
+      if (!claim.fixturePayload) {
+        return `no fixture recorded yet — run \`pinned record-server-action <claim-id>\` to enable the pin`;
+      }
+      return null;
+    }
   }
 }
 

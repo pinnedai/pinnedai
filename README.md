@@ -165,6 +165,17 @@ npx pinned regenerate --all          # re-emit all pin .test.ts files using the 
 npx pinned retire <claim-id> --reason="..."   # legitimate retirement (writes audit entry)
 ```
 
+### Server-Action pins (Next.js App-Router mutations)
+
+Pin the App-Router mutation pattern that `/api/*` HTTP-route detectors can't see — auth-gated `"use server"` functions that perform DB writes, file uploads, or paid-API calls. Closes the highest-impact coverage gap reported via real-world dogfood.
+
+```bash
+npx pinned sweep                                                     # auto-detects Server Action writes
+npx pinned record-server-action <claim-id> --fixture <payload.json>  # capture valid payload + regenerate test
+```
+
+Detection covers: supabase / prisma / drizzle / kysely / mongoose / raw SQL DB writes; supabase-storage / S3 / R2 / Vercel Blob file uploads; outbound paid-API calls (Anthropic / OpenAI / Gemini / Stripe). Auth-gate function name (`isAdminAuthed`, `requireAuth`, etc.) and zod input-schema name are captured automatically. Until you record a fixture, the pin self-skips with a clear message.
+
 ### Browser interaction pins (🛟 BETA — opt-in)
 
 Cover frontend interaction regressions (the carousel "arrows do nothing" class) by wrapping Playwright. Beta posture: WARN-only on drift, attach-only to a running dev server, catches quarantined as `confidence:"review"` so they don't inflate the GA metric.

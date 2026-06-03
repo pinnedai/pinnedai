@@ -1745,7 +1745,9 @@ export type WriteShape = {
   //   db-insert / db-update / db-upsert / db-delete → happy-path-with-side-effect (sideEffectKind: "db-write")
   //   queue                                          → v0.3 (sideEffectKind: "queue-enqueue")
   //   email                                          → v0.3 (sideEffectKind: "email-send")
-  kind: "db-insert" | "db-update" | "db-upsert" | "db-delete" | "queue" | "email";
+  //   file-upload                                    → 0.2.18 (Supabase Storage / S3 / R2 / Vercel Blob)
+  //   http-post                                      → 0.2.18 (outbound paid-API calls — Anthropic / OpenAI)
+  kind: "db-insert" | "db-update" | "db-upsert" | "db-delete" | "queue" | "email" | "file-upload" | "http-post";
   // Table/model name extracted from the match. For raw-SQL or
   // mongoose calls where the target is the LHS identifier, this is
   // that identifier verbatim.
@@ -1829,6 +1831,41 @@ const WRITE_SHAPE_PATTERNS: Array<{
   { re: /\b(?:queue|jobs?)\s*\.\s*(?:add|enqueue|push|publish)\s*\(/i, kind: "queue", targetGroup: 0, library: "queue" },
   { re: /\b(?:bull|bullmq|bullQueue)\s*\.\s*add\s*\(/i, kind: "queue", targetGroup: 0, library: "bullmq" },
   { re: /\binngest\s*\.\s*send\s*\(/i, kind: "queue", targetGroup: 0, library: "inngest" },
+  // ── file-upload / object storage ──
+  // High-stakes: dropping the auth gate on these = anyone uploads files
+  // to a public bucket on the customer's domain (the socialideagen
+  // uploadMockup case). Target = bucket name. Matches the upload call,
+  // not download/getPublicUrl/list (read-only).
+  { re: /\bsupabase\s*\.\s*storage\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*upload\b/, kind: "file-upload", targetGroup: 1, library: "supabase-storage" },
+  // AWS S3 v3 — `s3Client.send(new PutObjectCommand({Bucket: "X", ...}))`.
+  // Captures the bucket from the command object when present.
+  { re: /\bnew\s+PutObjectCommand\s*\(\s*\{\s*[^}]*?Bucket\s*:\s*['"]([\w._-]+)['"]/, kind: "file-upload", targetGroup: 1, library: "aws-s3" },
+  // AWS S3 v2 — `s3.putObject({Bucket: "X", ...}).promise()`.
+  { re: /\b(?:s3|s3Client)\s*\.\s*putObject\s*\(\s*\{\s*[^}]*?Bucket\s*:\s*['"]([\w._-]+)['"]/, kind: "file-upload", targetGroup: 1, library: "aws-s3" },
+  // Cloudflare R2 / Workers KV / generic env bucket: `env.BUCKET.put("key", body)` or `bucket.put("key", body)`.
+  // Tight pattern — requires the literal "put" call signature (key, body)
+  // so DOM mutations like `el.put(...)` don't match.
+  { re: /\b(?:env\s*\.\s*([A-Z][A-Z0-9_]*)|([a-z]\w*Bucket))\s*\.\s*put\s*\(\s*['"`]/, kind: "file-upload", targetGroup: 1, library: "cloudflare-r2" },
+  // Vercel Blob — `import { put } from "@vercel/blob"; await put(name, body, {...});`.
+  // The import side is detected via the literal `@vercel/blob` token
+  // appearing in the same content slice, which suppresses ambiguous
+  // bare `put(...)` matches elsewhere.
+  { re: /['"]@vercel\/blob['"][\s\S]{0,500}?\bput\s*\(\s*['"`]([\w._/\-]+)['"`]/, kind: "file-upload", targetGroup: 1, library: "vercel-blob" },
+  // ── outbound paid-API calls (Anthropic / OpenAI / Gemini / Stripe) ──
+  // High-cost: dropping the auth gate = anyone runs up the customer's
+  // bill. The socialideagen aiFillIdea case. Target = the API name +
+  // method so the suggestion makes sense ("messages.create" / "chat.completions.create").
+  // Anthropic SDK: messages.create / messages.parse (typed-output helper)
+  // / messages.stream (streaming variant) / counts (token counting).
+  { re: /\b(?:anthropic|client|ai)\s*\.\s*messages\s*\.\s*(?:create|parse|stream)\s*\(/, kind: "http-post", targetGroup: 0, library: "anthropic" },
+  { re: /\b(?:openai|client)\s*\.\s*chat\s*\.\s*completions\s*\.\s*create\s*\(/, kind: "http-post", targetGroup: 0, library: "openai" },
+  { re: /\b(?:openai|client)\s*\.\s*responses\s*\.\s*create\s*\(/, kind: "http-post", targetGroup: 0, library: "openai" },
+  { re: /\b(?:openai|client)\s*\.\s*images\s*\.\s*generate\s*\(/, kind: "http-post", targetGroup: 0, library: "openai" },
+  { re: /\b(?:openai|client)\s*\.\s*embeddings\s*\.\s*create\s*\(/, kind: "http-post", targetGroup: 0, library: "openai" },
+  // Google Gemini SDK
+  { re: /\bgemini\s*\.\s*generateContent\s*\(/, kind: "http-post", targetGroup: 0, library: "google-gemini" },
+  // Stripe payment intent / charge create — cost AND data-integrity surface.
+  { re: /\bstripe\s*\.\s*(?:paymentIntents|charges|subscriptions|customers)\s*\.\s*create\s*\(/, kind: "http-post", targetGroup: 0, library: "stripe" },
 ];
 
 // Detect a write shape in a handler body. Returns the FIRST shape
@@ -1843,7 +1880,12 @@ export function detectWriteShape(content: string): WriteShape | null {
   for (const { re, kind, targetGroup, library } of WRITE_SHAPE_PATTERNS) {
     const m = re.exec(stripped);
     if (!m) continue;
-    const target = targetGroup > 0 ? m[targetGroup] : kind === "email" ? "outgoing-email" : kind === "queue" ? "queue-message" : "row";
+    const target = targetGroup > 0 ? m[targetGroup] :
+      kind === "email" ? "outgoing-email" :
+      kind === "queue" ? "queue-message" :
+      kind === "http-post" ? "external-api" :
+      kind === "file-upload" ? "uploaded-file" :
+      "row";
     return {
       kind,
       target,
@@ -2520,6 +2562,288 @@ export function detectRetroactiveWriteEndpoints(
         `${writeShape.kind === "db-insert" ? "creates" : writeShape.kind === "db-update" ? "updates" : writeShape.kind === "db-upsert" ? "upserts" : "deletes"} a ${writeShape.target} record`
       } (${writeShape.library})`,
     });
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Server-Action write detector (0.2.18+)
+// ────────────────────────────────────────────────────────────
+//
+// Closes the App-Router mutation blind spot reported via socialideagen
+// dogfood: `pinned sweep` was completely blind to `saveIdea` in
+// `lib/ideaActions.ts` because its write detector keys on HTTP route
+// handlers (/api/...), and Server Actions are the recommended modern
+// Next.js mutation pattern.
+//
+// Detection (precision-gated — every hit must have a real write):
+//   1. File contains a module-level `"use server"` directive (line 1
+//      after comments / imports, before any export), OR a function-
+//      body inline `"use server"`.
+//   2. Find exported async functions / async arrow exports:
+//        export async function NAME(...) { ... }
+//        export const NAME = async (...) => { ... }
+//        export const NAME = async function (...) { ... }
+//   3. Run `detectWriteShape()` against each function's body. The
+//      output type already encodes the write library / target / kind
+//      we need for the verifier.
+//   4. Optional: capture the input-schema variable name (zod) and the
+//      auth gate function call — the verifier needs both to build a
+//      realistic test.
+//
+// The verifier (separate task) generates a test that imports the
+// action + calls it with a valid payload from the schema OR a form-
+// action journey via Playwright. This detector ONLY surfaces the
+// write surface; it does not generate the test.
+export type ServerActionWriteHit = {
+  template: "server-action-write";
+  filePath: string;
+  exportName: string;          // saveIdea
+  schemaName?: string;         // IdeaInput  (when found)
+  authGate?: string;           // isAdminAuthed  (when found)
+  writeShape: WriteShape;
+  isModuleLevelDirective: boolean;  // top-of-file vs inline
+  suggestedPin: string;
+};
+
+// Regex/parse for "use server" directive at the top of a file (before
+// any export). Trims leading comments + whitespace + imports.
+function hasModuleLevelUseServer(content: string): boolean {
+  // Strip block comments, line comments, and the standard ESM
+  // `import ...` lines — none of those count as code preceding the
+  // directive. We require the directive to appear BEFORE any
+  // non-comment, non-import statement, otherwise Next ignores it.
+  let i = 0;
+  while (i < content.length) {
+    // Skip whitespace.
+    if (/\s/.test(content[i])) { i += 1; continue; }
+    // Skip line comment.
+    if (content.startsWith("//", i)) {
+      const eol = content.indexOf("\n", i);
+      i = eol === -1 ? content.length : eol + 1;
+      continue;
+    }
+    // Skip block comment.
+    if (content.startsWith("/*", i)) {
+      const end = content.indexOf("*/", i + 2);
+      i = end === -1 ? content.length : end + 2;
+      continue;
+    }
+    // "use server" or 'use server' directive.
+    const rest = content.slice(i, i + 20);
+    if (/^['"]use server['"]\s*;?/.test(rest)) return true;
+    // Skip import lines — they're allowed BEFORE the directive in
+    // practice (some lints reorder), so we look past them too.
+    if (content.startsWith("import", i)) {
+      const eol = content.indexOf("\n", i);
+      i = eol === -1 ? content.length : eol + 1;
+      continue;
+    }
+    // First substantive non-comment-non-import token: bail.
+    return false;
+  }
+  return false;
+}
+
+// Locate exported async function/arrow exports and return [name, body]
+// pairs. body = the {...} block content (string slice).
+function findExportedAsyncFunctions(content: string): Array<{ name: string; body: string }> {
+  const results: Array<{ name: string; body: string }> = [];
+  // Pattern A: export async function NAME(...) { ... }     (function decl)
+  // Pattern B: export const NAME = async (...) => { ... }  (arrow)
+  // Pattern C: export const NAME = async function (...) { ... }  (named-fn-expr)
+  // Between `)` (close of param list) and `{` (or `=>` for arrows),
+  // TypeScript permits a return-type annotation: `: Promise<T>`.
+  // The earlier impl missed those — caught on socialideagen
+  // `lib/ideaActions.ts`'s `saveIdea(input: unknown): Promise<SaveResult>`.
+  const headerRe = /export\s+(?:async\s+function\s+(\w+)|const\s+(\w+)\s*(?::\s*[^=]+)?\s*=\s*async\b)/g;
+  let m: RegExpExecArray | null;
+  while ((m = headerRe.exec(content)) !== null) {
+    const name = m[1] ?? m[2];
+    if (!name) continue;
+    const isArrow = !!m[2];
+    let i = headerRe.lastIndex;
+    // Skip whitespace.
+    while (i < content.length && /\s/.test(content[i])) i += 1;
+    // Param-list lookahead: many exports begin with `(` here. Walk past
+    // the paren-balanced param list (handles `(input: unknown): X`).
+    if (content[i] !== "(") {
+      // For arrows, the pattern `async name => { ... }` (single param,
+      // no parens) is allowed. Skip just whitespace and find `=>`.
+      if (isArrow) {
+        const arrowIdx = content.indexOf("=>", i);
+        if (arrowIdx === -1 || arrowIdx > i + 200) continue;
+        i = arrowIdx;
+      } else {
+        continue; // function decl MUST have ( — bail
+      }
+    } else {
+      let depth = 1;
+      let j = i + 1;
+      while (j < content.length && depth > 0) {
+        const ch = content[j];
+        if (ch === "(" ) depth += 1;
+        else if (ch === ")") depth -= 1;
+        // Skip strings (in case a default param string contains `(`).
+        else if (ch === '"' || ch === "'" || ch === "`") {
+          const quote = ch;
+          j += 1;
+          while (j < content.length && content[j] !== quote) {
+            if (content[j] === "\\") j += 1;
+            j += 1;
+          }
+        }
+        j += 1;
+      }
+      if (depth !== 0) continue;
+      i = j; // just past the closing `)`
+    }
+    // Now we may have whitespace, then optionally `: ReturnType`, then
+    // either `=>` (arrows) or `{` (function decls / async function).
+    while (i < content.length && /\s/.test(content[i])) i += 1;
+    if (content[i] === ":") {
+      // Skip the return-type annotation. It ends at `=>` (arrow) or
+      // `{` (decl). Scan forward respecting bracket depth so `Promise<{a:1}>`
+      // doesn't terminate early.
+      i += 1;
+      let depth = 0;
+      while (i < content.length) {
+        const ch = content[i];
+        if (depth === 0) {
+          if (ch === "{") break;
+          if (isArrow && ch === "=" && content[i + 1] === ">") break;
+        }
+        if (ch === "<" || ch === "(" || ch === "{" || ch === "[") depth += 1;
+        else if (ch === ">" || ch === ")" || ch === "}" || ch === "]") {
+          if (depth > 0) depth -= 1;
+        }
+        i += 1;
+      }
+    }
+    if (isArrow) {
+      // Skip `=>` and any whitespace.
+      if (content.slice(i, i + 2) !== "=>") continue;
+      i += 2;
+      while (i < content.length && /\s/.test(content[i])) i += 1;
+    } else {
+      while (i < content.length && /\s/.test(content[i])) i += 1;
+    }
+    if (content[i] !== "{") continue;
+    // Find matching `}` accounting for nesting. Skip strings + comments
+    // so a `// }` inside the body doesn't unbalance us.
+    let depth = 1;
+    let j = i + 1;
+    while (j < content.length && depth > 0) {
+      const ch = content[j];
+      if (ch === '"' || ch === "'" || ch === "`") {
+        const quote = ch;
+        j += 1;
+        while (j < content.length) {
+          if (content[j] === "\\") { j += 2; continue; }
+          if (content[j] === quote) { j += 1; break; }
+          // Template literal: handle ${...} as a nested expression.
+          if (quote === "`" && content[j] === "$" && content[j + 1] === "{") {
+            let tdepth = 1;
+            j += 2;
+            while (j < content.length && tdepth > 0) {
+              if (content[j] === "{") tdepth += 1;
+              else if (content[j] === "}") tdepth -= 1;
+              j += 1;
+            }
+            continue;
+          }
+          j += 1;
+        }
+        continue;
+      }
+      if (ch === "/" && content[j + 1] === "/") {
+        const eol = content.indexOf("\n", j);
+        j = eol === -1 ? content.length : eol + 1;
+        continue;
+      }
+      if (ch === "/" && content[j + 1] === "*") {
+        const end = content.indexOf("*/", j + 2);
+        j = end === -1 ? content.length : end + 2;
+        continue;
+      }
+      if (ch === "{") depth += 1;
+      else if (ch === "}") depth -= 1;
+      j += 1;
+    }
+    if (depth !== 0) continue;
+    const body = content.slice(i + 1, j - 1);
+    results.push({ name, body });
+    headerRe.lastIndex = j;
+  }
+  return results;
+}
+
+// Captures the zod input-schema variable name from the function body.
+// Looks for: `XxxInput.safeParse(...)`, `XxxInput.parse(...)`,
+// `XxxSchema.safeParse(...)`, `Schema.parse(...)`, returning the
+// identifier before `.safeParse`/`.parse` when it ends with -Input,
+// -Schema, -Body, -Payload, -Args (PascalCase convention).
+function extractSchemaName(body: string): string | undefined {
+  const m = /\b([A-Z][A-Za-z0-9_]*?(?:Input|Schema|Body|Payload|Args))\.(?:safeParse|parse)\s*\(/.exec(body);
+  return m ? m[1] : undefined;
+}
+
+// Captures an auth-gate call in the function body. Looks for the
+// first call to a function whose name matches the auth-vocabulary
+// pattern (case-insensitive). Returns the call expression source
+// (e.g. "isAdminAuthed()" / "requireAuth(req)") so the verifier
+// knows which gate to satisfy.
+function extractAuthGate(body: string): string | undefined {
+  const m = /\b(is(?:Admin|Authenticated|SignedIn|LoggedIn|Authed)\w*|require(?:Auth|Admin|Session|User|Role)\w*|getServerSession|currentUser|getUser|auth)\s*\(/.exec(body);
+  return m ? m[1] : undefined;
+}
+
+export function detectServerActionWrites(
+  filesByPath: Map<string, string>
+): ServerActionWriteHit[] {
+  const out: ServerActionWriteHit[] = [];
+  const seenExports = new Set<string>();
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    // Server Actions only live in TS/JS files (not .css, .json etc).
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+
+    const moduleDirective = hasModuleLevelUseServer(content);
+    const exportedAsync = findExportedAsyncFunctions(content);
+    if (exportedAsync.length === 0) continue;
+
+    for (const { name, body } of exportedAsync) {
+      const inlineDirective = /^\s*['"]use server['"]\s*;?/.test(body.trimStart());
+      const isServerAction = moduleDirective || inlineDirective;
+      if (!isServerAction) continue;
+
+      const writeShape = detectWriteShape(body);
+      if (!writeShape) continue; // require a real write — no fallbacks
+
+      const key = `${filePath}:${name}`;
+      if (seenExports.has(key)) continue;
+      seenExports.add(key);
+
+      const schemaName = extractSchemaName(body);
+      const authGate = extractAuthGate(body);
+      const verb =
+        writeShape.kind === "email" ? "sends an email" :
+        writeShape.kind === "queue" ? "enqueues a job" :
+        `${writeShape.kind === "db-insert" ? "creates" : writeShape.kind === "db-update" ? "updates" : writeShape.kind === "db-upsert" ? "upserts" : "deletes"} a ${writeShape.target} record`;
+      const authNote = authGate ? ` (gated by ${authGate})` : "";
+      const schemaNote = schemaName ? ` with ${schemaName}-validated input` : "";
+
+      out.push({
+        template: "server-action-write",
+        filePath,
+        exportName: name,
+        schemaName,
+        authGate,
+        writeShape,
+        isModuleLevelDirective: moduleDirective,
+        suggestedPin: `Server Action ${name}() in ${filePath} ${verb}${schemaNote}${authNote} (${writeShape.library})`,
+      });
+    }
   }
   return out;
 }

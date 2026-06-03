@@ -42,6 +42,7 @@ import {
   retireEntry,
   countActivePins,
   renderCatchesMarkdown,
+  getActiveClaimIds,
   type RegistryEntry,
 } from "./registry.js";
 import { activeByokProvider } from "./llmDirect.js";
@@ -3287,6 +3288,16 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `User journey \`${claim.label}\` (${claim.steps.length} step${claim.steps.length === 1 ? "" : "s"}) keeps working end-to-end (catches multi-step regressions — e.g. signup OK but /me returns stale data — that single-route pins structurally miss)`;
     case "interaction-baseline":
       return `🛟 BETA · Interaction \`${claim.action} ${claim.selector}\` on \`${claim.page}\` still produces the recorded ${claim.observe.kind} (warn-only catch class for frontend interaction regressions)`;
+    case "server-action-write": {
+      const verb =
+        claim.writeKind === "email" ? "sends an email" :
+        claim.writeKind === "queue" ? "enqueues a job" :
+        claim.writeKind === "file-upload" ? `uploads to ${claim.writeTarget}` :
+        claim.writeKind === "http-post" ? `calls ${claim.writeLibrary}` :
+        `${claim.writeKind === "db-insert" ? "creates" : claim.writeKind === "db-update" ? "updates" : claim.writeKind === "db-upsert" ? "upserts" : claim.writeKind === "db-delete" ? "deletes" : "writes to"} \`${claim.writeTarget}\``;
+      const authNote = claim.authGate ? ` (gated by ${claim.authGate}())` : "";
+      return `Server Action \`${claim.exportName}\` ${verb}${authNote} — fixture-recorded direct-invoke pin (catches App-Router mutation regressions that HTTP-route pins structurally miss)`;
+    }
   }
 }
 
@@ -3621,6 +3632,7 @@ program
       detectRetroactiveWriteEndpoints,
       detectHostConditionalInDiff,
       detectRetroactiveJourneys,
+      detectServerActionWrites,
       buildImportGraph,
       findFamilyMembers,
       deriveRouteFromPath: drfp,
@@ -3630,7 +3642,7 @@ program
 
     // 3. Detectors.
     type Proposal = {
-      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline";
+      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write";
       route: string;
       method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
       filePath: string;
@@ -3730,6 +3742,33 @@ program
       });
     }
 
+    // 0.2.18+ Server-Action write surfaces. Detector finds exported
+    // async functions in "use server" modules that perform writes
+    // (DB upsert / file upload / outbound paid-API call). Emit pin
+    // proposals — the test self-skips with a clear "run
+    // pinned record-server-action" message until the fixture is
+    // captured, same posture as interaction-baseline.
+    const serverActionHits = detectServerActionWrites(tree);
+    for (const h of serverActionHits) {
+      proposals.push({
+        kind: "server-action-write",
+        route: `${h.filePath}:${h.exportName}`,
+        filePath: h.filePath,
+        reason: h.suggestedPin,
+        claim: {
+          template: "server-action-write",
+          actionModule: h.filePath,
+          exportName: h.exportName,
+          writeTarget: h.writeShape.target,
+          writeLibrary: h.writeShape.library,
+          writeKind: h.writeShape.kind,
+          schemaName: h.schemaName,
+          authGate: h.authGate,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+
     // 0.2.17+ BETA: interaction-baseline candidates. Scanned the tree
     // for buttons with stable selectors (aria-label / data-testid) and
     // onClick handlers. Tagged beta: listed in the summary, but NOT
@@ -3757,13 +3796,14 @@ program
     out("");
     out("◆ Pinned · SWEEP");
     out("");
-    if (proposals.length === 0) {
+    if (proposals.length === 0 && serverActionHits.length === 0) {
       out("✓ No new families or unprotected flows found. Your tree is fully covered against the");
       out("  precision-bound detectors (host-conditional, write-endpoint, retroactive journey).");
       out("  Run `pinned audit` for the read-only retro view.");
       return;
     }
-    out(`Found ${proposals.length} proposed pin${proposals.length === 1 ? "" : "s"}:`);
+    const totalSurfaced = proposals.length + serverActionHits.length;
+    out(`Found ${totalSurfaced} write surface${totalSurfaced === 1 ? "" : "s"} / proposed pin${totalSurfaced === 1 ? "" : "s"}:`);
     out("");
     if (hostFamilies.length > 0) {
       out("🌐 Host-conditional families (multi-consumer risk):");
@@ -3796,6 +3836,37 @@ program
         out(`  + ${j.label}`);
         out(`    ${p.reason}`);
       }
+      out("");
+    }
+    if (serverActionHits.length > 0) {
+      out("⚡ Server-Action write surfaces (Next.js App-Router mutations):");
+      out("");
+      const groupedByFile = new Map<string, typeof serverActionHits>();
+      for (const h of serverActionHits) {
+        const arr = groupedByFile.get(h.filePath) ?? [];
+        arr.push(h);
+        groupedByFile.set(h.filePath, arr);
+      }
+      for (const [file, hits] of groupedByFile) {
+        const fileLabel = hits.length === 1 ? `${file}` : `${file}  (${hits.length} actions — likely a family)`;
+        out(`  ${fileLabel}`);
+        for (const h of hits.slice(0, 5)) {
+          const verb =
+            h.writeShape.kind === "email" ? "sends email" :
+            h.writeShape.kind === "queue" ? "enqueues job" :
+            h.writeShape.kind === "file-upload" ? `uploads to ${h.writeShape.target}` :
+            h.writeShape.kind === "http-post" ? `calls ${h.writeShape.library}` :
+            `${h.writeShape.kind === "db-insert" ? "inserts" : h.writeShape.kind === "db-update" ? "updates" : h.writeShape.kind === "db-upsert" ? "upserts" : "deletes"} ${h.writeShape.target}`;
+          const auth = h.authGate ? ` · gated by ${h.authGate}()` : " · NO AUTH GATE";
+          const schema = h.schemaName ? ` · ${h.schemaName}` : " · no schema found";
+          out(`    + ${h.exportName}()  →  ${verb}${auth}${schema}`);
+        }
+        if (hits.length > 5) out(`    + …and ${hits.length - 5} more`);
+        out("");
+      }
+      out("  Pins emit with self-skip until a fixture is recorded. After confirm, run:");
+      out("    pinned record-server-action <claim-id> --fixture <path-to-payload.json>");
+      out("  …per pin to enable the direct-invoke check.");
       out("");
     }
     const betaInteractions = proposals.filter((p) => p.kind === "interaction-baseline");
@@ -4691,7 +4762,7 @@ program
   )
   .option(
     "--reset-phantoms",
-    "Aggressive cleanup: drop EVERY catch whose claimId is currently in failingClaimIds AND whose corresponding pin file does not have a true failure when re-run with the current PREVIEW_URL. Use after fixing a probe-scope bug to scrub all ghosts at once."
+    "Drop catches that no longer correspond to active pins: (a) every claimId currently in failingClaimIds (cleared after a probe-scope fix), AND (b) every orphan claimId — i.e. catches whose pin was retired (or whose registry entry no longer exists). Pin files are preserved; only the tracking metadata is cleaned."
   )
   .option("--quiet", "Suppress the pinned banner header.")
   .action(async (opts: { dir: string; limit: string; review?: string; resetPhantoms?: boolean; quiet?: boolean }) => {
@@ -4731,25 +4802,42 @@ program
       return;
     }
 
-    // --reset-phantoms: bulk cleanup. Drop every catch whose claimId is
-    // CURRENTLY in failingClaimIds. Rationale: if the cache says the pin
-    // is currently failing AND we just patched the bug that caused
-    // erroneous attachment, those "failing" records are phantoms — the
-    // underlying behavior was never broken. Pin files stay; only the
-    // tracking metadata gets cleaned.
+    // --reset-phantoms: bulk cleanup. Drops every catch whose claimId is
+    //   (a) CURRENTLY in failingClaimIds, OR
+    //   (b) orphaned — claimId references a pin that's been retired or
+    //       deleted from the registry.
+    //
+    // (a) catches the probe-scope-bug case (we just patched a bug that
+    // erroneously attached to localhost). (b) catches the trust bug
+    // where a retired pin's historical catches keep showing in the
+    // headline metric forever, because pre-0.2.12 retires didn't clean
+    // catchHistory at all, and even post-0.2.12 retires only clean when
+    // the user runs `pinned retire` (not when they git-mv the test
+    // file themselves). Pin files are preserved; only tracking
+    // metadata gets cleaned. See 0.2.18 fix +
+    // [[strategic-moat-independent-guardrail]] — any path that lets
+    // a phantom catch inflate the headline metric is a thesis-breaker.
     if (opts.resetPhantoms) {
       const prev = readLastStatus(opts.dir);
       if (!prev) {
         out("Nothing to reset — no cache exists.");
         return;
       }
-      const ghostIds = new Set(prev.failingClaimIds ?? []);
-      if (ghostIds.size === 0) {
-        out("Nothing to reset — no claims are marked as currently failing.");
+      const failingIds = new Set(prev.failingClaimIds ?? []);
+      const activeClaimIds = getActiveClaimIds(opts.dir);
+      const allCatchClaimIds = new Set((prev.catchHistory ?? []).map((r) => r.claimId));
+      const orphanIds = new Set<string>();
+      for (const id of allCatchClaimIds) {
+        if (!activeClaimIds.has(id)) orphanIds.add(id);
+      }
+      // Union of failing + orphan claimIds to drop.
+      const toDrop = new Set<string>([...failingIds, ...orphanIds]);
+      if (toDrop.size === 0) {
+        out("Nothing to reset — no failing or orphan catches in the cache.");
         return;
       }
-      const catchHistory = (prev.catchHistory ?? []).filter((r) => !ghostIds.has(r.claimId));
-      const caughtClaimIds = (prev.caughtClaimIds ?? Array.from(new Set((prev.catchHistory ?? []).map((r) => r.claimId)))).filter((id) => !ghostIds.has(id));
+      const catchHistory = (prev.catchHistory ?? []).filter((r) => !toDrop.has(r.claimId));
+      const caughtClaimIds = (prev.caughtClaimIds ?? Array.from(new Set((prev.catchHistory ?? []).map((r) => r.claimId)))).filter((id) => !toDrop.has(id));
       writeLastStatus(opts.dir, {
         ...prev,
         failingClaimIds: [],
@@ -4765,8 +4853,15 @@ program
         const md = renderCatchesMarkdown({ catchHistory, breaksCaught: caughtClaimIds.length });
         writeFileSync(catchesPath, md);
       } catch { /* best-effort */ }
-      out(`✓ Reset ${ghostIds.size} phantom catch${ghostIds.size === 1 ? "" : "es"}:`);
-      for (const id of ghostIds) out(`   • ${id}`);
+      out(`✓ Reset ${toDrop.size} phantom catch${toDrop.size === 1 ? "" : "es"}:`);
+      if (failingIds.size > 0) {
+        out(`   ${failingIds.size} from failingClaimIds (probe-scope ghosts):`);
+        for (const id of failingIds) out(`     • ${id}`);
+      }
+      if (orphanIds.size > 0) {
+        out(`   ${orphanIds.size} orphan${orphanIds.size === 1 ? "" : "s"} (claimId no longer in active registry — typically retired pins):`);
+        for (const id of orphanIds) out(`     • ${id}`);
+      }
       out("");
       out(`New breaksCaught: ${caughtClaimIds.length} (was ${(prev.caughtClaimIds ?? []).length || prev.breaksCaught}).`);
       out("Pin files preserved. Run \`pinned test\` to re-verify against your real PREVIEW_URL.");
@@ -4774,7 +4869,16 @@ program
     }
 
     const last = readLastStatus(opts.dir);
-    const history = last?.catchHistory ?? [];
+    const rawHistory = last?.catchHistory ?? [];
+    // Orphan filter: a catch whose claimId no longer corresponds to an
+    // active pin (typically because the pin was retired) is silently
+    // dropped from the displayed count, but we surface the orphan
+    // total so the user knows phantoms exist + can clear them with
+    // --reset-phantoms. The records persist on disk (audit trail).
+    const activeClaimIds = getActiveClaimIds(opts.dir);
+    const orphanRecords = rawHistory.filter((r) => !activeClaimIds.has(r.claimId));
+    const orphanClaimIds = new Set(orphanRecords.map((r) => r.claimId));
+    const history = rawHistory.filter((r) => activeClaimIds.has(r.claimId));
     // Dedupe display by claimId — keep the most recent record per
     // claim so timestamps reflect the latest fire. Without this, a
     // pin caught twice (e.g. cache reset → re-detected) showed twice
@@ -4793,7 +4897,11 @@ program
       if (b > a) byClaim.set(r.claimId, r);
     }
     const dedupedHistory = Array.from(byClaim.values());
-    const total = last?.breaksCaught ?? dedupedHistory.length;
+    // Headline metric is the count of non-orphan unique claims, not the
+    // persisted breaksCaught (which may include orphans until --reset-
+    // phantoms is run). Persisted value still appears in --reset-phantoms
+    // output so users can see what's being cleaned.
+    const total = dedupedHistory.length;
     const eventCount = history.length;
 
     if (dedupedHistory.length === 0) {
@@ -4814,6 +4922,14 @@ program
       ? ` · ${eventCount} catch event${eventCount === 1 ? "" : "s"}`
       : "";
     out(`◆ Regressions Pinned has caught — ${dedupedHistory.length} unique pin${dedupedHistory.length === 1 ? "" : "s"}${eventsNote}, ${total} lifetime`);
+    // Surface orphan catches separately so the user knows they exist
+    // + can clear them. Filtered from the listing so the headline
+    // metric stays trustworthy. Trust-bug fix 0.2.18.
+    if (orphanClaimIds.size > 0) {
+      out("");
+      out(`  ⓘ ${orphanRecords.length} catch event${orphanRecords.length === 1 ? "" : "s"} (across ${orphanClaimIds.size} pin${orphanClaimIds.size === 1 ? "" : "s"}) are orphans — the pin${orphanClaimIds.size === 1 ? " was" : "s were"} retired or removed from the registry.`);
+      out(`     Run \`pinned catches --reset-phantoms\` to permanently clear them from .last-status.json.`);
+    }
     out("");
     // Look up each catch's current claim entry so we can render the
     // human Title. Fall back to the cached claimText if the pin was
@@ -7604,7 +7720,11 @@ program
     const { formatChatHook, CHAT_HOOK_AUTO_PROTECT_TTL_MS } = await import(
       "./statusline.js"
     );
-    const result = formatChatHook(lastStatus);
+    // Filter catch metrics against active claims so retired pins'
+    // historical catches don't keep surfacing in chat. Trust-bug fix
+    // 0.2.18 — see [[strategic-moat-independent-guardrail]].
+    const activeClaimIds = getActiveClaimIds(opts.dir);
+    const result = formatChatHook(lastStatus, Date.now(), activeClaimIds);
     if (result.text) process.stdout.write(result.text + "\n");
 
     // Background auto-protect kick — cheap-check + throttled.
@@ -9753,6 +9873,162 @@ program
     }
   );
 
+// ─── pinned record-server-action <claim-id> ────────────────────────
+// Captures the fixture payload for a server-action-write pin so the
+// direct-invoke test can actually run. Reads a JSON file containing
+// a valid action payload, validates it parses as an object, writes
+// it back onto the claim's `fixturePayload` field, regenerates the
+// .test.ts so the inline `FIXTURE` constant matches.
+//
+// Optionally records the success-shape baseline by actually invoking
+// the action once and capturing the result.
+program
+  .command("record-server-action")
+  .description(
+    "Capture the fixture payload for a server-action-write pin. Reads a valid payload from JSON (`--fixture <path>`), persists it onto the claim, regenerates the pin file. Until recorded, the pin self-skips with a clear message."
+  )
+  .argument("[claim-id]", "Claim id to record. Run `pinned list` to see available pins.")
+  .option("--fixture <path>", "Path to a JSON file containing a valid payload that makes the action return success.")
+  .option("--dir <path>", "Pinned tests directory (default: tests/pinned)", "tests/pinned")
+  .option("--dry-run", "Show the parsed fixture without writing it back to the claim.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(
+    (
+      claimId: string | undefined,
+      opts: { fixture?: string; dir: string; dryRun?: boolean; quiet?: boolean }
+    ) => {
+      if (!opts.quiet) printBanner();
+
+      if (!claimId) {
+        err(
+          "✗ Pass a claim-id. Run `pinned list` to see available pins, then:\n    pinned record-server-action <claim-id> --fixture <path-to-payload.json>\n"
+        );
+        process.exit(1);
+      }
+      if (!opts.fixture) {
+        err(
+          "✗ Pass --fixture <path> pointing to a JSON file with a valid payload for this action.\n  e.g.  pinned record-server-action " + claimId + " --fixture ./fixtures/save-idea-valid.json\n"
+        );
+        process.exit(1);
+      }
+      assertSafeId("claim id", claimId);
+      assertInsideDir(opts.dir, process.cwd());
+      if (!existsSync(opts.dir)) {
+        err(`✗ ${opts.dir}/ does not exist. Run \`pinned init\` first.\n`);
+        process.exit(1);
+      }
+
+      const reg = readRegistry(opts.dir);
+      const entry = reg.claims.find((c) => c.status === "active" && c.claimId === claimId);
+      if (!entry) {
+        err(
+          `✗ No active pin with id '${claimId}'. Run \`pinned list\` to see all active pins.\n`
+        );
+        process.exit(1);
+      }
+      if (entry.claim.template !== "server-action-write") {
+        err(
+          `✗ Pin '${claimId}' is template ${entry.claim.template}, not server-action-write.\n  record-server-action only applies to Server Action write pins.\n`
+        );
+        process.exit(1);
+      }
+
+      // Read + parse the fixture JSON.
+      const fixturePath = resolve(process.cwd(), opts.fixture);
+      assertInsideDir(fixturePath, process.cwd());
+      if (!existsSync(fixturePath)) {
+        err(`✗ Fixture file not found: ${fixturePath}\n`);
+        process.exit(1);
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(readFileSync(fixturePath, "utf8"));
+      } catch (e) {
+        err(`✗ Fixture is not valid JSON: ${(e as Error).message}\n`);
+        process.exit(1);
+      }
+      if (typeof payload !== "object" || payload === null) {
+        err(`✗ Fixture must be a JSON object (got ${Array.isArray(payload) ? "array" : typeof payload}).\n`);
+        process.exit(1);
+      }
+
+      const claim = entry.claim;
+      out("");
+      out("Recording Server Action fixture");
+      out("─────────────────────────────────");
+      out(`  Pin:       ${entry.filename}`);
+      out(`  Action:    ${claim.exportName}() in ${claim.actionModule}`);
+      out(`  Write:     ${claim.writeKind} → ${claim.writeTarget} (${claim.writeLibrary})`);
+      if (claim.authGate) out(`  Auth gate: ${claim.authGate}()`);
+      out(`  Fixture:   ${relative(process.cwd(), fixturePath)}`);
+      const keys = Object.keys(payload as Record<string, unknown>).slice(0, 8);
+      out(`  Keys:      ${keys.length === 0 ? "(empty object)" : keys.join(", ")}${Object.keys(payload as Record<string, unknown>).length > keys.length ? "…" : ""}`);
+      out("");
+
+      if (opts.dryRun) {
+        out("(--dry-run: claim not updated, pin file not regenerated.)");
+        return;
+      }
+
+      const updatedClaim = { ...claim, fixturePayload: payload };
+      const updatedRegistry = {
+        ...reg,
+        claims: reg.claims.map((c) =>
+          c.claimId === entry.claimId ? { ...c, claim: updatedClaim } : c
+        ),
+      };
+      writeRegistry(opts.dir, updatedRegistry);
+
+      const gen = generateTest(updatedClaim, {
+        prId: entry.prId,
+        pinnedVersion: version,
+      });
+      const target = join(opts.dir, entry.filename);
+      writeFileSync(target, gen.content);
+
+      // Sanctioned-edit marker so the pre-commit guard recognizes the
+      // regenerated test file as legitimate. Same mechanism as
+      // `pinned regenerate` and `pinned record-interaction`.
+      try {
+        const markerDir = ".pinnedai";
+        if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+        const content = readFileSync(target, "utf8");
+        const sha256 = createHash("sha256").update(content).digest("hex");
+        const now = Date.now();
+        writeFileSync(
+          join(markerDir, "regenerate-allow.json"),
+          JSON.stringify(
+            {
+              version: 1,
+              createdAt: new Date(now).toISOString(),
+              expiresAt: new Date(now + 5 * 60 * 1000).toISOString(),
+              runId: randomBytes(8).toString("hex"),
+              source: "record-server-action" as const,
+              regenerated: [{ filename: entry.filename, sha256, dir: opts.dir }],
+            },
+            null,
+            2
+          ) + "\n"
+        );
+      } catch { /* marker is best-effort */ }
+
+      out("✓ Fixture recorded.");
+      out(`  Updated:   ${relative(process.cwd(), target)}`);
+      out("");
+      if (claim.authGate) {
+        out("⚠ This action is auth-gated. The direct-invoke test calls the action in-process; if");
+        out(`  ${claim.authGate}() requires a real cookie/session, the pin will fail with the`);
+        out("  not-authorized branch. Options:");
+        out("    1. Add `if (process.env.PINNED_TEST_BYPASS_AUTH) return true;` in your auth helper");
+        out("       (only when PINNED_TEST_BYPASS_AUTH=1).");
+        out(`    2. Or set up a test-fixture session in vitest setup so ${claim.authGate}() succeeds.`);
+        out("");
+      }
+      out("Commit the change so the fixture ships with the pin:");
+      out("  git add tests/pinned/ && git commit -m \"chore(pinned): record fixture for " + entry.filename + "\"");
+    }
+  );
+
 // Installer for the PostToolUse hook. Per the consent ladder this is
 // an L1 step — explicit yes, show-and-confirm the exact diff, marker-
 // bounded so uninstall is clean. Per-project default; --global behind
@@ -10523,6 +10799,8 @@ function describeClaim(c: Claim): string {
     }
     case "interaction-baseline":
       return `interaction🛟 BETA  ${c.action} ${c.selector} @ ${c.page}  →  ${c.observe.kind}`;
+    case "server-action-write":
+      return `server-action  ${c.actionModule}:${c.exportName}  →  ${c.writeKind} ${c.writeTarget} (${c.writeLibrary})${c.authGate ? ` · gated by ${c.authGate}` : ""}`;
   }
 }
 

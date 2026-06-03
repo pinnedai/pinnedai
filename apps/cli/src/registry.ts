@@ -110,6 +110,29 @@ export function countActivePins(registry: Registry): number {
   return registry.claims.filter((c) => c.status === "active").length;
 }
 
+// Set of claimIds currently active in `dir`. Read-path filter for catch
+// metrics so a retired pin's historical catches never inflate
+// breaksCaught / chat-hook output / statusline "★ caught N today". The
+// catch records persist in `.last-status.json` (audit trail), but the
+// metric the user sees is filtered against this set. Trust bug fix
+// from 0.2.18 — see [[strategic-moat-independent-guardrail]] (any
+// path that lets a phantom catch inflate the headline metric is a
+// thesis-breaker).
+export function getActiveClaimIds(dir: string): Set<string> {
+  try {
+    const registry = readRegistry(dir);
+    return new Set(
+      registry.claims.filter((c) => c.status === "active").map((c) => c.claimId)
+    );
+  } catch {
+    // Corrupt or missing registry — return an empty set rather than
+    // throwing. The caller (chat hook, statusline) shouldn't crash;
+    // worst-case behavior is "show everything as orphan" which is
+    // visibly wrong and surfaces the underlying problem.
+    return new Set();
+  }
+}
+
 export function readRegistry(dir: string): Registry {
   const path = join(dir, REGISTRY_FILENAME);
   if (!existsSync(path)) {
@@ -276,6 +299,11 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       // Page route covered. Any edit to the page (or its component
       // tree) should re-run the interaction baseline.
       return { routes: [claim.page] };
+    case "server-action-write":
+      // Action module is the load-bearing source — any edit to it
+      // touches the pin. No HTTP route exists (Server Actions compile
+      // to opaque RPC endpoints).
+      return { files: [claim.actionModule] };
   }
 }
 
@@ -444,6 +472,8 @@ function claimLabel(c: Claim): string {
     }
     case "interaction-baseline":
       return `\`🛟 BETA · ${escapeMarkdownCell(c.action)} ${escapeMarkdownCell(c.selector)} @ ${escapeMarkdownCell(c.page)}\``;
+    case "server-action-write":
+      return `\`server-action ${escapeMarkdownCell(c.actionModule)}:${escapeMarkdownCell(c.exportName)}\` (${c.writeKind} ${escapeMarkdownCell(c.writeTarget)})`;
   }
 }
 

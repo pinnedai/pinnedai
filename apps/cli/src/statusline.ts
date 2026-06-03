@@ -714,6 +714,12 @@ export function formatStatusline(opts: {
 
   const minimal = opts.statuslineMode === "minimal";
   const prefix = `${c.dim}◆ pinned${c.reset}`;
+  // Active claim IDs derived from `activePins` (when supplied) — drives
+  // the orphan-catch filter so retired pins' historical catches never
+  // inflate "★ N catches today" or "1 broken" rollups. See 0.2.18 fix.
+  const activeClaimIds: Set<string> | undefined = opts.activePins
+    ? new Set(opts.activePins.map((p) => p.claimId))
+    : undefined;
   if (totalPins === 0) {
     // Even with no active pins, recent catches (from a bug-fix
     // benchmark recording, or from a guard run that hasn't created
@@ -724,12 +730,14 @@ export function formatStatusline(opts: {
       const age = (opts.now ?? Date.now()) - new Date(lastStatus.lastCatchAt).getTime();
       if (Number.isFinite(age) && age >= 0 && age < CATCH_PROMINENT_WINDOW_MS) {
         const cutoff = (opts.now ?? Date.now()) - CATCH_PROMINENT_WINDOW_MS;
-        const recentCount = (lastStatus.catchHistory ?? []).filter((r) => {
+        const recentCount = dropOrphans(lastStatus.catchHistory ?? [], activeClaimIds).filter((r) => {
           const t = new Date(r.caughtAt).getTime();
           return Number.isFinite(t) && t >= cutoff;
-        }).length || 1;
-        const noun = recentCount === 1 ? "catch" : "catches";
-        return `${prefix} · ${c.green}★ ${recentCount} ${noun} today${c.reset}`;
+        }).length;
+        if (recentCount > 0) {
+          const noun = recentCount === 1 ? "catch" : "catches";
+          return `${prefix} · ${c.green}★ ${recentCount} ${noun} today${c.reset}`;
+        }
       }
     }
     return minimal ? "" : `${prefix} · 0 pins`;
@@ -741,8 +749,16 @@ export function formatStatusline(opts: {
 
   // 1. Broken pin — highest priority. Require count > 0 so we never
   // display "✗ 0 broken" (red signal with zero count = confusing UX).
+  // Filter against active set: a retired pin's leftover failingClaimId
+  // shouldn't render "✗ 1 broken" (the test file isn't even there
+  // anymore). Defense-in-depth — retire already cleans failingClaimIds.
   if (lastStatus.status === "failing" && lastStatus.failingCount > 0) {
-    return `${prefix} · ${totalPins} pins · ${c.red}✗ ${lastStatus.failingCount} broken${c.reset}`;
+    const stillBroken = activeClaimIds
+      ? lastStatus.failingClaimIds.filter((id) => activeClaimIds.has(id))
+      : lastStatus.failingClaimIds;
+    if (stillBroken.length > 0) {
+      return `${prefix} · ${totalPins} pins · ${c.red}✗ ${stillBroken.length} broken${c.reset}`;
+    }
   }
   // 2. "Caught N break" — tiered celebration:
   //    0-24h:  ★ caught N today (prominent green)
@@ -801,14 +817,18 @@ export function formatStatusline(opts: {
   if (lastStatus.lastCatchAt) {
     const age = now - new Date(lastStatus.lastCatchAt).getTime();
     if (Number.isFinite(age) && age >= 0 && age < CATCH_PROMINENT_WINDOW_MS) {
-      // Count catches within the prominent window
+      // Count catches within the prominent window — orphan-filtered so
+      // retired pins' historical catches don't keep showing as "today".
       const cutoff = now - CATCH_PROMINENT_WINDOW_MS;
-      const recentCount = (lastStatus.catchHistory ?? []).filter((r) => {
+      const recentCount = dropOrphans(lastStatus.catchHistory ?? [], activeClaimIds).filter((r) => {
         const t = new Date(r.caughtAt).getTime();
         return Number.isFinite(t) && t >= cutoff;
-      }).length || 1; // at least 1 since lastCatchAt itself is within window
-      const noun = recentCount === 1 ? "catch" : "catches";
-      return `${prefix} · ${totalPins} pins · ${c.green}★ ${recentCount} ${noun} today${c.reset}`;
+      }).length;
+      if (recentCount > 0) {
+        const noun = recentCount === 1 ? "catch" : "catches";
+        return `${prefix} · ${totalPins} pins · ${c.green}★ ${recentCount} ${noun} today${c.reset}`;
+      }
+      // Fall through to calm-green if every recent catch was orphaned.
     }
     // 24-72h: subtle footer, falls through to calm-green below.
     // We compute a label here and tack it on later in the calm branch.
@@ -1015,16 +1035,38 @@ export type ChatHookResult = {
   stampAddNotifiedAt: string | null;
 };
 
+// Filter catchHistory to drop orphan records (catches whose claimId is
+// no longer an active pin — typically because the pin was retired).
+// The records stay in `.last-status.json` (audit trail intact), but
+// they don't show up in the metric the user sees. Trust-bug fix from
+// 0.2.18.
+function dropOrphans(
+  history: CatchRecord[],
+  activeClaimIds?: Set<string>
+): CatchRecord[] {
+  if (!activeClaimIds) return history;
+  return history.filter((r) => activeClaimIds.has(r.claimId));
+}
+
 export function formatChatHook(
   lastStatus: LastStatus | null,
-  now: number = Date.now()
+  now: number = Date.now(),
+  activeClaimIds?: Set<string>
 ): ChatHookResult {
   // 1. Failure trumps everything.
+  // Active-claim filter applied: if every "failing" claimId is orphaned
+  // (e.g. retired), there's no real failure to report and we fall
+  // through to the celebration / catch / quiet branches.
   if (lastStatus && lastStatus.status === "failing" && lastStatus.failingCount > 0) {
-    return {
-      text: failureMessage(lastStatus),
-      stampAddNotifiedAt: null,
-    };
+    const stillFailing = activeClaimIds
+      ? lastStatus.failingClaimIds.filter((id) => activeClaimIds.has(id))
+      : lastStatus.failingClaimIds;
+    if (stillFailing.length > 0) {
+      return {
+        text: failureMessage(lastStatus, activeClaimIds),
+        stampAddNotifiedAt: null,
+      };
+    }
   }
   // 2. Fresh add we haven't notified about yet.
   if (
@@ -1059,7 +1101,7 @@ export function formatChatHook(
     const catchAge = now - new Date(lastStatus.lastCatchAt).getTime();
     if (Number.isFinite(catchAge) && catchAge >= 0 && catchAge < CATCH_PROMINENT_WINDOW_MS) {
       const cutoff = now - CATCH_PROMINENT_WINDOW_MS;
-      const recent = (lastStatus.catchHistory ?? []).filter((r) => {
+      const recent = dropOrphans(lastStatus.catchHistory ?? [], activeClaimIds).filter((r) => {
         const t = new Date(r.caughtAt).getTime();
         return Number.isFinite(t) && t >= cutoff;
       });
@@ -1172,16 +1214,28 @@ function addCelebrationMessage(n: number, summaries: string[]): string {
   return lines.join("\n");
 }
 
-function failureMessage(lastStatus: LastStatus): string {
+function failureMessage(lastStatus: LastStatus, activeClaimIds?: Set<string>): string {
   const n = lastStatus.failingCount;
-  const totalCaught = lastStatus.breaksCaught ?? 0;
+  // Filter to active pins only so a retired claim that happens to still
+  // be in failingClaimIds doesn't show up. (Retire path already removes
+  // these; the filter is defense-in-depth.)
+  const failingActiveIds = activeClaimIds
+    ? lastStatus.failingClaimIds.filter((id) => activeClaimIds.has(id))
+    : lastStatus.failingClaimIds;
+  // Lifetime caught — used for the CATCHES.md ledger sentence below.
+  // Subtract orphan claimIds when we know the active set; otherwise
+  // use the persisted counter as-is.
+  const filteredHistory = dropOrphans(lastStatus.catchHistory ?? [], activeClaimIds);
+  const filteredUniques = new Set(filteredHistory.map((c) => c.claimId)).size;
+  const totalCaught = activeClaimIds
+    ? filteredUniques
+    : (lastStatus.breaksCaught ?? 0);
   // Pull the most recent catch records that match the currently-failing
   // claim IDs so we can speak in human terms ("Without Pinned, this
   // would have shipped: <bad_case>"). Falls back gracefully when the
   // history is empty (pre-v0.1 cache) or doesn't have bad_case yet.
-  const failingSet = new Set(lastStatus.failingClaimIds);
-  const recentCatchesForFailing =
-    (lastStatus.catchHistory ?? []).filter((c) => failingSet.has(c.claimId));
+  const failingSet = new Set(failingActiveIds);
+  const recentCatchesForFailing = filteredHistory.filter((c) => failingSet.has(c.claimId));
 
   const lines: string[] = [
     `🛟 Pinned caught a regression — ${n} protected behavior${n === 1 ? " is" : "s are"} failing.`,

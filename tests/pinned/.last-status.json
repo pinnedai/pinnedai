@@ -2,18 +2,18 @@
   "status": "green",
   "failingCount": 0,
   "failingClaimIds": [],
-  "totalPins": 57,
+  "totalPins": 58,
   "safetyNotes": 0,
   "recentlyAddedCount": 1,
-  "recentlyAddedAt": "2026-06-03T13:34:15.350Z",
+  "recentlyAddedAt": "2026-06-03T23:41:09.657Z",
   "suggestedCount": 0,
-  "lastCheckedSha": "ea617439fc65085f50902b941eb4e28f1d89fd8d",
-  "lastCheckedDirtyHash": "a4c584597276bbf7",
-  "updatedAt": "2026-06-03T13:34:15.350Z",
+  "lastCheckedSha": "b35b5414c39982aaac77c1106e3cb276e45af5db",
+  "lastCheckedDirtyHash": "1202a0c876f32c84",
+  "updatedAt": "2026-06-03T23:41:09.657Z",
   "lastAutoProtectAt": "2026-05-26T15:35:19.295Z",
-  "lastAddNotifiedAt": "2026-06-03T13:15:05.322Z",
+  "lastAddNotifiedAt": "2026-06-03T13:34:15.350Z",
   "recentlyAddedSummaries": [
-    "`node ./apps/cli/dist/cli.js record-interaction --help` runs without crashing (AI can't break the CLI command)"
+    "`node ./apps/cli/dist/cli.js record-server-action --help` runs without crashing (AI can't break the CLI command)"
   ],
   "lastSavedAt": "2026-05-25T21:15:17.542Z",
   "lastSavedCount": 11,
@@ -28,89 +28,15 @@
   "lastLessonAt": "2026-05-25T21:15:17.545Z",
   "lastLessonSummary": "Do not weaken pinned tests to make CI pass.",
   "lessonsLifetime": 6,
-  "breaksCaught": 8,
+  "breaksCaught": 0,
   "lastCatchAt": "2026-06-02T23:23:38.541Z",
   "lastCatchClaimId": "baseline-20260525-auth-required-api-admin-19rdd0",
-  "catchHistory": [
-    {
-      "caughtAt": "2026-06-02T02:59:49.282Z",
-      "claimId": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2",
-      "claimText": "`node ./apps/cli/dist/cli.js check --description \"Rate-limits /api/users to 60 req/min.\"` outputs `Found 1 claim(s)`",
-      "template": "cli-output-contains",
-      "route": "node ./apps/cli/dist/cli.js check --description \"Rate-limits /api/users to 60 req/min.\"",
-      "originPr": "v0-1-1"
-    },
-    {
-      "caughtAt": "2026-05-26T15:44:09.653Z",
-      "claimId": "v0-1-1-auth-required-api-admin-export-rw7ne7",
-      "claimText": "/api/admin/export requires admin role",
-      "template": "auth-required",
-      "route": "/api/admin/export",
-      "originPr": "v0-1-1"
-    },
-    {
-      "caughtAt": "2026-05-26T15:44:09.653Z",
-      "claimId": "v0-1-1-returns-status-api-signup-15x1ys",
-      "claimText": "POST /api/signup returns 400 on missing email",
-      "template": "returns-status",
-      "route": "/api/signup",
-      "originPr": "v0-1-1"
-    },
-    {
-      "caughtAt": "2026-05-26T15:44:09.653Z",
-      "claimId": "v0-1-1-returns-status-api-users-12hl5q",
-      "claimText": "/api/users returns 422 on invalid email",
-      "template": "returns-status",
-      "route": "/api/users",
-      "originPr": "v0-1-1"
-    },
-    {
-      "caughtAt": "2026-05-26T15:44:09.653Z",
-      "claimId": "v0-1-1-returns-status-api-users-um7t93",
-      "claimText": "/api/users returns 401 on missing token",
-      "template": "returns-status",
-      "route": "/api/users",
-      "originPr": "v0-1-1"
-    },
-    {
-      "caughtAt": "2026-05-26T15:44:09.653Z",
-      "claimId": "baseline-20260525-lockfile-integrity-lockfile-pnpm-lock-yaml-e7a06ea703b2-tb6mqy",
-      "claimText": "lockfile-integrity pnpm-lock.yaml sha256 e7a06ea703b2",
-      "template": "lockfile-integrity",
-      "badCase": "`pnpm-lock.yaml` SHA-256 changed (lockfile was regenerated or hand-edited; transitive deps may have shifted)",
-      "originPr": "baseline-20260525"
-    },
-    {
-      "caughtAt": "2026-05-26T15:44:09.653Z",
-      "claimId": "baseline-20260525-secret-not-public-secret-not-public-vite-12jyea",
-      "claimText": "no VITE_* env var ever contains a secret (SECRET/TOKEN/PRIVATE_KEY/API_KEY)",
-      "template": "secret-not-public",
-      "badCase": "a `VITE_` env var with a secret-shaped suffix (SECRET, TOKEN, PRIVATE_KEY, API_KEY) was introduced — would leak a server secret into the client bundle",
-      "originPr": "baseline-20260525"
-    },
-    {
-      "caughtAt": "2026-05-26T15:44:09.653Z",
-      "claimId": "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-version-1o1gxj",
-      "claimText": "`node ./apps/cli/dist/cli.js --version` outputs `0.0.1`",
-      "template": "cli-output-contains",
-      "route": "node ./apps/cli/dist/cli.js --version",
-      "originPr": "v0-1-1"
-    }
-  ],
-  "checksRun": 49,
-  "verifiedStreak": 2,
+  "catchHistory": [],
+  "checksRun": 50,
+  "verifiedStreak": 3,
   "skippedCount": 2,
-  "lastVerifiedAt": "2026-06-03T13:15:08.557Z",
-  "lastCoveredAt": "2026-06-03T13:15:08.562Z",
-  "lastCoveredCount": 54,
-  "caughtClaimIds": [
-    "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-check-description-rate-limits-api-users-to-60-req-min-7llvs2",
-    "v0-1-1-auth-required-api-admin-export-rw7ne7",
-    "v0-1-1-returns-status-api-signup-15x1ys",
-    "v0-1-1-returns-status-api-users-12hl5q",
-    "v0-1-1-returns-status-api-users-um7t93",
-    "baseline-20260525-lockfile-integrity-lockfile-pnpm-lock-yaml-e7a06ea703b2-tb6mqy",
-    "baseline-20260525-secret-not-public-secret-not-public-vite-12jyea",
-    "v0-1-1-cli-output-contains-node-apps-cli-dist-cli-js-version-1o1gxj"
-  ]
+  "lastVerifiedAt": "2026-06-03T13:34:18.468Z",
+  "lastCoveredAt": "2026-06-03T13:34:18.469Z",
+  "lastCoveredCount": 55,
+  "caughtClaimIds": []
 }

@@ -2,6 +2,65 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.18] — 2026-06-03
+
+Two trust-critical fixes shipped together: (1) the retired-pin catch trust bug — phantom catches from retired pins were permanently inflating the "regressions caught" metric with no clean way to remove them. (2) The App-Router mutation blind spot — Server Actions (the modern Next.js mutation pattern) were entirely invisible to `pinned sweep` because write detection only covered HTTP `/api/*` route handlers. Both are P0 per [[strategic-moat-independent-guardrail]] (the trust metric must be trustworthy; the independent guardrail must actually see the high-stakes write surfaces).
+
+### Fixed — retired-pin catches no longer inflate the trust metric
+
+`pinned catches` headline + the UserPromptSubmit hook output + the statusline "★ N catches today" rollup now ignore catches whose `claimId` is no longer an active pin. The records persist in `.last-status.json` as audit-trail (so an unwise retire can still be investigated), but they don't show up in any user-facing metric until the user explicitly purges them with `--reset-phantoms`.
+
+The bug: `retire` correctly cleaned catchHistory + `caughtClaimIds` + `breaksCaught` as of 0.2.12, but (a) pre-0.2.12 retires left orphans that never got cleaned, and (b) `--reset-phantoms` only dropped catches whose claimId was in `failingClaimIds` — retiring a pin REMOVES it from `failingClaimIds`, so its lingering catches became forever-phantoms with the failing-set early-exit returning "Nothing to reset." 8 phantom catches on pinnedai itself (every catch ever recorded was from a now-retired baseline pin); 1 reported by user on socialideagen.
+
+The fix: three layers.
+1. **Read-side filter** (no migration needed): `pinned catches` listing, `pinned hook-failure` output, statusline catch counters all filter `catchHistory` against `getActiveClaimIds()`. Orphan catches surface as a one-line `ⓘ N orphan events` info so the user knows phantoms exist.
+2. **Extended `--reset-phantoms`**: now drops catches in `failingClaimIds` UNION orphan claimIds (catches whose pin is no longer active in the registry). Removed the "Nothing to reset — no claims are marked as currently failing" early-exit that was suppressing the orphan path.
+3. **failureMessage active-set filter**: a retired pin still listed in `failingClaimIds` no longer fires the chat-hook regression warning — defense-in-depth against the cache-vs-registry skew that triggered the user's report.
+
+Three-test matrix:
+- Positive 4/4: orphan filtered from listing + headline drops to honest count + `--reset-phantoms` purges orphan catches + writes drop to disk + hook-failure suppresses retired-pin warnings.
+- Negative 3/3: active-pin catches survive `--reset-phantoms` untouched + legitimately failing active pin still fires the hook regression warning + empty-state (`0 failing, 0 orphan`) exits cleanly with `Nothing to reset`.
+- Self-applied on pinnedai: 8 phantom catches identified + cleared (all 8 corresponded to retired baseline pins from earlier dogfood iterations).
+
+### Added — Next.js Server Action write detection (the App-Router mutation blind spot)
+
+`detectServerActionWrites()` walks the tree for files containing a module-level `"use server"` directive (or inline directive at function-body top), finds exported async functions / arrow exports, runs `detectWriteShape()` against each body, and surfaces:
+- write target (table / bucket / API)
+- library (supabase-js / supabase-storage / aws-s3 / cloudflare-r2 / vercel-blob / anthropic / openai / google-gemini / stripe / …)
+- auth gate function name (`isAdminAuthed`, `requireAuth`, `getServerSession`, etc.)
+- input schema variable (`IdeaInput`, `*Schema`, `*Body`, `*Payload`)
+
+Acceptance on socialideagen (the report fixture): `pinned sweep` now flags all three of the admin panel's Server Actions — `saveIdea` (DB upsert → `ideas` via supabase-js), `uploadMockup` (file upload → `mockups` bucket via supabase-storage), `aiFillIdea` (paid Anthropic call → `client.messages.parse`). All three were previously invisible. All three carry the `isAdminAuthed()` gate, captured + surfaced in the sweep output.
+
+**Extended `WriteShape` coverage:**
+- `file-upload` kind, libraries: supabase-storage (`storage.from(BUCKET).upload`), aws-s3 (`PutObjectCommand` / `putObject`), cloudflare-r2 / Workers KV (`env.BUCKET.put`), vercel-blob (`@vercel/blob` import + `put()` call)
+- `http-post` kind, libraries: anthropic (`messages.create` / `messages.parse` / `messages.stream`), openai (`chat.completions.create` / `responses.create` / `images.generate` / `embeddings.create`), google-gemini (`generateContent`), stripe (`paymentIntents.create` / `charges.create` / `subscriptions.create` / `customers.create`)
+
+### Added — `server-action-write` template + `pinned record-server-action`
+
+The verifier loop. The detector emits a `server-action-write` claim into `pinned sweep`'s batch confirm; on Y the pin file is written. Until a fixture is recorded the test self-skips with a clear `run pinned record-server-action` message. Same posture as `interaction-baseline`'s "no baseline recorded yet" mode.
+
+**Template (`templates/serverActionWrite.ts`):** imports the action by relative path (derived from `actionModule`, extension stripped for ESM resolution), calls it with the recorded fixture, asserts the return matches `successShape` (default `{ ok: true }`) field-by-field. Specific error messages for the two failure modes that matter most: action no longer exported / action no longer returns the success shape. No PREVIEW_URL needed — runs against the customer's compiled code in-process.
+
+**Command (`pinned record-server-action <claim-id> --fixture <path>`):** reads a JSON file containing a valid payload, validates it parses as an object (not array / not primitive), persists it onto the claim's `fixturePayload` field, regenerates the pin file via the standard `generateTest()` dispatcher so the inline `FIXTURE` constant matches. Writes a `.pinnedai/regenerate-allow.json` marker (`source: "record-server-action"`) so the pre-commit guard recognizes the regeneration as sanctioned.
+
+**Auth-gated actions** (all three socialideagen examples — `isAdminAuthed`): the recorder prints a warning explaining that the direct-invoke test will hit the not-authorized branch unless the user adds a `PINNED_TEST_BYPASS_AUTH` short-circuit to their auth helper OR sets up a fixture session in vitest setup. Documented limitation for 0.2.18; full auth-fixture machinery lands in 0.2.19.
+
+### Tested
+
+Three-test matrix + dyad sweep per [[fp-check-everything-with-real-tests]]:
+- **Positive (detector)**: socialideagen 3/3 actions detected with correct categorization, library, target, and auth gate. WriteShape patterns 5/5 (supabase-storage, aws-s3, vercel-blob, anthropic `.parse`, openai chat.completions). 8/8 ✓
+- **Negative (detector)**: read-only Server Action skipped, no-directive skipped, no-export skipped, commented-out directive skipped, .css skipped, test file skipped. 6/6 ✓
+- **Positive (template)**: skip-without-fixture emits `FIXTURE = null` + `it.skipIf(noFixture)` + `../../lib/...` import path. With-fixture emits inline payload. 4/4 ✓
+- **Positive (record-server-action)**: writes fixture to registry + regenerates pin file with inline payload + `.pinnedai/regenerate-allow.json` marker tagged `source: "record-server-action"`. 4/4 ✓
+- **Negative (record-server-action)**: rejects wrong-template claim, rejects missing `--fixture`. 2/2 ✓
+- **Full suite**: 327/327 vitest tests pass; typecheck clean.
+- **FP sweep**: 10 dyad repos, 683 files, 3 candidates, 0 spurious (all 3 real socialideagen actions).
+
+### Added — README "Browser interaction pins" section + new "Server-Action pins" section
+
+Per [[readme-updates-with-every-release]].
+
 ## [0.2.17] — 2026-06-03
 
 Closes the BETA Playwright adapter loop: auto-detection of interaction pins from source + `pinned record-interaction` to capture the baseline. With this release, the carousel "arrows do nothing" regression class is end-to-end covered — discover → pin → record → catch — without the user authoring a single test by hand.

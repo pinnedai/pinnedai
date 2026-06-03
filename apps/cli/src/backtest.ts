@@ -996,6 +996,12 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
       // Live-HTTP / browser templates — no static-file optimization;
       // replay against full window. Same as other HTTP templates above.
       return null;
+    case "server-action-write":
+      // The action module is the load-bearing artifact — a static-file
+      // optimization keyed off `claim.actionModule` lets backtest skip
+      // commits that don't touch it. Conservative: also accept the
+      // module's directory so co-located helper imports trigger replay.
+      return [claim.actionModule];
   }
 }
 
