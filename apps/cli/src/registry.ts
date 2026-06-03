@@ -272,6 +272,10 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       // All routes the journey touches — any edit to any step's
       // handler is reason to re-run the journey.
       return { routes: claim.steps.map((s) => s.route) };
+    case "interaction-baseline":
+      // Page route covered. Any edit to the page (or its component
+      // tree) should re-run the interaction baseline.
+      return { routes: [claim.page] };
   }
 }
 
@@ -438,6 +442,8 @@ function claimLabel(c: Claim): string {
         .join(" → ");
       return `\`journey: ${escapeMarkdownCell(c.label)}\` (${path})`;
     }
+    case "interaction-baseline":
+      return `\`🛟 BETA · ${escapeMarkdownCell(c.action)} ${escapeMarkdownCell(c.selector)} @ ${escapeMarkdownCell(c.page)}\``;
   }
 }
 

@@ -62,6 +62,8 @@ Auto-maintained by [pinnedai](https://pinnedai.dev). Each row is a permanent CI 
 | `cli node ./apps/cli/dist/cli.js uninstall --help` (exits 0) | [auto-20260602-cli-exits-zero-node-apps-cli-dist-cli-js-uninstall-help-61js1u.test.ts](auto-20260602-cli-exits-zero-node-apps-cli-dist-cli-js-uninstall-help-61js1u.test.ts) | `auto-20260602` | [@michaelzon](https://github.com/michaelzon) | 2026-06-02 |
 | `cli node ./apps/cli/dist/cli.js install-claude-hook --help` (exits 0) | [auto-20260602-cli-exits-zero-node-apps-cli-dist-cli-js-install-claude-hook-help-ajk39c.test.ts](auto-20260602-cli-exits-zero-node-apps-cli-dist-cli-js-install-claude-hook-help-ajk39c.test.ts) | `auto-20260602` | [@michaelzon](https://github.com/michaelzon) | 2026-06-02 |
 | `cli node ./apps/cli/dist/cli.js audit-learned --help` (exits 0) | [auto-20260602-cli-exits-zero-node-apps-cli-dist-cli-js-audit-learned-help-uhg37x.test.ts](auto-20260602-cli-exits-zero-node-apps-cli-dist-cli-js-audit-learned-help-uhg37x.test.ts) | `auto-20260602` | [@michaelzon](https://github.com/michaelzon) | 2026-06-02 |
+| `cli node ./apps/cli/dist/cli.js sweep --help` (exits 0) | [auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-sweep-help-84d0gc.test.ts](auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-sweep-help-84d0gc.test.ts) | `auto-20260603` | [@michaelzon](https://github.com/michaelzon) | 2026-06-03 |
+| `cli node ./apps/cli/dist/cli.js add-browser --help` (exits 0) | [auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-add-browser-help-1e77ol.test.ts](auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-add-browser-help-1e77ol.test.ts) | `auto-20260603` | [@michaelzon](https://github.com/michaelzon) | 2026-06-03 |
 
 ## Retired
 

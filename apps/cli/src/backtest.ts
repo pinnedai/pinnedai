@@ -992,8 +992,9 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
     case "validation-rejects-bad":
     case "happy-path-with-side-effect":
     case "journey":
-      // Live-HTTP templates — no static-file optimization; replay
-      // against full window. Same as other HTTP templates above.
+    case "interaction-baseline":
+      // Live-HTTP / browser templates — no static-file optimization;
+      // replay against full window. Same as other HTTP templates above.
       return null;
   }
 }

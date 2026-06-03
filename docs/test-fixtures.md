@@ -102,6 +102,91 @@ openssl rand -hex 32
 #    Pinned reads it and forwards as the X-Pinned-Secret header.
 ```
 
+## Identity marker — upgrade catches from `review` to `confirmed`
+
+When Pinned probes your dev server, it can only verify the URL matches
+the one in your config — it can't tell whether the server at that URL
+is actually YOUR project (a stray dev server from another project on
+the same port would also match). Without identity verification, any
+catches Pinned records get tagged `🔍 review` and excluded from the
+lifetime `breaksCaught` metric.
+
+To upgrade catches to `confirmed`, opt in to identity verification.
+
+### 1. Add a marker to your Pinned config
+
+`.pinnedai/config.json`:
+
+```json
+{
+  "http": {
+    "mode": "local",
+    "url": "http://localhost:3000",
+    "start": "npm run dev",
+    "ready_path": "/",
+    "timeout_seconds": 60,
+    "identity_marker": "socialideagen-prod",
+    "identity_path": "/__pinned/identity"
+  }
+}
+```
+
+Pick any unique string for `identity_marker` — a project slug, a
+random nanoid, anything that identifies THIS project. `identity_path`
+defaults to `/__pinned/identity` if omitted.
+
+### 2. Have your dev server respond at that path
+
+Either approach works:
+
+**Option A — response header (lightest):**
+
+```ts
+// app/__pinned/identity/route.ts
+import { NextResponse } from "next/server";
+export async function GET() {
+  return new NextResponse(null, {
+    status: 204,
+    headers: { "X-Pinned-Project": "socialideagen-prod" },
+  });
+}
+```
+
+**Option B — response body (works without header):**
+
+```ts
+// app/__pinned/identity/route.ts
+import { NextResponse } from "next/server";
+export async function GET() {
+  return NextResponse.json({ project: "socialideagen-prod" });
+}
+```
+
+### 3. Run `pinned test`
+
+Pinned will probe `<your-url>/__pinned/identity`. If the response
+header `X-Pinned-Project` contains `socialideagen-prod` OR the body
+contains it, identity is verified and any catches recorded during
+the test run are tagged `confirmed` — counts toward the lifetime
+`breaksCaught` metric.
+
+If identity is missing or wrong, catches stay tagged `🔍 review`
+(visible in `pinned catches`, audit-only). Either way Pinned still
+runs the test, you just know whether to trust the count.
+
+### Why this is opt-in, not required
+
+Most users don't have name collisions on `localhost:3000` and don't
+need the verification step. The `review` quarantine is just a safety
+net — if a phantom catch ever does happen (port collision, dev server
+moved, etc), the headline metric stays honest. Add the marker when:
+
+- You frequently switch between projects on the same port
+- You're running Pinned in CI against a self-hosted preview where
+  identity matters
+- You want the strongest possible signal in `breaksCaught` for a
+  customer demo or audit
+
 ## Skip real side effects on Pinned probes
 
 Every Pinned-issued HTTP request carries `X-Pinned-Test: 1`. Your handler

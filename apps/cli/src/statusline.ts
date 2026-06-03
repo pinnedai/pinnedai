@@ -187,6 +187,23 @@ export type CatchRecord = {
   // entries written before the impact translator existed. See
   // `apps/cli/src/catchImpact.ts` for the mapping rules.
   severity?: "critical" | "high" | "medium" | "low" | "info";
+  // 0.2.15+ metric quarantine — distinguishes a CONFIRMED catch
+  // (host was identity-verified as this project's app, the pin's
+  // failure is a real regression) from a REVIEW catch (host attached
+  // but identity couldn't be confirmed — the failure might be a
+  // phantom from running pins against the wrong target).
+  //
+  // - undefined = legacy (treat as confirmed for backward compat)
+  // - "confirmed" = real catch; counts toward breaksCaught + headline
+  // - "review" = quarantined; PRESERVED in catchHistory for audit BUT
+  //              excluded from breaksCaught + the UserPromptSubmit
+  //              hook's headline alarm. Surfaces in `pinned catches`
+  //              with a 🔍 prefix so the user can audit + promote to
+  //              confirmed (or drop) via `pinned catches --review <id>`.
+  //
+  // Per locked [[full-stack-roadmap-2026-06-03]]: catches against
+  // attached-but-unverified hosts must not inflate the GA headline.
+  confidence?: "confirmed" | "review";
   // 3-6 word title for the layman-friendly catch listing ("Admin
   // dashboard auth check" instead of "auth required on * (middleware)
   // (added in this fix)").

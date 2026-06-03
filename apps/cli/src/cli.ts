@@ -1712,6 +1712,7 @@ program
                 status: { min: 200, max: 399 }, // allow 3xx redirects on step 1
                 ...(s.setsCookie ? { setsCookie: s.setsCookie } : {}),
                 ...(s.redirectIncludes ? { redirectIncludes: s.redirectIncludes } : {}),
+                ...((s as { bodyForbids?: string[] }).bodyForbids?.length ? { bodyForbids: (s as { bodyForbids?: string[] }).bodyForbids } : {}),
               },
             })),
             raw: j.suggestedPin,
@@ -2932,7 +2933,19 @@ async function detectVercelPreviewUrl(cwd: string): Promise<DetectedPreviewUrl |
 // (deploy URL → running dev server → loud warn) and for the
 // in-loop verify paths (pre-commit verify, watch verify, init's
 // "run pins once at end" closing banner).
-async function probeRunningDevServer(cwd: string): Promise<{ url: string; source: "config-http-url" } | null> {
+async function probeRunningDevServer(cwd: string): Promise<{
+  url: string;
+  source: "config-http-url";
+  // 0.2.16+ identity verification result. Tells the caller (pinned
+  // test) what catch-confidence to record:
+  //   "verified" — server explicitly identified itself as this project
+  //                via an identity marker (Pinned-aware app, opt-in)
+  //   "config-only" — URL matched config.http.url + responded, but no
+  //                   identity marker present. Could still be a stray
+  //                   localhost server at the same port → catches get
+  //                   tagged confidence:"review" instead of "confirmed".
+  identity: "verified" | "config-only";
+} | null> {
   // 0.2.14: TIGHTENED scope. Pre-0.2.14 this function scanned ports
   // 3000/5173/4321/8080/8000 indiscriminately and attached to whatever
   // localhost server it found. That caused phantom catches when an
@@ -2940,22 +2953,24 @@ async function probeRunningDevServer(cwd: string): Promise<{ url: string; source
   // on those ports — Pinned would run the project's pin tests against
   // someone else's server and report bogus regressions.
   //
-  // Now: only attaches to the URL the user explicitly configured at
-  // `pinned init` time (config.http.url). If the user picked "off" or
-  // "preview" mode (no local URL), this function returns null and the
-  // caller falls back to the loud "0 verifying" banner — which is the
-  // correct outcome. Better to skip verification than to verify
-  // against the wrong server and lie to the user.
+  // 0.2.14: only attaches to the URL the user explicitly configured at
+  // `pinned init` time (config.http.url). Stops the phantom-catch source.
   //
-  // Trade-off: this removes the "fortuitously catches when they have
-  // their dev server up" magic of 0.2.12. The right replacement is
-  // [[retro-audit-zero-work-zero-anger]]'s L2 rung — attach only
-  // when configured, never via opportunistic port scan.
+  // 0.2.16: adds identity verification as a SAFETY NET. Even when the
+  // probe URL matches config, the server at that URL might be the wrong
+  // process (user changed projects, port was reused, dev server crashed
+  // and something else grabbed the port). When the config has a
+  // `http.identity_marker` (string) AND a `http.identity_path`
+  // (defaults to "/__pinned/identity"), Pinned hits that path and
+  // requires the response body or response header `X-Pinned-Project`
+  // to contain the marker. Match → "verified". Mismatch / 404 / no
+  // marker configured → "config-only" (catches get quarantined as
+  // confidence:"review" per the locked roadmap).
   try {
     const cfgPath = join(cwd, ".pinnedai", "config.json");
     if (!existsSync(cfgPath)) return null;
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as {
-      http?: { url?: string; mode?: string };
+      http?: { url?: string; mode?: string; identity_marker?: string; identity_path?: string };
     };
     if (cfg.http?.mode !== "local" || !cfg.http?.url) return null;
     const target = cfg.http.url.replace(/\/$/, "");
@@ -2965,9 +2980,38 @@ async function probeRunningDevServer(cwd: string): Promise<{ url: string; source
         signal: AbortSignal.timeout(750),
         headers: { "X-Pinned-Probe": "1" },
       });
-      if (res.status >= 100 && res.status < 600) {
-        return { url: target, source: "config-http-url" };
+      if (!(res.status >= 100 && res.status < 600)) return null;
+
+      // 0.2.16 identity check. Only fires when the customer set
+      // http.identity_marker in their config (it's opt-in — most
+      // customers won't add it, and that's fine; their catches just
+      // get tagged "review" instead of "confirmed").
+      let identity: "verified" | "config-only" = "config-only";
+      const marker = cfg.http.identity_marker;
+      if (marker) {
+        const identityPath = cfg.http.identity_path ?? "/__pinned/identity";
+        try {
+          const idRes = await fetch(target + identityPath, {
+            method: "GET",
+            signal: AbortSignal.timeout(750),
+            headers: { "X-Pinned-Probe": "1" },
+          });
+          // Accept either:
+          //   - X-Pinned-Project response header containing the marker
+          //   - response body containing the marker (200 status)
+          const headerMatch = (idRes.headers.get("x-pinned-project") ?? "").includes(marker);
+          if (headerMatch) {
+            identity = "verified";
+          } else if (idRes.status === 200) {
+            try {
+              const body = await idRes.text();
+              if (body.includes(marker)) identity = "verified";
+            } catch { /* unreadable body; stay config-only */ }
+          }
+        } catch { /* identity probe failed; stay config-only */ }
       }
+
+      return { url: target, source: "config-http-url", identity };
     } catch { /* unreachable — return null */ }
   } catch { /* config unreadable — return null */ }
   return null;
@@ -3241,6 +3285,8 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `\`${claim.method} ${claim.route}\` actually performs its ${claim.sideEffectKind} to \`${claim.sideEffectTarget}\` (catches stub endpoints returning 200 without doing the work)`;
     case "journey":
       return `User journey \`${claim.label}\` (${claim.steps.length} step${claim.steps.length === 1 ? "" : "s"}) keeps working end-to-end (catches multi-step regressions — e.g. signup OK but /me returns stale data — that single-route pins structurally miss)`;
+    case "interaction-baseline":
+      return `🛟 BETA · Interaction \`${claim.action} ${claim.selector}\` on \`${claim.page}\` still produces the recorded ${claim.observe.kind} (warn-only catch class for frontend interaction regressions)`;
   }
 }
 
@@ -3507,6 +3553,295 @@ async function promptYSN(question: string): Promise<"Y" | "S" | "N"> {
     process.stdin.on("data", onData);
   });
 }
+
+// ---------- sweep (0.2.16+) ----------
+// Per locked [[pattern-driven-family-sweep]] + [[full-stack-roadmap-2026-06-03]]:
+// audit (L0) reads + reports; sweep (L1) reads + reports + WRITES pin
+// files after batch-confirm. The user-facing red→green demo packaging
+// of the family-aware detectors.
+//
+// Flow:
+//   1. Walk the tree. Build the import graph.
+//   2. Run precision-bound detectors (host-conditional + family,
+//      write-endpoint, retroactive journey).
+//   3. Group findings into families (consumers of a single root) +
+//      print summary: "Found 1 host-conditional family (3 routes share
+//      lib/host.ts:resolveIdeaFromRequest), 5 unprotected write
+//      endpoints, 2 retroactive journeys."
+//   4. Single batch-confirm: [pin all / review each / skip] — never
+//      silent mass-pin, per the locked precision rule.
+//   5. On "pin all", generate pin files via the existing
+//      generateTest() dispatcher (so we get schema-derived bodies +
+//      every other 0.2.x template improvement automatically).
+program
+  .command("sweep")
+  .description(
+    "Family-aware sweep: classifies the whole codebase by risk pattern, groups multi-consumer findings into families, and offers to pin them all from a single batch-confirm. The user-facing red→green demo for the family-driven coverage model."
+  )
+  .option("--dir <path>", "Pinned tests directory (default: tests/pinned)", "tests/pinned")
+  .option("--yes", "Skip the batch-confirm prompt (pin everything high-confidence).")
+  .option("--dry-run", "Show what would be pinned without writing.")
+  .option("--quiet", "Suppress the banner.")
+  .action(async (opts: { dir: string; yes?: boolean; dryRun?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const cwd = process.cwd();
+    assertInsideDir(opts.dir, cwd);
+
+    // 1. Walk tree.
+    const tree = new Map<string, string>();
+    const linesByPath = new Map<string, string[]>();
+    try {
+      for (const p of walkRepo(cwd)) {
+        try {
+          const content = readFileSync(join(cwd, p), "utf8");
+          tree.set(p, content);
+          linesByPath.set(p, content.split("\n"));
+        } catch { /* unreadable */ }
+      }
+    } catch (e) {
+      err(`✗ Tree walk failed: ${(e as Error).message}\n`);
+      process.exit(1);
+    }
+
+    // 2. Existing pin coverage (don't propose pins for already-protected routes).
+    const pinnedRoutes = new Set<string>();
+    try {
+      if (existsSync(opts.dir)) {
+        const reg = readRegistry(opts.dir);
+        for (const e of reg.claims) {
+          if (e.status !== "active") continue;
+          const r = claimRoute(e.claim);
+          if (r) pinnedRoutes.add(r);
+        }
+      }
+    } catch { /* no registry yet */ }
+
+    const {
+      detectRetroactiveWriteEndpoints,
+      detectHostConditionalInDiff,
+      detectRetroactiveJourneys,
+      buildImportGraph,
+      findFamilyMembers,
+      deriveRouteFromPath: drfp,
+    } = await import("./scanDiff.js");
+
+    const importGraph = buildImportGraph(tree);
+
+    // 3. Detectors.
+    type Proposal = {
+      kind: "happy-path" | "page-renders" | "journey";
+      route: string;
+      method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
+      filePath: string;
+      reason: string;
+      claim: Claim;
+    };
+    const proposals: Proposal[] = [];
+
+    // Host-conditional families: every consumer route → happy-path proposal.
+    const hostFamilies: Array<{ rootFile: string; affectedExport: string; routes: Array<{ filePath: string; route: string }> }> = [];
+    for (const h of detectHostConditionalInDiff(linesByPath)) {
+      if (!h.affectedExport) continue;
+      const consumers = findFamilyMembers(h.filePath, h.affectedExport, importGraph);
+      const routes = consumers
+        .map((c) => ({ filePath: c.importer, route: drfp(c.importer) }))
+        .filter((r): r is { filePath: string; route: string } => r.route !== null);
+      if (routes.length === 0) continue;
+      hostFamilies.push({ rootFile: h.filePath, affectedExport: h.affectedExport, routes });
+      for (const r of routes) {
+        if (pinnedRoutes.has(r.route)) continue;
+        // We need write-shape info to emit a useful happy-path. The
+        // retroactive write detector gives us that; fall back to a
+        // generic POST proposal if not found.
+        const lastSeg = r.route.split("/").filter(Boolean).pop() || "items";
+        const claim: Claim = {
+          template: "happy-path-with-side-effect",
+          route: r.route,
+          method: "POST",
+          sideEffectKind: "db-write",
+          sideEffectTarget: lastSeg,
+          raw: `${r.route} family — host-conditional consumer of ${h.filePath}:${h.affectedExport}. POST with valid body returns 2xx + writes to ${lastSeg}.`,
+        };
+        proposals.push({
+          kind: "happy-path",
+          route: r.route,
+          method: "POST",
+          filePath: r.filePath,
+          reason: `family member of host-conditional ${h.filePath}:${h.affectedExport}`,
+          claim,
+        });
+      }
+    }
+
+    // Standalone write endpoints not already covered.
+    for (const w of detectRetroactiveWriteEndpoints(tree)) {
+      if (pinnedRoutes.has(w.route)) continue;
+      // Skip if a host-family proposal already covered this route.
+      if (proposals.some((p) => p.route === w.route)) continue;
+      proposals.push({
+        kind: "happy-path",
+        route: w.route,
+        method: w.method,
+        filePath: w.filePath,
+        reason: `unprotected ${w.writeShape.library} ${w.writeShape.kind} to "${w.writeShape.target}"`,
+        claim: {
+          template: "happy-path-with-side-effect",
+          route: w.route,
+          method: w.method,
+          sideEffectKind: "db-write",
+          sideEffectTarget: w.writeShape.target,
+          raw: w.suggestedPin,
+        },
+      });
+    }
+
+    // Retroactive journeys (signup→thanks, confirm→thanks, etc).
+    for (const j of detectRetroactiveJourneys(tree)) {
+      // Skip if any step's first-route is already pinned. Conservative:
+      // a partial overlap still warrants the journey-pair pin since the
+      // contract is the multi-step relationship.
+      proposals.push({
+        kind: "journey",
+        route: j.steps[0].route,
+        filePath: j.filePaths[0],
+        reason: `multi-step ${j.pairReason}: ${j.sharedToken}`,
+        claim: {
+          template: "journey",
+          label: j.label,
+          steps: j.steps.map((s) => ({
+            method: s.method,
+            route: s.route,
+            expect: {
+              status: { min: 200, max: 399 },
+              ...(s.setsCookie ? { setsCookie: s.setsCookie } : {}),
+              ...(s.redirectIncludes ? { redirectIncludes: s.redirectIncludes } : {}),
+            },
+          })),
+          raw: j.suggestedPin,
+        },
+      });
+    }
+
+    // 4. Print summary.
+    out("");
+    out("◆ Pinned · SWEEP");
+    out("");
+    if (proposals.length === 0) {
+      out("✓ No new families or unprotected flows found. Your tree is fully covered against the");
+      out("  precision-bound detectors (host-conditional, write-endpoint, retroactive journey).");
+      out("  Run `pinned audit` for the read-only retro view.");
+      return;
+    }
+    out(`Found ${proposals.length} proposed pin${proposals.length === 1 ? "" : "s"}:`);
+    out("");
+    if (hostFamilies.length > 0) {
+      out("🌐 Host-conditional families (multi-consumer risk):");
+      out("");
+      for (const f of hostFamilies) {
+        out(`  ${f.rootFile}:${f.affectedExport} — ${f.routes.length} consumer${f.routes.length === 1 ? "" : "s"}:`);
+        for (const r of f.routes) out(`    + ${r.route}  (${r.filePath})`);
+        out("");
+      }
+    }
+    const standaloneWrites = proposals.filter((p) =>
+      p.kind === "happy-path" && !hostFamilies.some((f) => f.routes.some((r) => r.route === p.route))
+    );
+    if (standaloneWrites.length > 0) {
+      out("📝 Standalone write endpoints (not in a family):");
+      out("");
+      for (const p of standaloneWrites.slice(0, 10)) {
+        out(`  + ${p.method} ${p.route}  (${p.filePath})`);
+        out(`    ${p.reason}`);
+      }
+      if (standaloneWrites.length > 10) out(`  + …and ${standaloneWrites.length - 10} more`);
+      out("");
+    }
+    const journeys = proposals.filter((p) => p.kind === "journey");
+    if (journeys.length > 0) {
+      out("🛤  Multi-step journeys:");
+      out("");
+      for (const p of journeys.slice(0, 5)) {
+        const j = p.claim as Extract<Claim, { template: "journey" }>;
+        out(`  + ${j.label}`);
+        out(`    ${p.reason}`);
+      }
+      out("");
+    }
+
+    // 5. Batch confirm.
+    if (opts.dryRun) {
+      out("(--dry-run: no pin files written.)");
+      return;
+    }
+    if (!opts.yes) {
+      process.stdout.write(`Pin all ${proposals.length}? [Y/review each/n] `);
+      const answer = await new Promise<string>((resolve) => {
+        let buf = "";
+        process.stdin.setEncoding("utf8");
+        process.stdin.resume();
+        const onData = (chunk: string) => {
+          buf += chunk;
+          if (buf.includes("\n")) {
+            process.stdin.removeListener("data", onData);
+            process.stdin.pause();
+            resolve(buf.trim().toLowerCase());
+          }
+        };
+        process.stdin.on("data", onData);
+      });
+      if (answer === "n" || answer === "no") {
+        out("");
+        out("Aborted. No pin files written.");
+        return;
+      }
+      if (answer === "r" || answer === "review" || answer === "review each") {
+        out("");
+        out("Per-pin review mode not yet implemented in 0.2.16. Re-run with --yes to pin all,");
+        out("or invoke `pinned check --description \"<claim>\"` to pin individually.");
+        return;
+      }
+    }
+
+    // 6. Write pin files via the existing generateTest() dispatcher.
+    const prId = `sweep-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}`;
+    let registry = existsSync(opts.dir)
+      ? readRegistry(opts.dir)
+      : { version: 1 as const, claims: [] };
+    if (!existsSync(opts.dir)) mkdirSync(opts.dir, { recursive: true });
+    let written = 0;
+    let skipped = 0;
+    out("");
+    for (const p of proposals) {
+      const gen = generateTest(p.claim, { prId, pinnedVersion: version });
+      const target = join(opts.dir, gen.filename);
+      try {
+        assertInsideDir(target, opts.dir);
+        writeFileSync(target, gen.content, { flag: "wx" });
+        registry = addEntry(registry, {
+          claimId: gen.claimId,
+          prId,
+          claim: p.claim,
+          filename: gen.filename,
+        });
+        written++;
+        out(`  + ${relative(cwd, target)}  (${p.kind})`);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+          skipped++;
+          continue;
+        }
+        err(`  ✗ ${relative(cwd, target)} — ${(e as Error).message}\n`);
+      }
+    }
+    if (written > 0) writeRegistry(opts.dir, registry);
+
+    out("");
+    out(`✓ Sweep complete: ${written} pin${written === 1 ? "" : "s"} written, ${skipped} already existed.`);
+    out("");
+    out("Next:");
+    out("  • Set PREVIEW_URL (or have your dev server up) and run `pinned test` to see green or first catches.");
+    out("  • `pinned audit` for the read-only retro view of what just got pinned.");
+  });
 
 // ---------- audit (0.2.12+) ----------
 // THE first-touch activation experience. Per [[retro-audit-zero-work-zero-anger]]:
@@ -4459,7 +4794,11 @@ program
           c.severity === "medium" ? "🟡 MEDIUM" :
           c.severity === "low" ? "🔵 LOW" :
           "⚪ INFO";
-        out(`${String(i).padStart(2)}. ${badge} — ${c.laymanHeadline}`);
+        // 0.2.15+: review-confidence catches get a 🔍 prefix instead
+        // of the severity badge — signals "needs human verification,
+        // not counted toward the headline."
+        const reviewTag = c.confidence === "review" ? " 🔍 review" : "";
+        out(`${String(i).padStart(2)}. ${badge} — ${c.laymanHeadline}${reviewTag}`);
         if (c.userImpact) {
           // Wrap impact text to ~76 chars for terminal readability.
           const wrapped = wrapText(c.userImpact, 76, "      ");
@@ -4474,7 +4813,9 @@ program
         const title = entry
           ? describeClaimForUser(entry.claim).title
           : c.claimText ?? c.claimId;
-        out(`${String(i).padStart(2)}. 🛟 ${title}`);
+        const icon = c.confidence === "review" ? "🔍" : "🛟";
+        const tagSuffix = c.confidence === "review" ? "  (review — not counted in lifetime catches)" : "";
+        out(`${String(i).padStart(2)}. ${icon} ${title}${tagSuffix}`);
         out(`      Caught: ${dateOnly}`);
         if (entry) out(`      Test:   tests/pinned/${entry.filename}`);
         out("");
@@ -7381,7 +7722,22 @@ program
         const running = await probeRunningDevServer(process.cwd());
         if (running) {
           childEnv.PREVIEW_URL = running.url;
-          out(`◆ pinned: attached to running dev server at ${running.url} (${running.source})`);
+          // 0.2.16+ identity-aware confidence tagging. When the probe
+          // verified the server's identity via http.identity_marker,
+          // catches are CONFIRMED. Otherwise the attach is "config-only"
+          // — URL matched config but no project-identity signal →
+          // tag any catches as "review" so they don't inflate the
+          // headline metric. Per the locked roadmap, this is the
+          // automatic trigger for the confidence-quarantine path.
+          if (running.identity === "verified") {
+            out(`◆ pinned: attached to running dev server at ${running.url} (verified)`);
+          } else {
+            childEnv.PINNED_CATCH_CONFIDENCE = "review";
+            out(`◆ pinned: attached to ${running.url} (config match, identity NOT verified — any catches will be tagged 🔍 review)`);
+            out(`   To upgrade catches to "confirmed" status, add to .pinnedai/config.json:`);
+            out(`     "http": { "identity_marker": "<unique-string>", "identity_path": "/__pinned/identity" }`);
+            out(`   ...and have your dev server respond at identity_path with X-Pinned-Project: <marker> header or marker in body.`);
+          }
         }
       } catch { /* probe failure is non-fatal */ }
     }
@@ -7540,7 +7896,27 @@ program
       // Real catch: was green, now failing on a claim that wasn't
       // failing before. Don't count test-runner errors (exit non-zero
       // with zero parsed FAIL lines) — those aren't regressions.
-      for (const id of newFailures) caughtClaimIds.add(id);
+      //
+      // 0.2.15+ metric quarantine: tag each new catch with `confidence`.
+      // "confirmed" = host was identity-verified for this project →
+      //   counts toward breaksCaught + the hook's headline.
+      // "review" = host attached but identity couldn't be confirmed →
+      //   stays in catchHistory for audit BUT excluded from
+      //   breaksCaught. Surfaces in `pinned catches` with a 🔍 prefix.
+      //
+      // For 0.2.15: trigger source is the env var PINNED_CATCH_CONFIDENCE
+      // (default "confirmed"). Future versions will set "review"
+      // automatically when probeRunningDevServer attaches without an
+      // identity verification step, or when PREVIEW_URL points at a
+      // host that doesn't respond to an identity probe.
+      const catchConfidence: "confirmed" | "review" =
+        process.env.PINNED_CATCH_CONFIDENCE === "review" ? "review" : "confirmed";
+      for (const id of newFailures) {
+        // Quarantine: review-confidence catches are RECORDED for audit
+        // but don't count toward the unique-confirmed set that derives
+        // breaksCaught + the UserPromptSubmit hook headline.
+        if (catchConfidence === "confirmed") caughtClaimIds.add(id);
+      }
       lastCatchAt = new Date().toISOString();
       lastCatchClaimId = newFailures[0];
       // Append catch records — newest first. Cap at CATCH_HISTORY_LIMIT
@@ -7566,6 +7942,7 @@ program
           badCase: e?.badCase,
           originPr: e?.prId,
           bugFixOrigin: e?.bugFixOrigin,
+          confidence: catchConfidence,
         };
       });
       catchHistory = [...newRecords, ...catchHistory].slice(0, CATCH_HISTORY_LIMIT);
@@ -8941,6 +9318,123 @@ program
     }
   });
 
+// 0.2.16+ BETA: opt-in Playwright installer. Per locked
+// [[full-stack-roadmap-2026-06-03]]: Playwright pulls hundreds of MB
+// of browser binaries → MUST be opt-in. Gates behind explicit consent
+// + disclosure of what gets installed and where.
+program
+  .command("add-browser")
+  .description(
+    "🛟 BETA — install Playwright so Pinned can run interaction-baseline pins (click/scroll/type → assert observable effect). Opt-in because Playwright downloads ~300 MB of browser binaries. Per locked roadmap: WARN never block, beta catches quarantined."
+  )
+  .option("--yes", "Skip the confirmation prompt (CI scripts).")
+  .option("--quiet", "Suppress the banner.")
+  .action(async (opts: { yes?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const cwd = process.cwd();
+
+    // Detect existing install.
+    const playwrightPkgPath = join(cwd, "node_modules", "@playwright", "test", "package.json");
+    const alreadyInstalled = existsSync(playwrightPkgPath);
+
+    out("");
+    out("🛟 BETA — Pinned interaction-baseline adapter");
+    out("─────────────────────────────────────────────");
+    out("");
+    out("What this installs:");
+    out("  • @playwright/test as a devDependency (~10 MB)");
+    out("  • Chromium browser binaries (~300 MB)");
+    out("");
+    out("Where it lands:");
+    out(`  • Dep:     ${relative(cwd, join(cwd, "node_modules/@playwright/test"))}`);
+    out(`  • Browser: ~/Library/Caches/ms-playwright/ (macOS) or %USERPROFILE%\\AppData\\Local\\ms-playwright (Win)`);
+    out("");
+    out("What it enables:");
+    out("  • interaction-baseline template (record-baseline mode)");
+    out("  • `pinned record-interaction` to capture a baseline for a single pin");
+    out("  • Auto-detection of interaction pins via `pinned sweep` (future)");
+    out("");
+    out("Beta posture (non-negotiable, baked into the template):");
+    out("  • WARN, never block — frontend flake doesn't fail CI.");
+    out("  • Catches quarantined as confidence:\"review\" — never inflate the GA metric.");
+    out("  • Attach-only to running dev server (same scoped probe as backend pins).");
+    out("  • All output labeled 🛟 BETA.");
+    out("");
+
+    if (alreadyInstalled) {
+      out("✓ Playwright is already installed. Browser binaries may still need a refresh:");
+      out("    npx playwright install chromium");
+      out("");
+      out("Then author an interaction pin:");
+      out("  pinned check --description \"click [aria-label=Next] on / scrolls the carousel track\"");
+      return;
+    }
+
+    if (!opts.yes) {
+      process.stdout.write("Install Playwright + Chromium? [y/N] ");
+      const answer = await new Promise<string>((resolve) => {
+        let buf = "";
+        process.stdin.setEncoding("utf8");
+        process.stdin.resume();
+        const onData = (chunk: string) => {
+          buf += chunk;
+          if (buf.includes("\n")) {
+            process.stdin.removeListener("data", onData);
+            process.stdin.pause();
+            resolve(buf.trim().toLowerCase());
+          }
+        };
+        process.stdin.on("data", onData);
+      });
+      if (answer !== "y" && answer !== "yes") {
+        out("");
+        out("Aborted. No install performed.");
+        return;
+      }
+    }
+
+    out("");
+    out("Installing @playwright/test...");
+    // Detect package manager from lockfile in cwd. Fall back to npm.
+    const pm: "pnpm" | "yarn" | "npm" =
+      existsSync(join(cwd, "pnpm-lock.yaml")) ? "pnpm" :
+      existsSync(join(cwd, "yarn.lock")) ? "yarn" :
+      "npm";
+    const installCmd = pm === "pnpm"
+      ? { cmd: "pnpm", args: ["add", "-D", "@playwright/test"] }
+      : pm === "yarn"
+        ? { cmd: "yarn", args: ["add", "-D", "@playwright/test"] }
+        : { cmd: "npm", args: ["install", "--save-dev", "@playwright/test"] };
+    try {
+      const { spawnSync } = await import("node:child_process");
+      const r1 = spawnSync(installCmd.cmd, installCmd.args, { cwd, stdio: "inherit" });
+      if (r1.status !== 0) {
+        err(`✗ Install failed (${installCmd.cmd} ${installCmd.args.join(" ")}).\n`);
+        process.exit(1);
+      }
+      out("");
+      out("Downloading Chromium browser binary (~300 MB, one-time)...");
+      const r2 = spawnSync("npx", ["playwright", "install", "chromium"], { cwd, stdio: "inherit" });
+      if (r2.status !== 0) {
+        err(`✗ Chromium install failed. Run \`npx playwright install chromium\` manually.\n`);
+        process.exit(1);
+      }
+    } catch (e) {
+      err(`✗ ${(e as Error).message}\n`);
+      process.exit(1);
+    }
+
+    out("");
+    out("✓ Playwright + Chromium installed.");
+    out("");
+    out("Next:");
+    out("  pinned check --description \"click [aria-label=Next] on / scrolls the carousel track\"");
+    out("  pinned record-interaction <claim-id>   # capture the baseline (coming next)");
+    out("  pinned uninstall                       # remove Pinned + Playwright dep");
+    out("");
+    out("🛟 BETA — see https://pinnedai.dev/docs/interaction-beta for the full guide.");
+  });
+
 // Installer for the PostToolUse hook. Per the consent ladder this is
 // an L1 step — explicit yes, show-and-confirm the exact diff, marker-
 // bounded so uninstall is clean. Per-project default; --global behind
@@ -9709,6 +10203,8 @@ function describeClaim(c: Claim): string {
       const path = c.steps.map((s) => `${s.method} ${s.route}`).join(" → ");
       return `journey        ${c.label}  →  ${path}`;
     }
+    case "interaction-baseline":
+      return `interaction🛟 BETA  ${c.action} ${c.selector} @ ${c.page}  →  ${c.observe.kind}`;
   }
 }
 

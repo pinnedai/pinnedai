@@ -1999,6 +1999,12 @@ export type RetroactiveJourneyHit = {
     route: string;
     setsCookie?: string;
     redirectIncludes?: string;
+    // 0.2.16+: empty-state markers extracted from the target page's
+    // source ("No signup found" etc). When present, the journey
+    // template emits these as `expect.bodyForbids` on this step so
+    // the journey catches the "happened structurally but the page
+    // shows the empty-state copy" failure mode (socialideagen #3).
+    bodyForbids?: string[];
   }>;
   filePaths: string[];
   pairReason: "shared-session-module" | "redirect-target";
@@ -2008,6 +2014,90 @@ export type RetroactiveJourneyHit = {
 
 // Lightweight per-file extract used by the detector. Keep it small —
 // we run it on every file in the baseline pass.
+// 0.2.16+: extract empty-state UI markers from a page's source so the
+// journey detector can populate `bodyForbids` automatically. Catches
+// socialideagen #3 (/thanks shows "No signup found" when the cookie
+// isn't set). Patterns we look for inside JSX h1/h2/h3 tags:
+//   - "No X found" / "X not found"
+//   - "Sign in to" / "Please sign"
+//   - "expired" / "expired session"
+//   - "404" (rarely a real route, but a real signal when present)
+//
+// We deliberately scope to CONDITIONAL branches — text that ALWAYS
+// renders (page title, marketing copy) shouldn't be in bodyForbids
+// or we'll false-fire on legitimate renders. Conservative pattern:
+// only extract a heading if the surrounding source has an `if (!X)`
+// / ternary / `&&` guard within 8 lines above. Misses some real
+// empty-states but precision >> recall here since false-bodyForbids
+// = pin false-fires on the happy path.
+export function extractEmptyStateMarkers(content: string): string[] {
+  const out = new Set<string>();
+  // Strip comments first.
+  const stripped = content
+    .replace(/\/\/.*$/gm, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+
+  // Find h1/h2/h3 text content. JSX-style: <h1 ...>text</h1>.
+  // Allow class attrs and inline expressions; capture the text part.
+  const HEADING_RE = /<h[1-3][^>]*>([^<{]+?)<\/h[1-3]>/g;
+  for (const m of stripped.matchAll(HEADING_RE)) {
+    const text = m[1].trim();
+    if (text.length < 3 || text.length > 80) continue;
+    // Only keep texts that look like empty-state markers.
+    const isEmptyMarker = /^No\s+\w/.test(text)
+      || /\bnot\s+found\b/i.test(text)
+      || /^Sign\s+in\b/i.test(text)
+      || /^Please\s+sign/i.test(text)
+      || /\bexpired\b/i.test(text)
+      || /^404\b/.test(text);
+    if (!isEmptyMarker) continue;
+
+    // Precision gate: the heading text should appear ABOVE a conditional
+    // guard pattern in the same file. Find the heading's source-index,
+    // walk back ~8 lines, check for `if (!X)` / `: <` / `&& <` patterns.
+    const idx = stripped.indexOf(m[0]);
+    if (idx < 0) continue;
+    const before = stripped.slice(Math.max(0, idx - 500), idx);
+    const hasConditional =
+      /\bif\s*\(\s*!\s*\w/.test(before) ||
+      /\?\s*<\s*\w/.test(before) ||
+      /\&\&\s*<\s*\w/.test(before) ||
+      /\breturn\s+<\s*(?:[A-Z]\w*|h[1-3])/.test(before);
+    if (!hasConditional) continue;
+
+    out.add(text);
+  }
+
+  // Component-name signal: `<NoSignup ...>` / `<NoUser />` /
+  // `<NotFound />` — these abstract-named components almost always
+  // render empty-state copy. When found, infer the empty-state text
+  // from the component name itself: "No signup" → bodyForbids "No
+  // signup". Lower-confidence than direct heading text.
+  const COMPONENT_RE = /<(No[A-Z]\w+|NotFound)\b/g;
+  for (const m of stripped.matchAll(COMPONENT_RE)) {
+    const name = m[1];
+    // Find the component definition in this file. Accept all common
+    // forms: `function X`, `async function X`, `export function X`,
+    // `const X = `, arrow functions. The previous regex required
+    // export/const which missed plain `function X(...)` definitions
+    // (the most common Next.js pattern).
+    const defPattern = new RegExp(`(?:(?:export\\s+(?:default\\s+)?)?(?:async\\s+)?function|(?:export\\s+)?const|let|var)\\s+${name}\\s*[(=]`);
+    if (defPattern.test(stripped)) {
+      const defStart = stripped.search(defPattern);
+      if (defStart >= 0) {
+        const defBlock = stripped.slice(defStart, defStart + 2000);
+        const innerHeading = /<h[1-3][^>]*>([^<{]+?)<\/h[1-3]>/.exec(defBlock);
+        if (innerHeading) {
+          const text = innerHeading[1].trim();
+          if (text.length >= 3 && text.length <= 80) out.add(text);
+        }
+      }
+    }
+  }
+
+  return Array.from(out);
+}
+
 type FileAnalysis = {
   filePath: string;
   route: string | null;
@@ -2022,6 +2112,12 @@ type FileAnalysis = {
   // setCookie calls: cookies.set("name", ...) or res.cookies.set(NAME, ...).
   // Captures the cookie name when literal (string) or imported constant.
   setsCookies: string[];
+  // 0.2.16+ for pages only: empty-state markers extracted from the
+  // page's source (e.g. "No signup found" inside a conditional branch).
+  // Used by detectRetroactiveJourneys to populate bodyForbids on the
+  // page step so the journey catches "signup happened but cookie wasn't
+  // set → page shows empty state."
+  emptyStateMarkers: string[];
 };
 
 const SESSION_WRITE_FN = /^(?:write|set)([A-Z]\w*?)(?:Id|Session|Cookie|Token)$/;
@@ -2112,6 +2208,9 @@ function analyzeFile(filePath: string, content: string): FileAnalysis | null {
   for (const m of stripped.matchAll(COOKIE_SET_LITERAL)) setsCookies.push(m[1]);
   for (const m of stripped.matchAll(COOKIE_SET_CONST)) setsCookies.push(m[1]);
 
+  // 0.2.16+ empty-state markers (pages only — handlers don't render UI).
+  const emptyStateMarkers = isPage ? extractEmptyStateMarkers(content) : [];
+
   return {
     filePath,
     route,
@@ -2120,6 +2219,7 @@ function analyzeFile(filePath: string, content: string): FileAnalysis | null {
     imports,
     redirectTargets,
     setsCookies,
+    emptyStateMarkers,
   };
 }
 
@@ -2167,11 +2267,18 @@ export function detectRetroactiveJourneys(
           label,
           steps: [
             { method: handler.method!, route: handler.route! },
-            { method: "GET", route: page.route! },
+            {
+              method: "GET",
+              route: page.route!,
+              // 0.2.16+: empty-state markers from the page → bodyForbids.
+              // Catches socialideagen #3 ("/thanks shows 'No signup found'"
+              // when the cookie wasn't set during signup).
+              ...(page.emptyStateMarkers.length > 0 ? { bodyForbids: page.emptyStateMarkers } : {}),
+            },
           ],
           filePaths: [handler.filePath, page.filePath],
           pairReason: "shared-session-module",
-          sharedToken: `${name}() in handler + ${readFn}() in page, both from ${mod}`,
+          sharedToken: `${name}() in handler + ${readFn}() in page, both from ${mod}${page.emptyStateMarkers.length > 0 ? ` (page guards: ${page.emptyStateMarkers.map((m) => JSON.stringify(m)).join(", ")})` : ""}`,
           suggestedPin: `journey: ${label} (${handler.method} writes ${subject.toLowerCase()} session; page reads it via ${readFn})`,
         });
       }
@@ -2205,11 +2312,15 @@ export function detectRetroactiveJourneys(
               ...(queryHint ? { redirectIncludes: queryHint } : {}),
               ...(setsCookie ? { setsCookie } : {}),
             },
-            { method: "GET", route: page.route! },
+            {
+              method: "GET",
+              route: page.route!,
+              ...(page.emptyStateMarkers.length > 0 ? { bodyForbids: page.emptyStateMarkers } : {}),
+            },
           ],
           filePaths: [handler.filePath, page.filePath],
           pairReason: "redirect-target",
-          sharedToken: `${handler.method ?? "GET"} ${handler.route} redirects to ${target}${setsCookie ? ` + sets cookie "${setsCookie}"` : ""}`,
+          sharedToken: `${handler.method ?? "GET"} ${handler.route} redirects to ${target}${setsCookie ? ` + sets cookie "${setsCookie}"` : ""}${page.emptyStateMarkers.length > 0 ? ` (page guards: ${page.emptyStateMarkers.map((m) => JSON.stringify(m)).join(", ")})` : ""}`,
           suggestedPin: `journey: ${label} (handler redirects to the page; ${setsCookie ? `also sets cookie "${setsCookie}" — pin asserts the redirect target + cookie` : "pin asserts the redirect target"})`,
         });
       }

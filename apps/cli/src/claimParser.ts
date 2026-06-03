@@ -277,6 +277,11 @@ export function classifyPinStrength(
     case "journey":
       // Multi-step HTTP. Same gating as the single-step HTTP templates.
       return httpVerifiable ? "behavioral" : "unverified";
+    case "interaction-baseline":
+      // 0.2.16+ BETA Playwright adapter. Same gating as HTTP — needs a
+      // browser-reachable PREVIEW_URL. Marked behavioral when reachable
+      // (the interaction IS a real behavior); unverified otherwise.
+      return httpVerifiable ? "behavioral" : "unverified";
   }
 }
 
@@ -647,6 +652,46 @@ export type JourneyClaim = {
   raw: string;
 };
 
+// 0.2.16+ BETA — Playwright interaction pin. Per the locked
+// [[full-stack-roadmap-2026-06-03]]: opt-in (Playwright pulls
+// hundreds of MB), WARN never block, beta catches MUST quarantine
+// (auto-tagged confidence:"review"), attach-only via the scoped
+// dev-server probe, label everything beta.
+//
+// Pin shape: render a page → perform an interaction (click /
+// scroll / type) → observe an effect (scroll position, DOM text,
+// URL change, element count) → assert it matches the recorded
+// baseline. The baseline is captured once via `pinned record-
+// interaction` and stored ON the claim; the pin replays the
+// interaction and compares observed-effect against baseline.
+export type InteractionBaselineClaim = {
+  template: "interaction-baseline";
+  // Page route to render (e.g. "/", "/products"). The pin prepends
+  // PREVIEW_URL at runtime.
+  page: string;
+  // CSS selector for the interactive element to act on.
+  // Prefer accessible selectors: [aria-label=...], [data-testid=...].
+  selector: string;
+  // The interaction to perform.
+  action: "click" | "scroll" | "type" | "press-key";
+  // Optional argument for the action: text to type, scroll-by px,
+  // key to press. Unused for plain click.
+  actionArgs?: string;
+  // What to observe AFTER the action — the dimension that should
+  // have changed as a result of the interaction.
+  observe:
+    | { kind: "scroll-position"; element?: string }   // window or element scrollTop/scrollLeft
+    | { kind: "dom-text"; element: string }            // textContent of an element
+    | { kind: "url" }                                  // window.location.href
+    | { kind: "element-count"; element: string };      // querySelectorAll(element).length
+  // Recorded baseline observation. When present, the pin asserts the
+  // observed value matches. When absent (claim emitted from auto-
+  // detection without record step), the pin warns "no baseline — run
+  // pinned record-interaction to capture."
+  baseline?: string;
+  raw: string;
+};
+
 export type Claim =
   | RateLimitClaim
   | AuthRequiredClaim
@@ -675,7 +720,8 @@ export type Claim =
   | PageRendersClaim
   | ValidationRejectsBadClaim
   | HappyPathWithSideEffectClaim
-  | JourneyClaim;
+  | JourneyClaim
+  | InteractionBaselineClaim;
 
 // A route token: must start with ASCII `/`, must not contain whitespace,
 // trailing punctuation, OR dangerous Unicode characters (RTL-override,
@@ -2093,6 +2139,12 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         check: `Walks ${c.steps.length} step(s) with a shared cookie jar. Per step: asserts status, body inclusions, body forbids, and any expected Set-Cookie / redirect. Catches regressions single-step templates structurally miss (e.g. signup succeeds but /me returns stale email).`,
       };
     }
+    case "interaction-baseline":
+      return {
+        title: `🛟 BETA · ${c.action} ${c.selector} @ ${c.page}`,
+        promise: `Interaction ${c.action} on \`${c.selector}\` at \`${c.page}\` still produces the same observable effect (${c.observe.kind}) as the recorded baseline.`,
+        check: `(BETA, opt-in) Renders ${c.page} via Playwright, performs ${c.action} on ${c.selector}, observes ${c.observe.kind}, compares to baseline. WARN-only on drift; catches tagged confidence:"review" so they don't inflate the GA metric.`,
+      };
   }
 }
 
@@ -2224,6 +2276,8 @@ export function badCaseForClaim(claim: Claim): string {
       const summary = claim.steps.map((s) => `${s.method} ${s.route}`).join(" → ");
       return `journey \`${claim.label}\` regressed at some step in (${summary}) — multi-step session/state contract broken (e.g. signup OK but /me returns stale data; login OK but dashboard shows expired-session warning; checkout OK but order page missing items)`;
     }
+    case "interaction-baseline":
+      return `🛟 BETA: interaction "${claim.action} ${claim.selector}" on \`${claim.page}\` no longer produces the same observable effect (${claim.observe.kind}) — the handler may be removed/broken, the selector may have changed, or the page no longer renders this element`;
   }
 }
 
@@ -2310,6 +2364,8 @@ export function claimRoute(c: Claim): string | null {
       // as the "primary" location (matches the human reading of the
       // journey: signup → dashboard ⇒ /signup is the entry point).
       return c.steps[0]?.route ?? null;
+    case "interaction-baseline":
+      return c.page;
   }
 }
 
@@ -2353,7 +2409,9 @@ export function claimSlug(claim: Claim): string {
                               ? `form-error-${claim.filePath}`
                               : claim.template === "journey"
                                 ? `journey-${claim.label}-${claim.steps.map((s) => `${s.method}-${s.route}`).join("-")}`
-                                : claim.route;
+                                : claim.template === "interaction-baseline"
+                                  ? `interaction-${claim.action}-${claim.page}-${claim.selector}`
+                                  : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -2456,6 +2514,8 @@ export function claimKey(c: Claim): string {
         .join("|");
       return `journey:${c.label}:${stepKey}`;
     }
+    case "interaction-baseline":
+      return `interaction-baseline:${c.page}:${c.selector}:${c.action}:${c.observe.kind}`;
   }
 }
 

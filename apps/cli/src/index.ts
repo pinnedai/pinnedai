@@ -89,6 +89,7 @@ import { generatePageRendersTest } from "./templates/pageRenders.js";
 import { generateValidationRejectsBadTest } from "./templates/validationRejectsBad.js";
 import { generateHappyPathWithSideEffectTest } from "./templates/happyPathWithSideEffect.js";
 import { generateJourneyTest } from "./templates/journey.js";
+import { generateInteractionBaselineTest } from "./templates/interactionBaseline.js";
 
 // Convenience dispatcher — given any Claim, pick the right generator.
 // Keeps callers (CLI, landing demo, hosted Worker) DRY.
@@ -189,6 +190,8 @@ function dispatchToTemplate(claim: Claim, opts: GenerateOpts): GeneratedTest {
       return generateHappyPathWithSideEffectTest(claim, opts);
     case "journey":
       return generateJourneyTest(claim, opts);
+    case "interaction-baseline":
+      return generateInteractionBaselineTest(claim, opts);
   }
   // Exhaustiveness guard — if a new Claim variant is added without a
   // case here, TS will fail to compile this assignment with a clear

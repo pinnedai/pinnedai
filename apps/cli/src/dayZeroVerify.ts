@@ -262,9 +262,11 @@ function preflight(claim: Claim, cwd: string): string | null {
     case "validation-rejects-bad":
     case "happy-path-with-side-effect":
     case "journey":
-      // Live-HTTP templates — no source-file preflight check needed.
-      // Templates' own skipIf-on-missing-PREVIEW_URL handles the
-      // common "can't actually verify right now" case.
+    case "interaction-baseline":
+      // Live-HTTP / browser templates — no source-file preflight check
+      // needed. Templates' own skipIf-on-missing-PREVIEW_URL (and the
+      // BETA Playwright install check) handles the "can't actually
+      // verify right now" case.
       return null;
   }
 }

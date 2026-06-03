@@ -2,6 +2,89 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.16] — 2026-06-03
+
+Backend GA proof packaging + identity-aware quarantine trigger + journey empty-state extraction + Playwright interaction adapter beta. Closes 4 of the items from the locked [[full-stack-roadmap-2026-06-03]] in a single batch.
+
+### Added — `pinned sweep` command (red→green proof packaging)
+
+Per locked [[pattern-driven-family-sweep]]: `pinned audit` is L0 (read-only); `pinned sweep` is L1 (read + pin). Walks the tree, runs precision-bound detectors (host-conditional + family, retroactive write-endpoints, retroactive journeys), groups multi-consumer findings into families with shared roots, prints a summary, and batch-confirms before writing pin files. Uses the existing `generateTest()` dispatcher so every shipped template improvement (schema-derived bodies, tier-1/2/3 safety net, etc) applies automatically.
+
+Acceptance on socialideagen: sweep surfaces the host-conditional family (`lib/host.ts:resolveIdeaFromRequest` → 2 consumer routes), 3 journeys (admin-logout, confirm→thanks with `setsCookie: "SIGNUP_COOKIE"`, signup→thanks). User confirms once with `Y` and pin files land. At 6bf2c28 those pins go RED against a preview; at HEAD they go GREEN. Detection alone was not the demo — sweep IS the demo.
+
+### Added — project-identity probe with auto `confidence:"review"` trigger
+
+Completes the second half of the phantom-catch fix per the locked roadmap. `probeRunningDevServer` now does identity verification when the user adds an `http.identity_marker` to `.pinnedai/config.json` + an `http.identity_path` (defaults to `/__pinned/identity`). Probe hits the path; if the response carries `X-Pinned-Project: <marker>` header OR the body contains the marker, identity is `"verified"` and catches default to `confidence:"confirmed"`. If marker missing, mismatched, or 404, identity is `"config-only"` and the test runner is invoked with `PINNED_CATCH_CONFIDENCE=review` so any catches get auto-quarantined.
+
+Opt-in by design — most users don't need it. Add when port collisions are likely (multi-project dev), or when running Pinned in CI against a self-hosted preview where identity matters. Full pattern documented in `docs/test-fixtures.md` with header + body response examples.
+
+### Added — journey detector extracts empty-state UI markers → `bodyForbids`
+
+Closes socialideagen bug #3 ("/thanks shows 'No signup found' when cookie isn't set") with structural detection. `extractEmptyStateMarkers()` scans page sources for empty-state UI text inside conditional branches: `<h1>No X found</h1>`, `<NoSignup />` / `<NotFound />` component-shape patterns (with internal heading extraction), `<h1>X not found</h1>` / `<h1>Sign in</h1>` / `<h1>expired session</h1>`. Precision-gated — text must appear inside an `if (!X) return` / ternary / `&&` conditional, not in marketing copy.
+
+`detectRetroactiveJourneys` threads the extracted markers as `bodyForbids` on the page step. When auto-pinned via `pinned sweep`, the journey claim's page step asserts the markers don't appear in the rendered response. socialideagen example: signup→/thanks journey now auto-includes `bodyForbids: ["No signup found"]`. Three-test matrix (5/5 green) + FP sweep on 330 dyad pages: 1 true-positive marker extracted ("Sign in" from Ai-Book's Login.tsx), 0 false-positives.
+
+### Added — Playwright interaction adapter (BETA, opt-in)
+
+Per locked roadmap. Full-stack coverage extends to frontend interaction regressions (the carousel "arrows do nothing" class) by WRAPPING Playwright — never building a browser engine.
+
+**New:** `pinned add-browser` opt-in installer with disclosure of install size (~300 MB) + consent prompt. Detects existing install; idempotent. Detects user's package manager (pnpm/yarn/npm). Installs `@playwright/test` as devDep then runs `npx playwright install chromium`.
+
+**New:** `interaction-baseline` template. New `InteractionBaselineClaim` type wired through every exhaustive switch (claim union, dispatcher, claimRoute, claimKey, classifyPinStrength, describeClaimForUser, badCaseForClaim, summarizeClaimForBanner, describeClaim, preflight, coverageFromClaim, claimLabel, backtest path-relevance). The emitted test:
+- **Dynamic-imports** `@playwright/test` so the file PARSES even without Playwright installed — the test just skips with a clear "run `pinned add-browser`" message.
+- **Sets `PINNED_CATCH_CONFIDENCE = "review"`** at module load. Beta catches auto-quarantine via 0.2.15 metric machinery so they don't inflate the GA "regressions caught" headline.
+- **WARNS instead of throwing** on baseline drift. Frontend flake is real; beta does NOT gate merges. The emitted drift path uses `console.warn` + `return`, never `throw`.
+- **Attaches to the dev server** (never auto-boots, reuses scoped probe from 0.2.14).
+- **Labels everything 🛟 BETA** in output, including a clear `pinned record-interaction` re-record command in the drift warning.
+
+Observation kinds supported: `scroll-position`, `dom-text`, `url`, `element-count`. Actions: `click`, `scroll`, `type`, `press-key`.
+
+Three-test matrix (4/4 green):
+- Positive: emitted test carries all expected markers (BETA label, confidence:"review", playwright import, drift detection, scroll-position observation, baseline literal)
+- Negative 1: no-baseline path emits a warn-only branch with re-record hint
+- Negative 2: drift path uses `console.warn` + `return`, NOT `throw`
+- CLI: `pinned add-browser --help` exposes the command with the right opt-in wording
+
+**Roadmap status:** 4 of 5 items from the locked roadmap shipped in 0.2.16. Remaining: auto-detection of interaction pins (find onClick handlers on buttons + propose pins via sweep) — Phase 2.
+
+### Internal
+
+- New `extractEmptyStateMarkers(content)` exported from scanDiff.ts
+- `FileAnalysis.emptyStateMarkers` added; threaded into `RetroactiveJourneyHit.steps[].bodyForbids`
+- `probeRunningDevServer` return type adds `identity: "verified" | "config-only"`
+- `InteractionBaselineClaim` added to claim union + wired through 13 exhaustive switches
+- New template `apps/cli/src/templates/interactionBaseline.ts` with safe-by-default emission
+
+## [0.2.15] — 2026-06-03
+
+P0 follow-on to 0.2.14: the second half of the phantom-catch trust fix per the locked [[full-stack-roadmap-2026-06-03]]. 0.2.14 stopped phantoms at the SOURCE (probe only attaches to config.http.url). 0.2.15 adds a SAFETY NET so even if a future probe path or misconfigured PREVIEW_URL produces a catch against an unverified host, the resulting record doesn't inflate the GA "regressions caught" headline.
+
+### Added — catch-confidence field + metric quarantine
+
+New optional `confidence: "confirmed" | "review"` field on `CatchRecord`:
+
+- **`undefined`** — legacy records (pre-0.2.15). Treated as confirmed for backward compat.
+- **`"confirmed"`** — host was identity-verified for this project. Counts toward `breaksCaught` + the UserPromptSubmit hook's headline alarm.
+- **`"review"`** — host attached but identity couldn't be confirmed. **PRESERVED in `catchHistory` for audit BUT EXCLUDED from `breaksCaught`** + the hook's headline. Surfaces in `pinned catches` with a 🔍 prefix and a `(review — not counted in lifetime catches)` suffix so the user knows to audit.
+
+### Wiring
+
+- `pinned test` now reads `PINNED_CATCH_CONFIDENCE` env var when recording a green→red transition. Defaults to `"confirmed"` (preserves current 0.2.14 behavior). Future versions will auto-set `"review"` when probe attaches without an identity-verification step.
+- `caughtClaimIds` set (which derives `breaksCaught`) now only adds claim IDs when the catch is `confirmed`. Review-confidence records stay in `catchHistory` but don't bump the metric.
+- A claim that gets a `review` catch first and a `confirmed` catch later DOES promote into `breaksCaught` (the audit history is monotonic).
+- `pinned catches` listing renders `🔍 review` instead of `🛟` so the user can spot quarantined entries.
+
+### Three-test matrix (4/4 green)
+
+- **Positive** — 2 confirmed catches → `breaksCaught` 1 → 3 ✓
+- **Negative** — 2 review catches → `breaksCaught` stays at 1 (quarantined) ✓
+- **Mixed** — same claim review then later confirmed → now counts ✓
+- **Dedup** — already-caught + new confirmed → still 1 (Set dedupe holds) ✓
+
+### Roadmap status
+
+Both halves of the P0 phantom-catch fix from [[full-stack-roadmap-2026-06-03]] are now shipped (0.2.14 = probe scope; 0.2.15 = metric quarantine). Next: identity probe that triggers `review` automatically when an attach can't be verified.
+
 ## [0.2.14] — 2026-06-03
 
 P0 hotfix for a trust-damaging bug shipped in 0.2.12.
