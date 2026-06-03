@@ -165,6 +165,19 @@ npx pinned regenerate --all          # re-emit all pin .test.ts files using the 
 npx pinned retire <claim-id> --reason="..."   # legitimate retirement (writes audit entry)
 ```
 
+### Browser interaction pins (🛟 BETA — opt-in)
+
+Cover frontend interaction regressions (the carousel "arrows do nothing" class) by wrapping Playwright. Beta posture: WARN-only on drift, attach-only to a running dev server, catches quarantined as `confidence:"review"` so they don't inflate the GA metric.
+
+```bash
+npx pinned add-browser                                # one-time: install Playwright + Chromium (~300 MB)
+npx pinned sweep --include-beta                       # auto-detect interaction candidates + pin them
+npx pinned record-interaction <claim-id>              # capture the baseline observation once
+npx pinned record-interaction <claim-id> --dry-run    # observe without persisting (calibration)
+```
+
+Auto-detection finds buttons with stable selectors (`data-testid` preferred over `aria-label`) AND an `onClick` handler. Until you run `record-interaction`, the pin emits a single warn-only message; only after recording does drift get reported.
+
 ### Internal (called by hooks)
 
 ```bash

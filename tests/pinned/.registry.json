@@ -1000,6 +1000,21 @@
       "status": "active",
       "covers": {},
       "badCase": "running `node ./apps/cli/dist/cli.js add-browser --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-record-interaction-help-16e6mc",
+      "prId": "auto-20260603",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js record-interaction --help",
+        "raw": "`node ./apps/cli/dist/cli.js record-interaction --help` exits 0"
+      },
+      "filename": "auto-20260603-cli-exits-zero-node-apps-cli-dist-cli-js-record-interaction-help-16e6mc.test.ts",
+      "pinnedAt": "2026-06-03T13:34:15.331Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js record-interaction --help` exited with non-zero status (command broken)"
     }
   ]
 }

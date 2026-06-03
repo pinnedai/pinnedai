@@ -1,6 +1,6 @@
 {
   "name": "pinnedai",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "description": "Stop your AI coder from repeating bugs. Free beta · Founder Pro waitlist open. Pinned captures bug patterns, builds regression guards, audits sibling code paths, and blocks future AI edits that break or weaken those guards. Bug → guard → siblings audited → future edits checked → AI lesson saved.",
   "type": "module",
   "license": "Apache-2.0",

@@ -2,6 +2,39 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.17] — 2026-06-03
+
+Closes the BETA Playwright adapter loop: auto-detection of interaction pins from source + `pinned record-interaction` to capture the baseline. With this release, the carousel "arrows do nothing" regression class is end-to-end covered — discover → pin → record → catch — without the user authoring a single test by hand.
+
+### Added — auto-detect interaction pins (`pinned sweep --include-beta`)
+
+`detectInteractionCandidates()` walks the customer's `app/` / `pages/` / `src/` / `components/` trees for JSX buttons that satisfy ALL of:
+1. Have a stable selector (`data-testid="…"` preferred over `aria-label="…"`).
+2. Have an `onClick` handler (visual-only buttons are skipped).
+3. Live in a real component file (API routes filtered out).
+4. Aren't inside a `// …` or `/* … */` comment (commented-out JSX skipped).
+
+Handles ternary aria-labels (`aria-label={dir < 0 ? "Previous" : "Next"}` emits TWO candidates) — the exact shape that ships in `socialideagen/components/Carousel.tsx`. Suggested observation is inferred from the aria-label semantics: `"Next"` / `"Previous"` / `"Scroll"` → `scroll-position`; `"Open"` / `"Toggle"` / `"Show"` → `element-count`; `"Submit"` / `"Sign in"` / `"Continue"` → `url`; default → `dom-text`.
+
+Surfaced in `pinned sweep` output under "🛟 BETA — Interaction-baseline candidates" (visible by default, NOT pinned). Pinning requires both `--include-beta` AND a prior `pinned add-browser` to keep the consent ladder explicit. FP sweep across 10 dyad repos / 445 component files: 3 candidates, all real (2 socialideagen carousel arrows + 1 Ai-Book intro-video modal), 0 spurious hits.
+
+### Added — `pinned record-interaction <claim-id>`
+
+The final piece of the interaction-baseline workflow. Runs the action once via Playwright against `$PREVIEW_URL` (or `--url=<url>`, defaulting to `http://localhost:3000`), captures the observable value (scroll position / DOM text / URL / element count), writes it back onto the claim's `baseline` field in `.registry.json`, regenerates the `.test.ts` so the embedded `BASELINE` constant matches.
+
+Sanctioned via the same `.pinnedai/regenerate-allow.json` marker as `pinned regenerate` (source: `"record-interaction"`, 5-min TTL, sha256-bound to the regenerated file), so the pre-commit guard-removal hook recognizes the change as legitimate. Until a baseline is recorded, the auto-pinned test emits a single warn-only message ("no baseline yet — run pinned record-interaction") and returns green; the only way to ship a beta interaction pin to CI is the explicit record step.
+
+Resolves Playwright from the customer's `cwd/node_modules`, NOT the CLI's install dir — Playwright is the customer's optional devDep, not Pinned's runtime dep. Hard-fails with a pointer to `pinned add-browser` when missing. Refuses non-`http(s)` URLs, refuses claim-ids that aren't interaction-baseline pins, accepts only existing active pins (retired pins or unknown ids exit non-zero with a clear message).
+
+### Tested
+
+Three-test matrix + dyad sweep recorded in commit message per [[fp-check-everything-with-real-tests]]:
+- **Positive (detector)**: ternary aria-label carousel → emits both Previous + Next (2 hits). data-testid → preferred over aria-label. "Sign in" aria-label → url observation. 3/3 ✓
+- **Negative (detector)**: button without selector → skipped. Button without onClick → skipped. Commented JSX → skipped. API route → skipped. 4/4 ✓
+- **FP sweep (detector)**: 10 dyad repos, 445 component files, 3 candidates total — all real, 0 spurious.
+- **Positive (record-interaction)**: real Playwright run against a local HTML server clicked an `[aria-label=ScrollDown]` button → observed `top=500,left=0`, persisted to registry, rewrote pin file, wrote regenerate-allow marker. 4/4 ✓
+- **Negative (record-interaction)**: missing claim-id, unknown id, wrong template, no Playwright installed, invalid URL — all fail with specific actionable error. 5/5 ✓
+
 ## [0.2.16] — 2026-06-03
 
 Backend GA proof packaging + identity-aware quarantine trigger + journey empty-state extraction + Playwright interaction adapter beta. Closes 4 of the items from the locked [[full-stack-roadmap-2026-06-03]] in a single batch.

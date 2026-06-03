@@ -32,7 +32,7 @@ import {
   claimSlug,
   claimRoute,
 } from "./claimParser.js";
-import type { Claim } from "./claimParser.js";
+import type { Claim, InteractionBaselineClaim } from "./claimParser.js";
 import { classifyPinStrength, type PinStrength } from "./claimParser.js";
 import { generateTest } from "./index.js";
 import {
@@ -3581,8 +3581,9 @@ program
   .option("--dir <path>", "Pinned tests directory (default: tests/pinned)", "tests/pinned")
   .option("--yes", "Skip the batch-confirm prompt (pin everything high-confidence).")
   .option("--dry-run", "Show what would be pinned without writing.")
+  .option("--include-beta", "Also pin BETA interaction-baseline candidates (requires `pinned add-browser`). Default: listed in the summary, but not pinned.")
   .option("--quiet", "Suppress the banner.")
-  .action(async (opts: { dir: string; yes?: boolean; dryRun?: boolean; quiet?: boolean }) => {
+  .action(async (opts: { dir: string; yes?: boolean; dryRun?: boolean; includeBeta?: boolean; quiet?: boolean }) => {
     if (!opts.quiet) printBanner();
     const cwd = process.cwd();
     assertInsideDir(opts.dir, cwd);
@@ -3629,12 +3630,18 @@ program
 
     // 3. Detectors.
     type Proposal = {
-      kind: "happy-path" | "page-renders" | "journey";
+      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline";
       route: string;
       method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
       filePath: string;
       reason: string;
       claim: Claim;
+      // 0.2.17+: BETA proposals (interaction-baseline) flow through the
+      // same batch-confirm but are visibly tagged so the user can opt
+      // in/out per-section and so they don't inflate "I just pinned N
+      // things" perception. Without --include-beta, beta proposals are
+      // listed but not pinned by default Y answer.
+      beta?: boolean;
     };
     const proposals: Proposal[] = [];
 
@@ -3715,9 +3722,33 @@ program
               status: { min: 200, max: 399 },
               ...(s.setsCookie ? { setsCookie: s.setsCookie } : {}),
               ...(s.redirectIncludes ? { redirectIncludes: s.redirectIncludes } : {}),
+              ...((s as { bodyForbids?: string[] }).bodyForbids?.length ? { bodyForbids: (s as { bodyForbids?: string[] }).bodyForbids } : {}),
             },
           })),
           raw: j.suggestedPin,
+        },
+      });
+    }
+
+    // 0.2.17+ BETA: interaction-baseline candidates. Scanned the tree
+    // for buttons with stable selectors (aria-label / data-testid) and
+    // onClick handlers. Tagged beta: listed in the summary, but NOT
+    // pinned without --include-beta (Playwright is opt-in).
+    const { detectInteractionCandidates } = await import("./scanDiff.js");
+    for (const cand of detectInteractionCandidates(tree)) {
+      proposals.push({
+        kind: "interaction-baseline",
+        route: cand.page,
+        filePath: cand.filePath,
+        reason: cand.reason,
+        beta: true,
+        claim: {
+          template: "interaction-baseline",
+          page: cand.page,
+          selector: cand.selector,
+          action: cand.action,
+          observe: { kind: cand.suggestedObserve, ...(cand.suggestedObserve === "element-count" || cand.suggestedObserve === "dom-text" ? { element: "body" } : {}) } as InteractionBaselineClaim["observe"],
+          raw: `🛟 BETA: click ${cand.selector} on ${cand.page} produces a recordable ${cand.suggestedObserve} effect`,
         },
       });
     }
@@ -3767,6 +3798,23 @@ program
       }
       out("");
     }
+    const betaInteractions = proposals.filter((p) => p.kind === "interaction-baseline");
+    if (betaInteractions.length > 0) {
+      out("🛟 BETA — Interaction-baseline candidates (opt-in via --include-beta):");
+      out("");
+      for (const p of betaInteractions.slice(0, 10)) {
+        const c = p.claim as Extract<Claim, { template: "interaction-baseline" }>;
+        out(`  + ${c.action} ${c.selector} @ ${c.page}  →  observe ${c.observe.kind}`);
+        out(`    ${p.reason}`);
+      }
+      if (betaInteractions.length > 10) out(`  + …and ${betaInteractions.length - 10} more`);
+      out("");
+      if (!opts.includeBeta) {
+        out("  Not pinned by default — beta tier requires Playwright (~300 MB).");
+        out("  Run: pinned add-browser   then: pinned sweep --include-beta");
+        out("");
+      }
+    }
 
     // 5. Batch confirm.
     if (opts.dryRun) {
@@ -3810,8 +3858,16 @@ program
     if (!existsSync(opts.dir)) mkdirSync(opts.dir, { recursive: true });
     let written = 0;
     let skipped = 0;
+    let betaSkipped = 0;
     out("");
     for (const p of proposals) {
+      // BETA gating: interaction-baseline proposals only pin when
+      // --include-beta is passed. The locked roadmap requires beta to
+      // be opt-in so Playwright (~300 MB) isn't a surprise install.
+      if (p.beta && !opts.includeBeta) {
+        betaSkipped++;
+        continue;
+      }
       const gen = generateTest(p.claim, { prId, pinnedVersion: version });
       const target = join(opts.dir, gen.filename);
       try {
@@ -3836,7 +3892,7 @@ program
     if (written > 0) writeRegistry(opts.dir, registry);
 
     out("");
-    out(`✓ Sweep complete: ${written} pin${written === 1 ? "" : "s"} written, ${skipped} already existed.`);
+    out(`✓ Sweep complete: ${written} pin${written === 1 ? "" : "s"} written, ${skipped} already existed${betaSkipped > 0 ? `, ${betaSkipped} BETA interaction-pins skipped (use --include-beta to enable)` : ""}.`);
     out("");
     out("Next:");
     out("  • Set PREVIEW_URL (or have your dev server up) and run `pinned test` to see green or first catches.");
@@ -9429,11 +9485,273 @@ program
     out("");
     out("Next:");
     out("  pinned check --description \"click [aria-label=Next] on / scrolls the carousel track\"");
-    out("  pinned record-interaction <claim-id>   # capture the baseline (coming next)");
+    out("  pinned record-interaction <claim-id>   # capture the baseline");
     out("  pinned uninstall                       # remove Pinned + Playwright dep");
     out("");
     out("🛟 BETA — see https://pinnedai.dev/docs/interaction-beta for the full guide.");
   });
+
+// ─── pinned record-interaction <claim-id> ──────────────────────────
+// Captures the baseline observation for an interaction-baseline pin.
+// Runs the action once via Playwright against a running dev server,
+// writes the observed value back onto the claim's `baseline` field,
+// then regenerates the .test.ts file so future runs assert against it.
+//
+// Strict scope (do NOT widen without re-reading [[strategic-moat-
+// independent-guardrail]]):
+//   • Attach-only. We never auto-boot a dev server.
+//   • Beta-tier: warn-on-failure, never throw, never inflate metrics.
+//   • Sanctioned-edit marker so the pre-commit guard hook recognizes
+//     the regenerated .test.ts as a legitimate change.
+program
+  .command("record-interaction")
+  .description(
+    "🛟 BETA — capture the baseline observation for an interaction-baseline pin. Runs the action once via Playwright against PREVIEW_URL (or http://localhost:3000), writes the observed value into the claim, regenerates the pin file. Requires `pinned add-browser` first."
+  )
+  .argument("[claim-id]", "Claim id to record. Run `pinned list` to see available pins.")
+  .option("--url <url>", "Preview URL to render against. Default: $PREVIEW_URL or http://localhost:3000.")
+  .option("--dir <path>", "Pinned tests directory (default: tests/pinned)", "tests/pinned")
+  .option("--timeout <ms>", "Per-step timeout in ms (default: 15000)", "15000")
+  .option("--dry-run", "Show the observed value without writing it back to the claim.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(
+    async (
+      claimId: string | undefined,
+      opts: { url?: string; dir: string; timeout: string; dryRun?: boolean; quiet?: boolean }
+    ) => {
+      if (!opts.quiet) printBanner();
+
+      if (!claimId) {
+        err(
+          "✗ Pass a claim-id. Run `pinned list` to see available pins, then:\n    pinned record-interaction <claim-id>\n"
+        );
+        process.exit(1);
+      }
+      assertSafeId("claim id", claimId);
+      assertInsideDir(opts.dir, process.cwd());
+      if (!existsSync(opts.dir)) {
+        err(`✗ ${opts.dir}/ does not exist. Run \`pinned init\` first.\n`);
+        process.exit(1);
+      }
+
+      const reg = readRegistry(opts.dir);
+      const entry = reg.claims.find((c) => c.status === "active" && c.claimId === claimId);
+      if (!entry) {
+        err(
+          `✗ No active pin with id '${claimId}'. Run \`pinned list\` to see all active pins.\n`
+        );
+        process.exit(1);
+      }
+      if (entry.claim.template !== "interaction-baseline") {
+        err(
+          `✗ Pin '${claimId}' is template ${entry.claim.template}, not interaction-baseline.\n  record-interaction only applies to BETA interaction pins.\n`
+        );
+        process.exit(1);
+      }
+      const claim = entry.claim as InteractionBaselineClaim;
+
+      // Confirm Playwright is installed.
+      const playwrightPkg = join(process.cwd(), "node_modules", "@playwright", "test", "package.json");
+      if (!existsSync(playwrightPkg)) {
+        err(
+          "✗ @playwright/test is not installed. Run `pinned add-browser` first (BETA, opt-in: ~300 MB download).\n"
+        );
+        process.exit(1);
+      }
+
+      // Resolve preview URL.
+      const previewUrl = opts.url ?? process.env.PREVIEW_URL ?? "http://localhost:3000";
+      let urlOk: URL;
+      try {
+        urlOk = new URL(previewUrl);
+      } catch {
+        err(`✗ Invalid URL: ${previewUrl}\n`);
+        process.exit(1);
+      }
+      if (urlOk.protocol !== "http:" && urlOk.protocol !== "https:") {
+        err(`✗ Only http(s) URLs are supported. Got: ${urlOk.protocol}\n`);
+        process.exit(1);
+      }
+      const stepTimeout = Math.max(1000, parseInt(opts.timeout, 10) || 15000);
+
+      out("");
+      out("🛟 BETA — recording interaction baseline");
+      out("─────────────────────────────────────────");
+      out(`  Pin:       ${entry.filename}`);
+      out(`  Route:     ${claim.page}`);
+      out(`  Selector:  ${claim.selector}`);
+      out(`  Action:    ${claim.action}${claim.actionArgs ? ` (${claim.actionArgs})` : ""}`);
+      out(`  Observe:   ${claim.observe.kind}${"element" in claim.observe && claim.observe.element ? ` (${claim.observe.element})` : ""}`);
+      out(`  URL:       ${previewUrl}`);
+      if (claim.baseline) out(`  Previous:  ${claim.baseline}`);
+      out("");
+
+      // Dynamic Playwright import + run the action once. Same flow as
+      // the emitted test, but here we capture & persist instead of
+      // asserting against a stored value.
+      let observed: string | null = null;
+      let failureReason: string | null = null;
+      try {
+        // Playwright isn't a Pinned dep — it's installed in the customer
+        // workspace via `pinned add-browser`. Resolve it FROM the
+        // customer's cwd (not the CLI's install dir, which is
+        // node_modules/pinnedai/dist/ and has no Playwright). Use a
+        // string variable so bundlers don't try to resolve at build
+        // time; type as `any` since @playwright/test isn't a devDep here.
+        const { createRequire } = await import("node:module");
+        const { pathToFileURL } = await import("node:url");
+        const req = createRequire(join(process.cwd(), "noop.js"));
+        const playwrightEntry = req.resolve("@playwright/test");
+        const playwrightMod = (await import(pathToFileURL(playwrightEntry).href)) as any;
+        // CJS interop: @playwright/test is a CommonJS module. Dynamic
+        // ESM import wraps it as { default: <ns>, "module.exports": <ns> }.
+        // Unwrap to get the actual { chromium, ... } namespace.
+        const playwright = playwrightMod.default ?? playwrightMod;
+        if (!playwright?.chromium?.launch) {
+          throw new Error("@playwright/test exports unexpected shape — could not find chromium launcher.");
+        }
+        const browser = await playwright.chromium.launch();
+        try {
+          const ctx = await browser.newContext();
+          const pageObj = await ctx.newPage();
+          const target = previewUrl.replace(/\/$/, "") + claim.page;
+          await pageObj.goto(target, { waitUntil: "domcontentloaded", timeout: stepTimeout });
+
+          const el = pageObj.locator(claim.selector);
+          try {
+            await el.waitFor({ state: "visible", timeout: 5000 });
+          } catch {
+            failureReason = `selector "${claim.selector}" was not visible on ${claim.page} within 5s. Check the page rendered and the selector matches a real element.`;
+          }
+
+          if (!failureReason) {
+            if (claim.action === "click") {
+              await el.click();
+            } else if (claim.action === "scroll") {
+              const px = claim.actionArgs ? parseInt(claim.actionArgs, 10) || 100 : 100;
+              await el.evaluate((node: HTMLElement, dx: number) => {
+                node.scrollBy(0, dx);
+              }, px);
+            } else if (claim.action === "type") {
+              await el.fill(claim.actionArgs ?? "");
+            } else if (claim.action === "press-key") {
+              await pageObj.keyboard.press(claim.actionArgs ?? "Enter");
+            }
+
+            await pageObj.waitForTimeout(250);
+
+            if (claim.observe.kind === "scroll-position") {
+              if (claim.observe.element) {
+                const scrollTarget = pageObj.locator(claim.observe.element);
+                const pos = await scrollTarget.evaluate((node: HTMLElement) => ({
+                  top: node.scrollTop,
+                  left: node.scrollLeft,
+                }));
+                observed = `top=${pos.top},left=${pos.left}`;
+              } else {
+                const pos = await pageObj.evaluate(() => ({
+                  top: window.scrollY,
+                  left: window.scrollX,
+                }));
+                observed = `top=${pos.top},left=${pos.left}`;
+              }
+            } else if (claim.observe.kind === "dom-text") {
+              try {
+                observed = (await pageObj.locator(claim.observe.element).first().textContent({ timeout: 2000 })) ?? "";
+              } catch {
+                observed = "(missing)";
+              }
+            } else if (claim.observe.kind === "url") {
+              observed = pageObj.url();
+            } else if (claim.observe.kind === "element-count") {
+              observed = String(await pageObj.locator(claim.observe.element).count());
+            }
+          }
+        } finally {
+          await browser.close();
+        }
+      } catch (e) {
+        failureReason = (e as Error).message;
+      }
+
+      if (failureReason) {
+        err(`✗ Recording failed: ${failureReason}\n`);
+        out("");
+        out("Common causes:");
+        out("  • Dev server not running at " + previewUrl);
+        out("  • Selector doesn't match (try the browser DevTools `$$(\"" + claim.selector + "\")`)");
+        out("  • Page requires auth — record-interaction is attach-only, no auth flow.");
+        process.exit(1);
+      }
+      if (observed === null) {
+        err("✗ Recording produced no observation. This is a bug — please file an issue.\n");
+        process.exit(1);
+      }
+
+      out(`Observed baseline:  ${observed}`);
+      if (claim.baseline && claim.baseline !== observed) {
+        out(`(was ${claim.baseline})`);
+      }
+      out("");
+
+      if (opts.dryRun) {
+        out("(--dry-run: claim not updated, pin file not regenerated.)");
+        return;
+      }
+
+      // Persist the baseline back onto the claim + regenerate the file.
+      const updatedClaim: InteractionBaselineClaim = { ...claim, baseline: observed };
+      const updatedRegistry = {
+        ...reg,
+        claims: reg.claims.map((c) =>
+          c.claimId === entry.claimId ? { ...c, claim: updatedClaim } : c
+        ),
+      };
+      writeRegistry(opts.dir, updatedRegistry);
+
+      const gen = generateTest(updatedClaim, {
+        prId: entry.prId,
+        pinnedVersion: version,
+      });
+      const target = join(opts.dir, entry.filename);
+      writeFileSync(target, gen.content);
+
+      // Sanctioned-edit marker so the pre-commit guard recognizes this
+      // regeneration. Same mechanism as `pinned regenerate`.
+      try {
+        const markerDir = ".pinnedai";
+        if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+        const content = readFileSync(target, "utf8");
+        const sha256 = createHash("sha256").update(content).digest("hex");
+        const now = Date.now();
+        writeFileSync(
+          join(markerDir, "regenerate-allow.json"),
+          JSON.stringify(
+            {
+              version: 1,
+              createdAt: new Date(now).toISOString(),
+              expiresAt: new Date(now + 5 * 60 * 1000).toISOString(),
+              runId: randomBytes(8).toString("hex"),
+              source: "record-interaction" as const,
+              regenerated: [{ filename: entry.filename, sha256, dir: opts.dir }],
+            },
+            null,
+            2
+          ) + "\n"
+        );
+      } catch {
+        /* marker is best-effort */
+      }
+
+      out("✓ Baseline recorded.");
+      out(`  Updated:   ${relative(process.cwd(), target)}`);
+      out("");
+      out("Commit the change so the baseline ships with the pin:");
+      out("  git add tests/pinned/ && git commit -m \"chore(pinned): record interaction baseline for " + entry.filename + "\"");
+      out("");
+      out("🛟 BETA — interaction pins WARN-only on drift. Beta catches are confidence:\"review\" and don't inflate the GA metric.");
+    }
+  );
 
 // Installer for the PostToolUse hook. Per the consent ladder this is
 // an L1 step — explicit yes, show-and-confirm the exact diff, marker-

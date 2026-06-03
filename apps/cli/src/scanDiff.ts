@@ -5618,3 +5618,164 @@ export function extractExportedNames(content: string): string[] {
   // hard to name without parsing; skip for now.
   return Array.from(out);
 }
+
+// ────────────────────────────────────────────────────────────
+// Interaction-baseline detector (0.2.17+ BETA)
+// ────────────────────────────────────────────────────────────
+//
+// Per locked [[full-stack-roadmap-2026-06-03]] BETA section: scan
+// pages for interactive elements with handlers → propose interaction
+// pins. Conservative — only flag buttons with stable selectors
+// (aria-label, data-testid). Plain `<button onClick={...}>` without
+// an identity attribute is too brittle to pin (the selector would
+// rely on positional CSS that breaks under any refactor).
+//
+// Catches the socialideagen carousel arrow handler regression: the
+// Carousel.tsx renders `<button aria-label={dir < 0 ? "Previous" :
+// "Next"} onClick={...}>` — detector emits two candidates (Previous
+// + Next), each proposing click + scroll-position observation.
+
+export type InteractionCandidate = {
+  template: "interaction-baseline";
+  page: string;                                // route the element lives on
+  selector: string;                            // CSS selector (aria-label / data-testid)
+  ariaLabel: string;                           // the captured label (used for shape heuristics)
+  action: "click";                             // 0.2.17 ships click only; scroll/type follow
+  suggestedObserve: "scroll-position" | "dom-text" | "url" | "element-count";
+  filePath: string;
+  reason: string;
+};
+
+// Heuristic: map aria-label to a sensible default observation.
+// "Next" / "Previous" / "Forward" / "Back" → scroll-position
+//   (carousel-shaped behavior — the click scrolls a track).
+// "Open" / "Toggle" / "Show" / "Expand" → element-count
+//   (menu/modal opens — a new dialog/menu enters the DOM).
+// "Submit" / "Save" / "Continue" / "Sign in" → url
+//   (form submission usually changes the URL).
+// Everything else → dom-text (default; user can tweak in the pin file).
+function inferObserveFromAriaLabel(label: string): "scroll-position" | "dom-text" | "url" | "element-count" {
+  const l = label.toLowerCase();
+  if (/\b(next|previous|prev|forward|back|left|right|scroll)\b/.test(l)) return "scroll-position";
+  if (/\b(open|toggle|show|expand|menu|modal|dialog)\b/.test(l)) return "element-count";
+  if (/\b(submit|save|continue|sign\s*in|sign\s*up|log\s*in|register|send)\b/.test(l)) return "url";
+  return "dom-text";
+}
+
+export function detectInteractionCandidates(filesByPath: Map<string, string>): InteractionCandidate[] {
+  const out: InteractionCandidate[] = [];
+  const seen = new Set<string>();
+
+  // Match `<button ... aria-label="X" ... onClick={...}>` (any order
+  // of attrs). Also match data-testid variant. We use a two-step
+  // match: locate `<button` tag bodies (up to closing `>`), then
+  // pull aria-label / data-testid + confirm onClick presence.
+  //
+  // Conservative — only matches button elements. role=button divs
+  // are common in design systems but harder to bind to a stable
+  // selector + frequently aren't real handlers (CSS-only hover
+  // affordances). We can extend later.
+  const BUTTON_TAG = /<button\b[^>]{0,500}?>/g;
+  const ARIA_LABEL = /aria-label\s*=\s*(?:["']([^"']{2,60})["']|\{(?:["'`]([^"'`]{2,60})["'`])\})/;
+  const TEST_ID = /data-testid\s*=\s*["']([^"']{2,60})["']/;
+  const ONCLICK = /onClick\s*=/;
+
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    // Only consider rendered page sources. Skip API routes, libs, etc.
+    const pageRoute = derivePageRoute(filePath);
+    // ALSO accept components/ since carousels live there (they get
+    // rendered by some page). We attribute them to a fallback "/"
+    // route in that case — users can edit if they know better.
+    // Match both `components/X.tsx` (relative-ish path) and
+    // `<anything>/components/X.tsx`.
+    const isComponent = !pageRoute && /(?:^|\/)components\//.test(filePath) && /\.(tsx|jsx)$/.test(filePath);
+    if (!pageRoute && !isComponent) continue;
+    const route = pageRoute ?? "/";
+
+    // Strip comments so a commented `aria-label="Old"` doesn't fire.
+    const stripped = content
+      .replace(/\/\/.*$/gm, "")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\{\/\*[\s\S]*?\*\/\}/g, "");
+
+    for (const m of stripped.matchAll(BUTTON_TAG)) {
+      const tag = m[0];
+      if (!ONCLICK.test(tag)) continue; // no handler — not interactive
+      const aria = ARIA_LABEL.exec(tag);
+      const testid = TEST_ID.exec(tag);
+      const label = aria ? (aria[1] ?? aria[2]) : null;
+      const tid = testid ? testid[1] : null;
+
+      // Need at least one stable selector attribute.
+      if (!label && !tid) continue;
+
+      // Build the selector. Prefer data-testid (most stable). Fall
+      // back to aria-label.
+      const selector = tid
+        ? `[data-testid="${tid}"]`
+        : `[aria-label="${label}"]`;
+
+      // Skip when aria-label is a JSX expression we can't statically
+      // resolve. Carousel.tsx uses `aria-label={dir < 0 ? "Previous"
+      // : "Next"}` — we pulled BOTH literals via the alternation in
+      // ARIA_LABEL, so the selector ends up as one of them. That's
+      // fine — we'll emit one candidate per matched literal.
+      // (TODO 0.2.18: ALSO emit the second literal from a ternary.)
+
+      const ariaLabel = label ?? tid ?? "";
+      const dedupKey = `${filePath}|${selector}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+
+      const suggestedObserve = inferObserveFromAriaLabel(ariaLabel);
+      out.push({
+        template: "interaction-baseline",
+        page: route,
+        selector,
+        ariaLabel,
+        action: "click",
+        suggestedObserve,
+        filePath,
+        reason: tid
+          ? `<button data-testid="${tid}" onClick=...> — stable test-id selector`
+          : `<button aria-label="${label}" onClick=...> — heuristic observe: ${suggestedObserve}`,
+      });
+    }
+
+    // Also: emit a second candidate for ternary aria-labels — carousel
+    // pattern `aria-label={dir < 0 ? "Previous" : "Next"}`. Match the
+    // shape independently from the BUTTON_TAG iter so we get both.
+    const TERNARY_LABEL = /aria-label\s*=\s*\{\s*[^?}]+\?\s*["']([^"']{2,60})["']\s*:\s*["']([^"']{2,60})["']\s*\}/g;
+    for (const m of stripped.matchAll(TERNARY_LABEL)) {
+      const labelA = m[1];
+      const labelB = m[2];
+      // The matched text is INSIDE a button tag if BUTTON_TAG above
+      // would have caught it. We just need to verify the surrounding
+      // 200 chars actually contain `<button` + `onClick`.
+      const matchIdx = stripped.indexOf(m[0]);
+      const surround = stripped.slice(Math.max(0, matchIdx - 200), matchIdx + 400);
+      if (!/<button\b/.test(surround)) continue;
+      if (!ONCLICK.test(surround)) continue;
+      for (const lbl of [labelA, labelB]) {
+        const selector = `[aria-label="${lbl}"]`;
+        const dedupKey = `${filePath}|${selector}`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
+        const observe = inferObserveFromAriaLabel(lbl);
+        out.push({
+          template: "interaction-baseline",
+          page: route,
+          selector,
+          ariaLabel: lbl,
+          action: "click",
+          suggestedObserve: observe,
+          filePath,
+          reason: `<button aria-label={... ? "${labelA}" : "${labelB}"} onClick=...> ternary — emitting ${lbl}`,
+        });
+      }
+    }
+  }
+
+  return out;
+}

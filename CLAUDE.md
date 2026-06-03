@@ -44,6 +44,48 @@ AI coding agents (Cursor, Claude Code, Devin, Copilot Workspace) ship PRs that *
 
 ---
 
+## Strategic moat — independent guardrail for autonomous agents (LOCKED 2026-06-03)
+
+> Pinned and Cipherwake share the same existential risk and the same defense. Both products plant their flag here. Do not let scope drift away from this position.
+
+**The existential risk (same for both products):** the labs and IDEs (Anthropic, OpenAI, Cursor, GitHub) are building verification + security natively into the coding agent. Standalone tools that bolt onto someone else's loop get commoditized as that loop absorbs them.
+
+**The defense (same for both products):** independence + immutability + governance. The agent must not check or secure its own work. The verifier must be external, enforceable, and unable to be weakened by the agent it watches. That is the position neither the IDE nor the agent will ever credibly occupy — they have an irreducible conflict of interest, because their loop is what is being verified.
+
+**Pinned's category claim:** *the independent, tamper-proof guardrail for autonomous agents.* Pin tests live in the customer's repo (not ours), are signed by Pinned (not the agent), and are wired so the agent that wrote the code cannot weaken/skip/delete its own guards without Pinned catching it on the next commit. That is Guard Integrity — already the headline per [[strategic-pivot-guard-integrity]] — and it must remain the headline.
+
+**What this means for decisions going forward:**
+- Anything that makes Pinned look like "another thing inside the agent loop" is wrong. The product is *outside the loop, watching it.*
+- Anything that lets the agent silently disable, skip, or rewrite a pin without an audit trail is a P0 bug, not a polish item.
+- Enforcement primitives (pre-commit hook, pre-push hook, CI gate, statusline alerts, AI-coder rule files that resist tampering) are core, not optional UX.
+- Provider-analytics — "this agent / IDE / model produced this many weakened guards in your org last month" — is the durable upside. It is what neither Cursor nor Anthropic can ship for itself without conflict of interest.
+- Higher ceiling than "PR helper" framing. Treat Pinned as category-relevant if it owns the independent-guardrail position, not just as a CI test generator.
+
+### Three things the product must actually do to hold the position
+
+1. **Be tamper-proof.** The agent cannot quietly weaken or delete a pin — only a human, with consent + an audit trail (exactly how the middleware retire worked this session). That audit trail is the proof of independence. If an agent can silently soften it, the whole position collapses, so this has to be airtight. Treat any path that lets an agent edit/skip/disable a pin without surfacing it as a P0 bug.
+2. **Be agent-neutral.** Works across Claude / GPT / Cursor / Copilot. Pinned is the Switzerland — the IDEs are bound to their own model; we are not. Neutrality across providers is itself a moat the incumbents can't copy. Do not accept feature requests that would tie Pinned to a single vendor's runtime.
+3. **Lean hard into provider-mistake analytics.** "Across your codebase, this agent ships host-conditional bugs 3× more often than that one" — a neutral auditor's report card on the agents. It's our single strongest proof that we are the independent party: we grade them, we're not one of them. Make it the hero, not a footnote, in the product surface.
+
+### Moat + caveat
+
+- **Moat:** neutrality + tamper-proof enforcement + cross-provider analytics. Orgs buy an independent check they control specifically because they don't trust the vendor's agent to vouch for itself.
+- **Caveat (don't break our own thesis):**
+  - Stay independent. The moment Pinned gets bundled into / acquired-by one agent vendor, we lose the neutrality that *is* the value. Push back on partnerships that compromise it.
+  - Keep the tamper-proofness genuinely airtight. Any silent-weakening path is a thesis-breaker, not a polish item.
+
+### Unified banner with Cipherwake (one coherent story)
+
+- **Pinned** = the independent verifier of what agents *write* (functional correctness).
+- **Cipherwake** = the independent verifier of what agents *deploy* (security / trust posture).
+- **Together** = *"the independent, agent-neutral verification layer for everything AI agents ship."*
+
+That is the long-term reason a suite/combine eventually makes sense — same positioning, two surfaces. **The unbiased third-party referee for autonomous AI development.** Most defensible position available; the IDEs and labs structurally can't take it. Hold the two lines that make it true: **stay neutral, and make the guardrail genuinely un-weakenable.**
+
+**Cipherwake stays a separate product** with its own surface (site / deploy / public trust). Same philosophical position, different telemetry. Do not let the two leak into each other's framing per [[readme-rewrite-spec]].
+
+---
+
 ## Locked decisions (do not re-debate)
 
 These were settled after a long iteration. If the user asks "should we rename / repivot / add a SaaS dashboard / etc.", remind them of the rationale here before agreeing.
