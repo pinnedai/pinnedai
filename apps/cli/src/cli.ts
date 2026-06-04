@@ -3965,7 +3965,18 @@ program
           h.writeShape.kind === "file-upload" ? `uploads to ${h.writeShape.target}` :
           h.writeShape.kind === "http-post" ? `calls ${h.writeShape.library}` :
           `${h.writeShape.kind === "db-insert" ? "inserts" : h.writeShape.kind === "db-update" ? "updates" : h.writeShape.kind === "db-upsert" ? "upserts" : "deletes"} ${h.writeShape.target}`;
-        const auth = h.authGate ? ` · gated by ${h.authGate}()` : " · NO AUTH GATE";
+        // Three-tier auth posture (set by the detector):
+        //   confirmed = recognized idiom → "gated by X"
+        //   ambiguous = auth-shaped signals present but unrecognized
+        //               → soft "verify" warning (avoids cry-wolf on
+        //                  webhook-sig / OAuth / env-secret idioms
+        //                  the extractor doesn't structure)
+        //   none      = no auth signal at all → loud "NO AUTH GATE!"
+        //                (almost certainly a real gap worth flagging)
+        const auth =
+          h.authPosture === "confirmed" ? ` · gated by ${h.authGate}` :
+          h.authPosture === "ambiguous" ? " · ⚠ auth pattern not detected — verify" :
+          " · ⛔ NO AUTH GATE — likely real gap";
         out(`  + ${h.functionName}  →  ${verb}${auth}`);
       }
       if (edgeFnHits.length > 10) out(`  + …and ${edgeFnHits.length - 10} more`);
@@ -4016,7 +4027,10 @@ program
             h.writeShape.kind === "file-upload" ? `uploads to ${h.writeShape.target}` :
             h.writeShape.kind === "http-post" ? `calls ${h.writeShape.library}` :
             `${h.writeShape.kind === "db-insert" ? "inserts" : h.writeShape.kind === "db-update" ? "updates" : h.writeShape.kind === "db-upsert" ? "upserts" : "deletes"} ${h.writeShape.target}`;
-          const auth = h.authGate ? ` · gated by ${h.authGate}()` : " · NO AUTH GATE";
+          const auth =
+            h.authPosture === "confirmed" ? ` · gated by ${h.authGate}()` :
+            h.authPosture === "ambiguous" ? " · ⚠ auth pattern not detected — verify" :
+            " · ⛔ NO AUTH GATE — likely real gap";
           const schema = h.schemaName ? ` · ${h.schemaName}` : " · no schema found";
           out(`    + ${h.exportName}()  →  ${verb}${auth}${schema}`);
         }

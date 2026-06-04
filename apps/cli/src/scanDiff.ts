@@ -2618,6 +2618,7 @@ export type ServerActionWriteHit = {
   exportName: string;          // saveIdea
   schemaName?: string;         // IdeaInput  (when found)
   authGate?: string;           // isAdminAuthed  (when found)
+  authPosture: AuthPosture;    // confirmed / ambiguous / none
   writeShape: WriteShape;
   isModuleLevelDirective: boolean;  // top-of-file vs inline
   suggestedPin: string;
@@ -2810,9 +2811,116 @@ function extractSchemaName(body: string): string | undefined {
 // pattern (case-insensitive). Returns the call expression source
 // (e.g. "isAdminAuthed()" / "requireAuth(req)") so the verifier
 // knows which gate to satisfy.
+//
+// 0.2.19+: expanded coverage. The original regex only matched
+// "named auth-helper function calls". It missed real auth idioms
+// dyad-app dogfood proved are common:
+//   - Webhook signature verify (`crypto.timingSafeEqual`,
+//     `crypto.subtle.verify`, `verifyWebhookSignature`, Stripe's
+//     `webhooks.constructEvent`, Svix's `wh.verify`)
+//   - Bearer/Authorization header checks (`req.headers.get("authorization")`
+//     + comparison against env)
+//   - Password / shared-secret env comparison (`password === ENV_VAR`,
+//     `secret === process.env.X`)
+//   - OAuth state-param validation (`state === ...`)
+//   - Service-role-key check (`process.env.SUPABASE_SERVICE_ROLE_KEY`
+//     + comparison)
+//
+// Returns a short label describing the auth idiom (used in sweep
+// output). When undefined, the caller can downgrade the "NO_AUTH"
+// alarm to a soft "auth pattern not auto-detected — verify" warning.
 function extractAuthGate(body: string): string | undefined {
-  const m = /\b(is(?:Admin|Authenticated|SignedIn|LoggedIn|Authed)\w*|require(?:Auth|Admin|Session|User|Role)\w*|getServerSession|currentUser|getUser|auth)\s*\(/.exec(body);
-  return m ? m[1] : undefined;
+  // 1. Named helper-function calls. Widened per dyad-app audit:
+  //    `requireRetellAgentScope`, `requireRetellApiKey`,
+  //    `requireRetellToolScope` are all legitimate auth helpers that
+  //    the original tight vocab missed (only Auth/Admin/Session/User/
+  //    Role suffixes). Added Scope/ApiKey/Key/Token/Permission/Access.
+  //    Anchored on the require/is prefix + camelCase boundary so
+  //    `requireNonEmptyString` (string validator, real example from
+  //    MediniDyad/_shared) does NOT match.
+  const namedHelper = /\b(is(?:Admin|Authenticated|SignedIn|LoggedIn|Authed|Authorized|Authorised)\w*|require\w*(?:Auth|Admin|Session|User|Role|Scope|ApiKey|Key|Token|Permission|Access|Authorized|Authorised)\w*|getServerSession|currentUser|getUser|auth\.getUser)\s*\(/.exec(body);
+  if (namedHelper) {
+    // Defensive exclusion: avoid matching require-keyword variants
+    // that share the auth suffixes but aren't auth (e.g.
+    // requireApiKeyFormat would still match Key — fine. But the
+    // pre-fix camelCase-boundary regex prevents requireNonEmptyString
+    // matching since 'String' isn't in the suffix list).
+    return namedHelper[1];
+  }
+
+  // 2. Webhook signature verification — well-known SDK calls.
+  if (/\bstripe\s*\.\s*webhooks\s*\.\s*constructEvent\s*\(/.test(body)) return "stripe.webhooks.constructEvent";
+  if (/\b(?:wh|svix)\s*\.\s*verify\s*\(/.test(body)) return "svix.verify";
+  if (/\btwilio\s*\.\s*validateRequest\s*\(/.test(body)) return "twilio.validateRequest";
+
+  // 3. Generic verify/validate calls — but only when the function name
+  //    has an auth-noun suffix. Bare `validate(zodSchema)` and
+  //    `checkPastTime(date)` (real example from MediniDyad's
+  //    scheduleUtils) must NOT match. Confirmed FP risk via external
+  //    audit. Whitelist of auth-shaped roots only.
+  const verifyCall = /\b(verify(?:Webhook|Signature|Token|Request|Sender|Hmac|Jwt|Bearer|Sig|Auth|Session|Oidc|Pkce)\w*|validate(?:Webhook|Signature|Request|Token|Hmac|Jwt|Bearer|Sig|Auth|Session|Oidc)\w*|check(?:Webhook|Signature|Token|Hmac|Jwt|Bearer|Sig|Auth|Session|Oidc|Password|Secret)\w*|constructEvent|webhooks?\.verify)\s*\(/i.exec(body);
+  if (verifyCall) return verifyCall[1];
+
+  // 4. HMAC verification — `crypto.timingSafeEqual` (Node) or
+  //    `crypto.subtle.verify` (Deno / Web Crypto) — almost always
+  //    means "we're verifying an inbound signature." Either appearing
+  //    in handler body = real auth.
+  if (/\bcrypto\s*\.\s*timingSafeEqual\s*\(/.test(body)) return "crypto.timingSafeEqual";
+  if (/\bcrypto\s*\.\s*subtle\s*\.\s*verify\s*\(/.test(body)) return "crypto.subtle.verify";
+
+  // 5. Password / shared-secret env comparison — but the non-env side
+  //    must be an INBOUND value (read from request body/headers/url).
+  //    Without this tightening, `if (apiKey === process.env.OPENAI_API_KEY)`
+  //    (a sanity check before an outbound call) gets labeled as a caller
+  //    auth gate. Confirmed FP risk via external audit. Patterns we
+  //    accept now require `body.X / headers.X / searchParams.get(X) /
+  //    params.X / url.X` somewhere within ~120 chars of the comparison.
+  const envCompareRe = new RegExp(
+    // Inbound-shaped LHS  ==/!== env-shaped RHS
+    "\\b(?:(?:req|request)?\\s*\\.?\\s*(?:body|headers|query|params)\\s*(?:\\.|\\[)\\s*['\"]?[\\w-]+['\"]?\\]?(?:\\s*(?:\\?\\.|\\.)\\s*\\w+)?|searchParams\\s*\\.\\s*get\\s*\\(\\s*['\"][\\w-]+['\"]\\s*\\)|(?:url|new\\s+URL[^)]*)\\.\\s*searchParams[^,)]*)" +
+    "\\s*[!=]==?\\s*" +
+    "(?:process\\s*\\.\\s*env\\s*\\.\\s*\\w*(?:PASSWORD|SECRET|TOKEN|API_KEY)\\w*|getEnv\\s*\\(\\s*['\"]?\\w*(?:PASSWORD|SECRET|TOKEN|API_KEY)\\w*['\"]?\\s*\\)|Deno\\s*\\.\\s*env\\s*\\.\\s*get\\s*\\(\\s*['\"]?\\w*(?:PASSWORD|SECRET|TOKEN|API_KEY)\\w*['\"]?\\s*\\))",
+    "i"
+  );
+  // Try LHS=request RHS=env first, then reversed
+  if (envCompareRe.test(body)) return "env-secret-compare";
+  const envCompareReReversed = new RegExp(
+    "(?:process\\s*\\.\\s*env\\s*\\.\\s*\\w*(?:PASSWORD|SECRET|TOKEN|API_KEY)\\w*|getEnv\\s*\\(\\s*['\"]?\\w*(?:PASSWORD|SECRET|TOKEN|API_KEY)\\w*['\"]?\\s*\\)|Deno\\s*\\.\\s*env\\s*\\.\\s*get\\s*\\(\\s*['\"]?\\w*(?:PASSWORD|SECRET|TOKEN|API_KEY)\\w*['\"]?\\s*\\))" +
+    "\\s*[!=]==?\\s*" +
+    "(?:(?:req|request)?\\s*\\.?\\s*(?:body|headers|query|params)\\s*(?:\\.|\\[)|searchParams\\s*\\.\\s*get\\s*\\()",
+    "i"
+  );
+  if (envCompareReReversed.test(body)) return "env-secret-compare";
+
+  // 6. Authorization header read followed by a comparison/parse.
+  //    `req.headers.get("authorization")` / `req.headers["authorization"]`
+  //    paired with a substring check, comparison, or parse call. Tight
+  //    enough to skip CORS-only files (which mention "authorization"
+  //    in Access-Control-Allow-Headers but don't read it).
+  const hasAuthHeaderRead =
+    /\breq\s*\.\s*headers\s*\.\s*get\s*\(\s*['"]authorization['"]/i.test(body) ||
+    /\breq\s*\.\s*headers\s*\[\s*['"]authorization['"]\s*\]/i.test(body) ||
+    /\bheaders\s*\.\s*authorization\b/i.test(body);
+  const hasComparison = /\b(?:Bearer|bearer|startsWith|startswith|substring|split|trim|===|!==)\b/.test(body);
+  if (hasAuthHeaderRead && hasComparison) return "Authorization header check";
+
+  // 7. OAuth state-param validation. `state === ...` or
+  //    `state !== ...` where `state` was read from a query / param
+  //    earlier in the body. Tight: must have both `state` read and
+  //    a comparison on it.
+  const hasStateRead = /\b(?:searchParams\s*\.\s*get\s*\(\s*['"]state['"]|url\s*\.\s*searchParams|query\s*\.\s*state|params\s*\.\s*state|body\s*\.\s*state)\b/.test(body);
+  const hasStateCheck = /\bstate\s*[!=]==?\s*/.test(body);
+  if (hasStateRead && hasStateCheck) return "OAuth state validation";
+
+  // (Removed) service-role-key check: a `if (!SUPABASE_SERVICE_ROLE_KEY)
+  // throw` line is a config assertion, NOT a caller auth gate. Anyone
+  // can still call the endpoint; the key just constructs the admin
+  // client. Labeling these "confirmed" was hiding real auth gaps.
+  // Confirmed via external audit on Ai-Book/generate-page-music +
+  // MediniDyad/retell-web-call — both were labeled gated but actually
+  // had no caller auth.
+
+  return undefined;
 }
 
 export function detectServerActionWrites(
@@ -2843,6 +2951,26 @@ export function detectServerActionWrites(
 
       const schemaName = extractSchemaName(body);
       const authGate = extractAuthGate(body);
+      // Three-tier auth posture so sweep output can distinguish
+      // truly-bare functions from ones with idioms we don't structure.
+      let authPosture: AuthPosture;
+      if (authGate) {
+        authPosture = "confirmed";
+      } else {
+        // Tightened ambiguous-tier signals per external audit. See
+        // detectEdgeFunctionWrites for full rationale.
+        const hasAuthSignals =
+          /\bcrypto\s*\.\s*(?:subtle|timingSafeEqual|createHmac)/.test(body) ||
+          /\b(?:verify|validate|check)(?:Webhook|Signature|Token|Hmac|Auth|Session|Sig|Jwt|Bearer|Oidc|Pkce|Password|Secret|Request|Sender)\w*\s*\(/i.test(body) ||
+          (
+            (/\breq\s*\.\s*headers\s*\.\s*get\s*\(\s*['"]authorization['"]/i.test(body) ||
+             /\breq\s*\.\s*headers\s*\[\s*['"]authorization['"]\s*\]/i.test(body) ||
+             /\bheaders\s*\.\s*authorization\b/i.test(body)) &&
+            /\b(?:Bearer|bearer|substring|startsWith|split|trim)\b/.test(body)
+          ) ||
+          /\bsearchParams\s*\.\s*get\s*\(\s*['"](?:state|code|token|verifier)['"]/i.test(body);
+        authPosture = hasAuthSignals ? "ambiguous" : "none";
+      }
       const verb =
         writeShape.kind === "email" ? "sends an email" :
         writeShape.kind === "queue" ? "enqueues a job" :
@@ -2856,6 +2984,7 @@ export function detectServerActionWrites(
         exportName: name,
         schemaName,
         authGate,
+        authPosture,
         writeShape,
         isModuleLevelDirective: moduleDirective,
         suggestedPin: `Server Action ${name}() in ${filePath} ${verb}${schemaNote}${authNote} (${writeShape.library})`,
@@ -3156,12 +3285,22 @@ export function detectPaidApiCalls(
 // (auth-gate + schema-name extraction); the verifier emits a static
 // "function file exists + write call still present" pin — direct
 // invoke isn't feasible in vitest since these run in Deno runtime.
+// Three-tier auth posture so the sweep output can distinguish:
+//   - "confirmed": recognized auth idiom (named helper / signature
+//     verify / env-secret compare / etc.). Display "gated by X".
+//   - "ambiguous": file has auth-shaped signals (crypto, header
+//     reads, env-SECRET references, verify/validate calls) but the
+//     structured extractor didn't recognize them. Soft warning.
+//   - "none": no auth signal at all. Strong warning — likely real gap.
+export type AuthPosture = "confirmed" | "ambiguous" | "none";
+
 export type EdgeFunctionWriteHit = {
   template: "edge-function-write";
   filePath: string;
   functionName: string;  // <name> from the path
   writeShape: WriteShape;
   authGate?: string;
+  authPosture: AuthPosture;
   suggestedPin: string;
 };
 
@@ -3185,9 +3324,49 @@ export function detectEdgeFunctionWrites(
     if (!hasDenoServe && !hasImportedServe) continue;
     const writeShape = detectWriteShape(content);
     if (!writeShape) continue;
-    // Reuse the Server Action auth-gate extractor (same vocabulary).
-    const authMatch = /\b(is(?:Admin|Authenticated|SignedIn|LoggedIn|Authed)\w*|require(?:Auth|Admin|Session|User|Role)\w*|getServerSession|currentUser|getUser|auth\.getUser|verifyToken)\s*\(/.exec(content);
-    const authGate = authMatch ? authMatch[1] : undefined;
+    // Use the same widened auth-gate extractor as Server Actions —
+    // covers named helpers, webhook-signature verify, HMAC verify,
+    // password/secret env compare, Authorization-header check, OAuth
+    // state validation, service-role key check.
+    const authGate = extractAuthGate(content);
+    // Three-tier posture: confirmed (extractor matched), ambiguous
+    // (auth-shaped signals present but unrecognized), none (no signal
+    // at all — almost certainly a real auth gap).
+    let authPosture: AuthPosture;
+    if (authGate) {
+      authPosture = "confirmed";
+    } else {
+      // Ambiguous signals — auth-shaped patterns that suggest the
+      // detector might be missing a structured idiom. Tightened per
+      // external audit so this tier doesn't engulf the "none" bucket
+      // (then "verify" becomes meaningless noise).
+      //
+      // Rules:
+      //   1. crypto.subtle / timingSafeEqual / createHmac — strong
+      //      inbound-verify signal (almost never appears in pure
+      //      outbound code).
+      //   2. verify/validate/check call with an AUTH-NOUN suffix —
+      //      tight vocab so checkPastTime / validateEnv / validate(zod)
+      //      don't FP.
+      //   3. INBOUND Authorization-header READ (not just CORS string
+      //      mention or outbound Bearer-template). `req.headers.get`
+      //      / `req.headers["..."]` / `headers.authorization`.
+      //   4. OAuth-shaped param reads (state / code / verifier).
+      //   5. (Removed) bare env-secret references — too universal;
+      //      every outbound-API file has them. Without paired comparison
+      //      they signal nothing about caller auth.
+      const hasAuthSignals =
+        /\bcrypto\s*\.\s*(?:subtle|timingSafeEqual|createHmac)/.test(content) ||
+        /\b(?:verify|validate|check)(?:Webhook|Signature|Token|Hmac|Auth|Session|Sig|Jwt|Bearer|Oidc|Pkce|Password|Secret|Request|Sender)\w*\s*\(/i.test(content) ||
+        (
+          (/\breq\s*\.\s*headers\s*\.\s*get\s*\(\s*['"]authorization['"]/i.test(content) ||
+           /\breq\s*\.\s*headers\s*\[\s*['"]authorization['"]\s*\]/i.test(content) ||
+           /\bheaders\s*\.\s*authorization\b/i.test(content)) &&
+          /\b(?:Bearer|bearer|substring|startsWith|split|trim)\b/.test(content)
+        ) ||
+        /\bsearchParams\s*\.\s*get\s*\(\s*['"](?:state|code|token|verifier)['"]/i.test(content);
+      authPosture = hasAuthSignals ? "ambiguous" : "none";
+    }
     const verb =
       writeShape.kind === "email" ? "sends email" :
       writeShape.kind === "queue" ? "enqueues job" :
@@ -3201,6 +3380,7 @@ export function detectEdgeFunctionWrites(
       functionName,
       writeShape,
       authGate,
+      authPosture,
       suggestedPin: `Supabase Edge Function "${functionName}" ${verb}${authNote} — invisible to HTTP-route detection (runs in Deno).`,
     });
   }

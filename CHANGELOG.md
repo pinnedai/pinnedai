@@ -2,6 +2,35 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.20] — 2026-06-04
+
+Quality fix on top of 0.2.19 — the new auth-posture detector was reviewed by an external audit agent and three concrete tightenings applied. The audit's concern: the "ambiguous → verify" tier was too loose, would engulf real bare-endpoint warnings under soft yellow alarms, and developers would learn to ignore everything. Three tightenings landed:
+
+1. **`verify`/`validate`/`check` calls now require an auth-noun suffix** (Webhook/Signature/Token/Hmac/Auth/Session/Sig/Jwt/Bearer/Oidc/Pkce/Password/Secret). Kills FPs on `checkPastTime`, `validateEnv`, `checkAndIncrement`, `validateSubscription` — none of which are auth, all of which previously flipped functions to "ambiguous".
+2. **`Authorization`-header signal now requires an INBOUND read**, not literal word presence. Without this, every backend file with `headers: { Authorization: \`Bearer ${OPENAI_API_KEY}\` }` (outbound proxy) was getting "ambiguous" — exactly the case where a real bare webhook receiver could merge into the soft warnings.
+3. **Bare env-secret references dropped from ambiguous signals.** Nearly universal in backend code; on its own says nothing about caller auth.
+
+Plus two `extractAuthGate` improvements:
+4. **Widened `require*` vocab** to include Scope / ApiKey / Key / Token / Permission / Access. Caught `requireRetellAgentScope`, `requireRetellApiKey`, `requireRetellToolScope` (real auth helpers from MediniDyad). Anchored on camelCase boundary so `requireNonEmptyString` (a string validator) does NOT match.
+5. **Dropped service-role-key branch** — `if (!SUPABASE_SERVICE_ROLE_KEY) throw` is a config assertion, not a caller-auth boundary. Was incorrectly labeling bare endpoints as "gated."
+
+### Result on MediniDyad's 42 Edge Functions
+
+| Tier | Original (0.2.19) | After audit + fix |
+|---|---|---|
+| Confirmed auth | 19 | **25** (caught 6 Retell scope/key helpers + the `medini-cancel-appointment` retell-scope check) |
+| Ambiguous (soft warn) | 0 (originally all alarm-or-clear) | **5** (genuinely-might-be-auth idioms — OAuth callbacks, prod-admin with password compare) |
+| NO_AUTH (loud alarm) | 27 (mostly wrong) | **12** — the actually-bare functions worth investigating |
+
+Same posture model also applied to Server Actions for consistency.
+
+### Tested
+
+- 9 unit cases for the widened `require*` regex: 9/9 correct (real auth helpers detected, validator/data-access FPs rejected)
+- Full vitest suite: 327/327 ✓
+- 5-template matrix re-run: 21/21 ✓ (all FP/positive checks still pass)
+- Dyad FP sweep: 0 new spurious hits introduced by the tightenings
+
 ## [0.2.19] — 2026-06-04
 
 Five new coverage gaps closed in a single release, plus a precondition-WARN fix on Server Actions and a long-overdue npm-README sync. The new gaps span the highest-stakes surfaces dyad-app dogfood and a follow-up deep-audit agent both flagged: paid-API calls in plain backend services (the "AI silently swapped my model" defense), Supabase Edge Functions (Deno runtime — HTTP-route detection structurally misses them), Vercel/GH-Actions cron handlers (no user-in-loop, silent SLA-break class), Stripe webhook event-type dispatch (one-letter typo + signature still verifies = paying customers never get provisioned), and Stripe checkout/billingPortal session creation. FP sweep across 10 dyad-apps: 0 spurious hits, every detection confirmed real-world.
