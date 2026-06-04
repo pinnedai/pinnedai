@@ -302,6 +302,11 @@ export function classifyPinStrength(
       // existence / schedule string. All have real signals; no
       // preconditions. Always behavioral.
       return "behavioral";
+    case "page-accessibility":
+      // 0.2.21+ BETA Playwright + axe-core. Same gating as HTTP —
+      // needs a browser-reachable PREVIEW_URL. Behavioral when
+      // reachable; unverified otherwise.
+      return httpVerifiable ? "behavioral" : "unverified";
   }
 }
 
@@ -752,6 +757,13 @@ export type ServerActionWriteClaim = {
   // Optional auth-gate name (informational, used in the test header
   // comment so the reader knows the action is auth-gated).
   authGate?: string;
+  // 0.2.21+: import location of the auth helper. When present, the
+  // template emits `vi.mock(specifier)` so the test can flip auth
+  // behavior and run the action's success path (instead of always
+  // hitting the unauthorized branch). Enables a second test case
+  // — "rejects when unauthed" — that catches AI silently removing
+  // the auth gate (otherwise undetectable with mock-always-true).
+  authHelperImport?: { specifier: string; named: string };
   // Optional schema name (informational).
   schemaName?: string;
   raw: string;
@@ -791,7 +803,39 @@ export type Claim =
   | StripeEventHandledClaim
   | PaidApiCallClaim
   | EdgeFunctionWriteClaim
-  | CronHandlerClaim;
+  | CronHandlerClaim
+  | PageAccessibilityClaim;
+
+// 0.2.21+ BETA: page accessibility pin. Closes the gap socialideagen
+// dogfood exposed — admin pages shipped white-on-white text three
+// separate times, and page-renders pins stayed GREEN every time
+// because the page DID render (no React/Next error, body > 500 bytes),
+// it was just unreadable.
+//
+// Mode: Playwright + axe-core. Beta-tier (Playwright required), WARN-
+// only on violations (don't block CI on contrast issues), confidence:
+// "review" so catches don't inflate the GA "regressions caught" metric.
+// Focused on the two highest-signal rule families:
+//   - color-contrast (WCAG AA contrast minimums)
+//   - color-contrast-enhanced (WCAG AAA, opt-in via claim flag)
+//
+// Same axe-injection pattern as the broader a11y community uses for
+// CI testing (Playwright + axe-core via CDN script tag). No extra
+// npm dep on Pinned or the customer side beyond @playwright/test.
+export type PageAccessibilityClaim = {
+  template: "page-accessibility";
+  // Route to render (e.g. "/admin/new-idea").
+  page: string;
+  // Source file the page was detected from. Used for source-bound
+  // pin coverage (any edit to this file = re-run the pin).
+  filePath: string;
+  // Default: ["color-contrast"]. Customer can extend via record flow
+  // later. We don't run a11y full-sweep because that fires on many
+  // false-positive-ish rules (label-content / region) that aren't
+  // actionable from a Pinned pin.
+  rules: string[];
+  raw: string;
+};
 
 // 0.2.19+: Paid-API call pin. Entry-point-agnostic — fires on any
 // file (plain backend service, library helper, etc.) that calls
@@ -2345,6 +2389,13 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         check: `Reads \`${c.declarationFile}\` + asserts the schedule string is preserved${c.handlerFile ? `, and asserts \`${c.handlerFile}\` exists` : ""}.`,
       };
     }
+    case "page-accessibility": {
+      return {
+        title: `🛟 BETA · page-accessibility \`${c.page}\``,
+        promise: `Page \`${c.page}\` continues to pass axe-core a11y rules (${c.rules.join(", ")}) — catches white-on-white text / invisible labels / WCAG-AA contrast failures that page-renders pins go GREEN on.`,
+        check: `(BETA, opt-in) Renders ${c.page} via Playwright, injects axe-core, runs configured a11y rules. WARN-only on violations; catches tagged confidence:"review" so they don't inflate the GA metric.`,
+      };
+    }
   }
 }
 
@@ -2488,6 +2539,8 @@ export function badCaseForClaim(claim: Claim): string {
       return `Supabase Edge Function \`${claim.functionName}\` (${claim.filePath}) no longer performs its ${claim.writeKind} to \`${claim.writeTarget}\` — the function may have been deleted, the write expression removed, or the auth gate weakened.`;
     case "cron-handler":
       return `${claim.source === "vercel" ? "Vercel cron" : "GH Actions cron"} \`${claim.identifier}\` no longer runs on \`${claim.schedule}\` — the schedule was changed${claim.handlerFile ? ` or the handler (${claim.handlerFile}) was renamed/deleted` : ""}.`;
+    case "page-accessibility":
+      return `🛟 BETA: page \`${claim.page}\` failed axe-core a11y check (${claim.rules.join(", ")}) — likely a contrast regression or invisible-text bug that page-renders pins miss.`;
   }
 }
 
@@ -2592,6 +2645,9 @@ export function claimRoute(c: Claim): string | null {
       // Cron pins are config-bound; surface the declaration file
       // (vercel.json / workflow yaml).
       return c.declarationFile;
+    case "page-accessibility":
+      // Route-bound — same as page-renders.
+      return c.page;
   }
 }
 
@@ -2647,7 +2703,9 @@ export function claimSlug(claim: Claim): string {
                                           ? `edge-fn-${claim.functionName}`
                                           : claim.template === "cron-handler"
                                             ? `cron-${claim.source}-${claim.identifier}`
-                                            : claim.route;
+                                            : claim.template === "page-accessibility"
+                                              ? `a11y-${claim.page}`
+                                              : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -2762,6 +2820,8 @@ export function claimKey(c: Claim): string {
       return `edge-function-write:${c.filePath}`;
     case "cron-handler":
       return `cron-handler:${c.source}:${c.identifier}`;
+    case "page-accessibility":
+      return `page-accessibility:${c.page}:${c.rules.sort().join(",")}`;
   }
 }
 

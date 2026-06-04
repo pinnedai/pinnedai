@@ -208,6 +208,17 @@ npx pinned record-server-action <claim-id> --fixture <payload.json>  # capture v
 
 Detection covers: supabase / prisma / drizzle / kysely / mongoose / raw SQL DB writes; supabase-storage / S3 / R2 / Vercel Blob file uploads; outbound paid-API calls (Anthropic / OpenAI / Gemini / Stripe). Auth-gate function name (`isAdminAuthed`, `requireAuth`, etc.) and zod input-schema name are captured automatically. Until you record a fixture, the pin self-skips with a clear message.
 
+### Page accessibility pins (🛟 BETA — opt-in)
+
+Catches the *"page renders but is unreadable"* class — white-on-white text, WCAG-AA contrast failures, invisible labels. Plain page-renders pins stay GREEN on these because the page does render; this is the only template that catches it.
+
+```bash
+npx pinned add-browser                  # one-time: install Playwright (~300 MB)
+npx pinned sweep --include-beta         # auto-detects pages + emits axe-core pins
+```
+
+Loads each page via Playwright + injects axe-core (pinned version, CDN-loaded) + runs the `color-contrast` rule. WARN-only on violations (frontend a11y doesn't fail CI) + `confidence: "review"` so catches don't inflate the GA metric.
+
 ### Browser interaction pins (🛟 BETA — opt-in)
 
 Cover frontend interaction regressions (the carousel "arrows do nothing" class) by wrapping Playwright. Beta posture: WARN-only on drift, attach-only to a running dev server, catches quarantined as `confidence:"review"` so they don't inflate the GA metric.

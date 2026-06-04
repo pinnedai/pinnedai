@@ -309,6 +309,11 @@ function preflight(claim: Claim, cwd: string): string | null {
       }
       return null;
     }
+    case "page-accessibility":
+      // Browser-template — same posture as page-renders /
+      // interaction-baseline. Template handles missing-Playwright +
+      // missing-PREVIEW_URL via skipIf at test time.
+      return null;
   }
 }
 

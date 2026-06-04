@@ -2619,6 +2619,15 @@ export type ServerActionWriteHit = {
   schemaName?: string;         // IdeaInput  (when found)
   authGate?: string;           // isAdminAuthed  (when found)
   authPosture: AuthPosture;    // confirmed / ambiguous / none
+  // 0.2.21+: import location of the auth helper. Captured so the
+  // generated test can vi.mock() that module to flip auth-gate behavior
+  // and actually go GREEN on the success path (vs. precondition-WARN
+  // on the unauthorized branch). When present, the template emits both
+  //   - "returns success with valid payload + session" (auth → true)
+  //   - "rejects when unauthenticated" (auth → false)
+  // The second case is what catches AI silently removing the auth gate
+  // entirely — with only auth → true, gate-removal would still pass.
+  authHelperImport?: { specifier: string; named: string };
   writeShape: WriteShape;
   isModuleLevelDirective: boolean;  // top-of-file vs inline
   suggestedPin: string;
@@ -2806,6 +2815,48 @@ function extractSchemaName(body: string): string | undefined {
   return m ? m[1] : undefined;
 }
 
+// 0.2.21+: locate the import statement for an auth-helper function.
+// Used by the Server Action verifier to emit `vi.mock(specifier)`
+// in the generated test, so the action can be exercised on its
+// success path (auth → true) AND its rejection path (auth → false)
+// without a real session.
+//
+// Returns the import specifier (module path) and named export when
+// the auth-helper was imported via a standard ESM named import:
+//   import { isAdminAuthed } from "./adminAuth"
+//   import { foo, isAdminAuthed, bar } from "./adminAuth"
+//   import { isAdminAuthed as checkAdmin } from "./adminAuth"  (uses `as` alias)
+//
+// Does NOT match default imports (`import isAdminAuthed from ...`) or
+// namespace imports (`import * as auth from ...`) since the mock shape
+// differs. Those are valid edge cases for a follow-up.
+function extractAuthHelperImport(
+  content: string,
+  authGate: string
+): { specifier: string; named: string } | undefined {
+  if (!authGate) return undefined;
+  // The auth-helper might be the captured function name OR an aliased
+  // name. Try both shapes.
+  //
+  // Pattern: `import { ..., <name>, ... } from "<specifier>"` where
+  // <name> matches the captured authGate. We escape the auth-gate
+  // name for regex use, but it should be a simple identifier so this
+  // is conservative.
+  if (!/^[A-Za-z_$][\w$.]*$/.test(authGate)) return undefined;
+  // The dotted-call form (`auth.getUser`) means the imported name is
+  // the prefix segment (`auth`). Otherwise it's the full name.
+  const importedName = authGate.split(".")[0];
+  const escaped = importedName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Match named imports — allow whitespace, multi-line braces, alias.
+  const re = new RegExp(
+    "import\\s*(?:type\\s+)?\\{[^}]*?\\b" + escaped + "(?:\\s+as\\s+\\w+)?\\b[^}]*?\\}\\s*from\\s*['\"]([^'\"]+)['\"]",
+    "s"
+  );
+  const m = re.exec(content);
+  if (!m) return undefined;
+  return { specifier: m[1], named: importedName };
+}
+
 // Captures an auth-gate call in the function body. Looks for the
 // first call to a function whose name matches the auth-vocabulary
 // pattern (case-insensitive). Returns the call expression source
@@ -2951,6 +3002,12 @@ export function detectServerActionWrites(
 
       const schemaName = extractSchemaName(body);
       const authGate = extractAuthGate(body);
+      // Locate the auth helper's import statement so the generated
+      // test can `vi.mock(specifier)` to flip auth-gate behavior and
+      // actually go GREEN on the success path (vs. precondition-WARN
+      // on the unauthorized branch). Search the FULL file content,
+      // not just the function body — imports live at module top.
+      const authHelperImport = authGate ? extractAuthHelperImport(content, authGate) : undefined;
       // Three-tier auth posture so sweep output can distinguish
       // truly-bare functions from ones with idioms we don't structure.
       let authPosture: AuthPosture;
@@ -2985,6 +3042,7 @@ export function detectServerActionWrites(
         schemaName,
         authGate,
         authPosture,
+        authHelperImport,
         writeShape,
         isModuleLevelDirective: moduleDirective,
         suggestedPin: `Server Action ${name}() in ${filePath} ${verb}${schemaNote}${authNote} (${writeShape.library})`,
@@ -3661,6 +3719,18 @@ export type DiffNewPageHit = {
   filePath: string;
   suggestedPin: string;
 };
+
+// Retroactive page detector — same shape as detectNewPagesInDiff but
+// walks the full tree (each file is treated as if every line is "added")
+// so sweep can emit page-renders / page-accessibility proposals on
+// existing pages, not just diff-introduced ones.
+export function detectRetroactivePages(filesByPath: Map<string, string>): DiffNewPageHit[] {
+  const diff: DiffByFile = new Map();
+  for (const [filePath, content] of filesByPath.entries()) {
+    diff.set(filePath, content.split("\n"));
+  }
+  return detectNewPagesInDiff(diff);
+}
 
 export function detectNewPagesInDiff(diffByFile: DiffByFile): DiffNewPageHit[] {
   const out: DiffNewPageHit[] = [];

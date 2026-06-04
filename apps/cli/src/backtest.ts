@@ -1012,6 +1012,10 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
       // Both the declaration (vercel.json / workflow yaml) AND the
       // resolved handler file (when present) gate replay.
       return claim.handlerFile ? [claim.declarationFile, claim.handlerFile] : [claim.declarationFile];
+    case "page-accessibility":
+      // Browser-rendered — no static-file optimization. Replay against
+      // full window (same as page-renders / interaction-baseline).
+      return null;
   }
 }
 

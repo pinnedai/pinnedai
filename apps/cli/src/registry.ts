@@ -315,6 +315,10 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       return claim.handlerFile
         ? { files: [claim.declarationFile, claim.handlerFile] }
         : { files: [claim.declarationFile] };
+    case "page-accessibility":
+      // Both the page route AND the source file. Either edit warrants
+      // re-running the a11y check.
+      return { routes: [claim.page], files: [claim.filePath] };
   }
 }
 
@@ -493,6 +497,8 @@ function claimLabel(c: Claim): string {
       return `\`edge-fn ${escapeMarkdownCell(c.functionName)}\` (${c.writeKind} ${escapeMarkdownCell(c.writeTarget)})`;
     case "cron-handler":
       return `\`cron ${escapeMarkdownCell(c.identifier)}\` (${c.source} · ${escapeMarkdownCell(c.schedule)})`;
+    case "page-accessibility":
+      return `\`🛟 BETA · a11y ${escapeMarkdownCell(c.page)}\` (${c.rules.join(", ")})`;
   }
 }
 

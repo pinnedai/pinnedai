@@ -3306,6 +3306,8 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `Supabase Edge Function \`${claim.functionName}\` (${claim.filePath}) keeps performing its ${claim.writeKind} to \`${claim.writeTarget}\`${claim.authGate ? ` (gated by ${claim.authGate})` : ""} (Edge Functions run in Deno — HTTP-route detection structurally misses them; this is a static source-scan pin)`;
     case "cron-handler":
       return `${claim.source === "vercel" ? "Vercel cron" : "GH Actions cron"} \`${claim.identifier}\` keeps running on \`${claim.schedule}\`${claim.handlerFile ? ` (handler: ${claim.handlerFile})` : ""} (catches schedule drift + handler renames — cron has no user-in-loop, silent regression class)`;
+    case "page-accessibility":
+      return `🛟 BETA · Page \`${claim.page}\` keeps passing axe-core a11y rules (${claim.rules.join(", ")}) — catches white-on-white text / invisible labels that page-renders pins go GREEN on`;
   }
 }
 
@@ -3645,6 +3647,7 @@ program
       detectPaidApiCalls,
       detectEdgeFunctionWrites,
       detectCronHandlers,
+      detectRetroactivePages,
       buildImportGraph,
       findFamilyMembers,
       deriveRouteFromPath: drfp,
@@ -3654,7 +3657,7 @@ program
 
     // 3. Detectors.
     type Proposal = {
-      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler";
+      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility";
       route: string;
       method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
       filePath: string;
@@ -3864,7 +3867,30 @@ program
           writeKind: h.writeShape.kind,
           schemaName: h.schemaName,
           authGate: h.authGate,
+          authHelperImport: h.authHelperImport,
           raw: h.suggestedPin,
+        },
+      });
+    }
+
+    // 0.2.21+ BETA: page-accessibility candidates. For each detected
+    // page in the tree, emit a sibling axe-core a11y check. Same beta
+    // gating as interaction-baseline — requires Playwright + opt-in
+    // via --include-beta. Closes the white-on-white-text class that
+    // page-renders pins go GREEN on.
+    for (const p of detectRetroactivePages(tree)) {
+      proposals.push({
+        kind: "page-accessibility",
+        route: p.route,
+        filePath: p.filePath,
+        reason: `axe-core color-contrast scan for ${p.route} — catches white-on-white text + WCAG-AA contrast failures`,
+        beta: true,
+        claim: {
+          template: "page-accessibility",
+          page: p.route,
+          filePath: p.filePath,
+          rules: ["color-contrast"],
+          raw: `🛟 BETA: ${p.route} passes axe-core color-contrast rules`,
         },
       });
     }
@@ -4058,6 +4084,26 @@ program
         out("  Run: pinned add-browser   then: pinned sweep --include-beta");
         out("");
       }
+    }
+    const betaA11y = proposals.filter((p) => p.kind === "page-accessibility");
+    if (betaA11y.length > 0) {
+      out("🛟 BETA — Page-accessibility candidates (axe-core contrast/visibility):");
+      out("");
+      for (const p of betaA11y.slice(0, 10)) {
+        const c = p.claim as Extract<Claim, { template: "page-accessibility" }>;
+        out(`  + ${c.page}  →  axe-core: ${c.rules.join(", ")}`);
+      }
+      if (betaA11y.length > 10) out(`  + …and ${betaA11y.length - 10} more`);
+      out("");
+      out("  Catches white-on-white text + WCAG-AA contrast failures that");
+      out("  page-renders pins go GREEN on (page renders without crashing,");
+      out("  but is unreadable). WARN-only on violations.");
+      if (!opts.includeBeta) {
+        out("");
+        out("  Not pinned by default — beta tier requires Playwright (~300 MB).");
+        out("  Run: pinned add-browser   then: pinned sweep --include-beta");
+      }
+      out("");
     }
 
     // 5. Batch confirm.
@@ -10982,6 +11028,8 @@ function describeClaim(c: Claim): string {
       return `edge-fn        ${c.functionName}  →  ${c.writeKind} ${c.writeTarget}${c.authGate ? ` · gated by ${c.authGate}` : ""}`;
     case "cron-handler":
       return `cron           ${c.identifier}  →  ${c.schedule} (${c.source})${c.handlerFile ? ` · ${c.handlerFile}` : ""}`;
+    case "page-accessibility":
+      return `a11y🛟 BETA   ${c.page}  →  axe-core rules: ${c.rules.join(", ")}`;
   }
 }
 

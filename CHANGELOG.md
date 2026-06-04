@@ -2,6 +2,51 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.21] — 2026-06-04
+
+Both gaps from the socialideagen admin-build dogfood closed. Moves page-renders from *"didn't crash"* → *"works + is usable,"* and Server Action pins from *"detected"* → *"verified."* Every contrast bug and every admin write went unguarded in that build; this release pins both classes.
+
+### Added — Server Action pins go GREEN (test-session injection)
+
+The 0.2.18 detector caught `saveIdea` / `uploadMockup` / `aiFillIdea` but couldn't verify them — they're `isAdminAuthed()`-gated, so direct invocation always returned `{ok: false, error: "Not authorized."}`. 0.2.19's precondition-WARN downgraded that from cry-wolf-red to skip-with-warning (good), but the pin was still inert — no actual verification, just "we know we can't verify."
+
+0.2.21 closes the loop. When the detector captures the auth helper's import location (via `extractAuthHelperImport`), the generated test emits `vi.mock(specifier, () => ({ authHelper: () => __authState.allow }))` using vi.hoisted() for a flippable mock reference. Two test cases land:
+
+1. **"returns success shape for valid payload (session mocked)"** — `__authState.allow = true`, action runs through to its happy path, success-shape asserted field-by-field.
+2. **"rejects when unauthenticated"** — `__authState.allow = false`, expects `{ok: false}` OR thrown rejection. This second case is what catches AI silently REMOVING the auth gate entirely (with only the allow-mock, gate removal would still pass).
+
+Falls back to single-test mode when no auth helper detected (or non-standard import shape) — preserves prior behavior for ungated actions.
+
+Acceptance on socialideagen `lib/ideaActions.ts:saveIdea`:
+- `authHelperImport: { specifier: "./adminAuth", named: "isAdminAuthed" }` captured at detection
+- Generated test mocks `../../lib/adminAuth` via `vi.mock` — resolves to the same absolute path as the action's `./adminAuth` import
+- With session mock + valid fixture: GREEN on `{ok: true, slug: ...}`
+- Removed write / removed validation / removed auth gate: each fails specifically
+
+Matrix: 7/7 (positive gated action / auth-gate removal red / write removal red / throw-on-unauthed accepted / env-missing precondition warn / no-fixture skip / no-auth-helper fallback).
+
+### Added — Page accessibility (axe-core contrast) — BETA
+
+Closes the white-on-white-shipped-three-times class. page-renders pins go GREEN on these pages (the page DID render, body has content), so this is the only template that catches the *"looks broken but doesn't crash"* class.
+
+`detectRetroactivePages` walks the tree for `app/**/page.tsx` + `pages/**/index.tsx` files, emits a `page-accessibility` proposal for each. Generated test:
+- Launches Playwright (same opt-in beta as interaction-baseline)
+- Navigates to the page via `PREVIEW_URL`
+- Injects axe-core via CDN script tag (`https://cdn.jsdelivr.net/npm/axe-core@4.10.0/axe.min.js`) — pinned version so future axe updates can't silently shift the pin's verdict
+- Runs `axe.run` with `runOnly: { type: "rule", values: ["color-contrast"] }` — filters out the noisy region/landmark findings that aren't actionable from a Pinned pin
+- WARN-only on violations — beta posture (frontend a11y doesn't fail CI). Catches tagged `confidence:"review"` so they don't inflate the GA metric
+
+Acceptance on socialideagen: 12 page-accessibility candidates surfaced — including the exact admin pages where white-on-white text shipped (`/admin/ideas/new`, `/admin/ideas/[slug]/edit`, `/admin/ideas/[slug]/ads`, `/admin/ideas/[slug]/customize`).
+
+### Tested
+
+- **Server Action GREEN matrix**: 7/7 end-to-end via real vitest (proper-gating both tests pass / auth-gate removal red / write removal red / throw-on-unauthed accepted / env-missing precondition still WARNs / no-fixture skip / no-auth-helper fallback)
+- **Real-world wiring**: socialideagen `saveIdea` now captures `authHelperImport: { specifier: "./adminAuth", named: "isAdminAuthed" }` at detection
+- **Detector matrix**: `detectRetroactivePages` on socialideagen returns 12 page candidates, all real admin pages
+- **Template emit**: generated a11y test file parses clean (TypeScript module-resolution + axe-core CDN + 30s test timeout + confidence:review env set)
+- **Regression suite**: 327/327 vitest, typecheck clean
+- **Dyad sweep**: no new spurious hits (page-accessibility candidates only emit for files matching the page-route conventions)
+
 ## [0.2.20] — 2026-06-04
 
 Quality fix on top of 0.2.19 — the new auth-posture detector was reviewed by an external audit agent and three concrete tightenings applied. The audit's concern: the "ambiguous → verify" tier was too loose, would engulf real bare-endpoint warnings under soft yellow alarms, and developers would learn to ignore everything. Three tightenings landed:
