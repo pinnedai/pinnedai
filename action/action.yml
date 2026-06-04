@@ -1,11 +1,23 @@
 # GitHub Action wrapper around the pinnedai CLI.
 #
-# This composite action mirrors the pull_request job from the workflow
-# emitted by `pinned init`. Customers can EITHER:
-#   (a) Run `npx pinnedai init` once to generate a workflow file directly
-#       in their repo (recommended — gives them the @pinned add: comment
-#       trigger + concurrency controls), OR
-#   (b) Use this Marketplace action as a single drop-in step.
+# What this does on every PR:
+#   1. Runs `pinned test` — executes every pin in tests/pinned/ via
+#      vitest. These pins were emitted by `pinned sweep` (server-action
+#      writes, paid-API calls, Edge Functions, cron, Stripe webhooks,
+#      journeys, host-conditional families, etc) plus any captured
+#      from PR-description claims. Real functional regressions fail CI.
+#   2. Runs `pinned check-guard-removal` — blocks AI weakening attempts
+#      (`.skip()`, weakened assertions, deleted tests, `--no-verify`
+#      bypass). The Guard Integrity layer.
+#   3. (Optional) Parses claims from the PR description, generates
+#      additional pins, auto-commits them to the PR branch.
+#
+# Customers can EITHER:
+#   (a) Run `npx pinnedai init` once to generate a workflow file
+#       directly in their repo (recommended — gives them the @pinned
+#       add: comment trigger + concurrency controls + PostToolUse hook
+#       for Claude Code), OR
+#   (b) Use this Marketplace action as a single drop-in step (below).
 #
 # Usage in customer repos:
 #
@@ -23,10 +35,10 @@
 #       steps:
 #         - uses: actions/checkout@v4
 #           with: { fetch-depth: 0, ref: ${{ github.event.pull_request.head.ref }} }
-#         - uses: pinnedai/pinnedai@v0.1.0
+#         - uses: pinnedai/pinnedai@v0.2.21
 
 name: "pinnedai"
-description: "AI-coder safety net: turn each fix into a permanent regression test, block AI from weakening pinned tests"
+description: "Permanent guardrails for AI-coded apps — pin Server Actions, paid-API calls, Edge Functions, cron, Stripe webhooks, journeys + block AI weakening attempts."
 author: "Michael Zon"
 branding:
   icon: "lock"

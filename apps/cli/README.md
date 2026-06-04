@@ -1,35 +1,46 @@
 # PinnedAI
 
-> **Pinned creates a local AI-coder safety net on install, writes repo-specific lessons, and blocks AI from weakening protected guards.**
+> **One command finds every high-stakes write surface in your AI-built app — Server Actions, paid-API calls, Supabase Edge Functions, cron handlers, Stripe webhooks, multi-step journeys, host-conditional families — and pins them as permanent regression tests. They run on every commit and every agent edit.**
 >
 > *Free beta · Founder Pro waitlist open at [pinnedai.dev](https://pinnedai.dev).*
 
-## The 5-step value loop
+## The value loop
 
-1. **`pinned init`** scans your repo and creates baseline guards on install (auth checks, lockfile integrity, secret prefixes, route registrations, webhook signatures, URL literals, exports, form error-handling, more).
-2. **Guard Integrity blocks** any commit that tries to delete, skip, weaken, or `--no-verify`-bypass a guard.
-3. **AI Lessons file** (`.pinned/ai-lessons.md`) captures repo-specific rules — read by Claude / Cursor / Devin / Copilot before they edit.
-4. **`pinned audit --learned`** scans sibling code paths for the same mistake pattern.
-5. **Future AI edits must pass every guard.** The output of every finding is an executable test, not a review comment.
+1. **`npx pinnedai audit`** — read-only inventory of your write surfaces. Zero install footprint. Tells you what Pinned would protect before you commit to anything.
+2. **`pinned sweep`** — one command auto-detects every high-stakes surface across your tree (not just the current diff): Server Actions, paid-API calls, Edge Functions, cron schedules, Stripe webhook event dispatch, multi-step journeys, host-conditional families. Each becomes a `tests/pinned/*.test.ts` file.
+3. **`pinned init`** — wires hooks: pre-commit + pre-push Guard Integrity blocks AI-weakening attempts (`.skip()` / weakened assertions / deleted tests / `--no-verify` bypass). Claude Code PostToolUse hook auto-verifies pins against your running dev server after every agent edit — *while the agent is still in the loop, not after the PR*. AI-coder rules seeded into `CLAUDE.md` / `.cursorrules` / `AGENTS.md` so Cursor / Claude / Copilot read them before editing.
+4. **Every commit + every agent edit** runs the pin suite. Bug fixes captured as `pinned record-server-action` / `record-interaction` fixtures land in your repo permanently.
+5. **AI Lessons** (`.pinned/ai-lessons.md`) capture repo-specific rules from real blocked events. `pinned audit --learned` finds sibling code paths with the same mistake pattern.
 
-**Proof it works**: see the [`/proof` page](https://pinnedai.dev/proof) for benchmark results, or jump to [Status](#status) below for the headline numbers.
+The output of every finding is an **executable test**, not a review comment. Cancel Pinned tomorrow and the pins stay.
+
+**Proof it works**: see the [`/proof` page](https://pinnedai.dev/proof) for benchmark results, or [Status](#status) below for headline numbers. Real dyad-app dogfood: 63 detections across 10 repos, 0 spurious; 42 unprotected Edge Function writes surfaced on a single repo.
 
 ---
 
 ## Quickstart
 
 ```bash
-# See what Pinned does on a sample claim — no install, no signup
-npx pinnedai
+# 0. See what Pinned would protect — read-only, no install footprint
+npx pinnedai audit
 
-# Install in your repo (one command)
+# 1. Auto-detect every high-stakes write surface and pin it
+npx pinnedai sweep
+
+# 2. Wire continuous verification (hooks + AI-coder rules + CI workflow)
 npx pinnedai init
-
-# After init, on every commit Pinned blocks AI bypass attempts and
-# auto-protects new admin/middleware/webhook/client-fetch code.
 ```
 
-`pinned init` writes `.github/workflows/pinned.yml`, creates `tests/pinned/` with `PINS.md`, installs pre-commit + pre-push hooks, auto-generates baseline pins from your current code, and seeds AI-coder rules into `CLAUDE.md` + `.github/copilot-instructions.md` (and any other AI rule file already in the repo). Each step prompts before writing in interactive mode; pass `--auto` to accept all.
+`pinned sweep` finds (precision-bound, no false positives in 10-repo dogfood):
+- **Server Action mutations** (`"use server"` functions with DB writes / file uploads / paid-API calls — auth gate + input schema captured)
+- **Paid-API calls** (Anthropic / OpenAI / Gemini / Stripe — model literal + max_tokens preserved)
+- **Supabase Edge Functions** (Deno runtime — HTTP-route detection misses these)
+- **Cron handlers** (Vercel `vercel.json:crons[]` + GitHub Actions `on.schedule`)
+- **Stripe webhook event dispatch** (case-literal preservation — catches one-letter typos)
+- **Multi-step journeys** (POST→GET redirects, signup→thanks flows with shared session)
+- **Host-conditional families** (one root file → multiple consumer routes)
+
+`pinned init` writes `.github/workflows/pinned.yml`, creates `tests/pinned/` with `PINS.md`, installs pre-commit + pre-push hooks, seeds AI-coder rules into `CLAUDE.md` + `.github/copilot-instructions.md`, and (for Claude Code users) wires the PostToolUse hook so Pinned auto-verifies pins against your running dev server after every agent edit. Each step prompts before writing in interactive mode; pass `--auto` to accept all.
 
 If your repo already has `.cursorrules`, `.clinerules`, `AGENTS.md`, or `.windsurfrules`, init writes to those too — same marker-bounded block, identical uninstall flow (`pinned uninstall-agent-rules`).
 
@@ -42,10 +53,10 @@ Pinned ships across every major AI-coder surface:
 | Surface | What you get | How to install |
 |---|---|---|
 | **VS Code / Cursor / Windsurf / Codium** | `◆ pinned · N guards · ✓` in the status bar, rich hover tooltip with recent guards + latest AI lesson, click → Quick Pick (action chooser) → command runs in a Pinned-managed terminal. Works in stock VS Code (Copilot users), Cursor, Windsurf, Codium. | Bundled `.vsix` auto-installs during `pinned init` (until we publish to the Marketplace + Open VSX in v0.1.1) |
-| **Claude Code** | Statusline + UserPromptSubmit hook (`◆ pinned · LEARNED · 1 new AI mistake`, transient block-event messages). Optional `/pinned-status`, `/pinned-list`, `/pinned-review`, `/pinned-done` slash commands. | Statusline auto-wired by `init`; slash commands via `npx pinnedai install-claude` |
+| **Claude Code** | **PostToolUse hook** — after every Claude edit, Pinned auto-verifies the affected pins against your running dev server and injects the result into Claude's next turn (catches regressions *while the agent is still in the loop*). Plus statusline (`◆ pinned · LEARNED · 1 new AI mistake`), UserPromptSubmit hook (transient block-event messages), `/pinned-status`, `/pinned-list`, `/pinned-review`, `/pinned-done` slash commands. | PostToolUse hook auto-wired by `init`; slash commands via `npx pinnedai install-claude` |
 | **GitHub Copilot Chat (free + paid)** | Reads Pinned rules from `.github/copilot-instructions.md` before generating code | Auto-created during `init` |
 | **MCP-aware tools (Claude Desktop, Cline, Continue)** | `pinned_before_code_change`, `pinned_before_done_check`, `pinned_scan_diff`, `pinned_list_guards`, `pinned_check_pr_description`, `pinned_suggest_init` as native tools with structured `human_summary` + must-report `agent_instruction` fields | Add `pinnedai-mcp` to the tool's MCP config — see [docs/integrations/](./docs/integrations/) |
-| **GitHub Action (CI)** | `pinned check-guard-removal` + vitest on every PR — guard weakening attempts fail CI | Auto-wired via `.github/workflows/pinned.yml` from `init` |
+| **GitHub Action (CI)** | Runs `pinned test` (all sweep-emitted pins) + `pinned check-guard-removal` on every PR. Guard weakening attempts AND functional regressions fail CI. | Auto-wired via `.github/workflows/pinned.yml` from `init`, or use the [Marketplace action](https://github.com/marketplace/actions/pinnedai) directly |
 | **Pre-commit + pre-push hooks** | Block bypass attempts locally before they reach CI | Auto-wired by `init` |
 
 Per-tool integration docs:
@@ -62,15 +73,50 @@ Per-tool integration docs:
 
 ---
 
-## v0.2 templates (just shipped)
+## Pin templates
 
-Three new templates for the contracts a real app actually wants pinned:
+Each template is a deterministic verifier — the LLM never writes test logic, it only fills slots. Templates auto-fire from `pinned sweep` based on what the detectors find in your tree. The full inventory:
 
+### HTTP / API surface
 - **`page-renders`** — *"GET /path renders without crashing."* Catches React/Next/Vite render errors + 500 pages + broken SSR.
-- **`validation-rejects-bad`** — *"POST /api/X with bad input returns 400."* Catches removed/weakened input validation. One pin, N sub-tests (malformed-JSON + per-field missing).
+- **`validation-rejects-bad`** — *"POST /api/X with bad input returns 400."* One pin, N sub-tests (malformed-JSON + per-field missing).
 - **`happy-path-with-side-effect`** — *"POST /api/X creates a users record."* Catches stub endpoints returning 200 without doing the work (misleading-green) via the `X-Pinned-Side-Effect` response header convention.
+- **`auth-required`** / **`permission-required`** / **`tier-cap`** — auth gates + role checks + per-tier caps survive.
+- **`rate-limit`** / **`idempotent`** — rate limiters + webhook dedup keys preserved.
+- **`returns-status`** — `<method> <route> returns <status> on <condition>` — auto-generated from added validation schemas in diffs.
 
-`happy-path-with-side-effect` auto-fires on routes with these recognized write shapes (0.2.8+), both in new diffs AND retroactively on `pinned init` for existing handlers:
+### App-Router + modern mutation surfaces (0.2.18+)
+- **`server-action-write`** — `"use server"` mutations with DB write / file upload / paid-API call. Direct-invoke pin with `vi.mock()` for the auth helper — runs the success path AND the reject path so AI silently *removing* the auth gate is caught (not just bypassing it).
+- **`paid-api-call`** — Anthropic / OpenAI / Gemini / Stripe calls anywhere in the codebase (not just inside Server Actions). Captures the call expression + **model literal** (catches `claude-opus` → `claude-haiku` silent swaps) + **max_tokens cap** (catches unbounded-spend regressions).
+- **`edge-function-write`** — Supabase Edge Functions at `supabase/functions/<name>/index.ts` (Deno runtime — HTTP-route detection misses these). Three-tier auth posture: confirmed (recognized helper) / ambiguous (auth-shaped signals but unrecognized — soft warn) / none (truly bare endpoint — loud alarm).
+- **`cron-handler`** — Vercel `vercel.json:crons[]` entries + GitHub Actions `on.schedule[].cron`. Catches silent schedule drift (`0 4 * * *` → `0 4 * * 0`, runs once a week instead of daily) + handler renames.
+- **`stripe-event-handled`** — Stripe webhook `switch (event.type) { case "X": ... }` dispatch. Catches AI silently typoing `"checkout.session.complete"` (one-letter rename), merging fallthrough arms dropping one, or wholesale deleting a case. Signature still verifies — paying customers never get provisioned.
+
+### Multi-step + family-shaped
+- **`journey`** — multi-step flows (signup→thanks, login→dashboard) with shared session. Catches "step 1 succeeds but step 2 silently regresses" — single-route pins structurally miss these.
+- Family detection (host-conditional) — one root file → multiple consumer routes. A change to the root pins all consumers as a group.
+
+### Browser interactions (🛟 BETA — opt-in)
+- **`interaction-baseline`** — Playwright records the observable effect of an interaction (carousel arrow click → scroll position, submit button → URL change). Catches `onClick` handler regressions that go undetected because the page still renders.
+- **`page-accessibility`** — axe-core via Playwright. Catches WCAG-AA contrast failures + invisible text — the *"page renders but is unreadable"* class that page-renders pins go GREEN on. WARN-only on violations; `confidence: "review"` so catches don't inflate the GA metric.
+
+### Repo integrity
+- **`lockfile-integrity`** / **`config-invariant`** / **`package-exports-exist`** / **`module-export-stable`** / **`import-path-resolves`** / **`tsc-clean`** — lockfile sha + critical config keys + module exports + import resolution + TS build all stay intact.
+- **`url-literal-preserved`** / **`changed-literal-preserved`** — URLs in code + bug-fix literals don't regress.
+- **`webhook-handler-exists`** — webhook handler signatures preserved.
+- **`react-route-registered`** — internal `<Link href="/foo">` / `navigate("/foo")` resolve to a real page file.
+- **`secret-not-public`** — no `NEXT_PUBLIC_*SECRET*` leaks, no `.env` commits, no debug routes exposed.
+- **`form-submit-error-handling`** — async error-handling on form submits stays wrapped.
+
+### CLI / library tooling
+- **`cli-output-contains`** / **`cli-exits-zero`** / **`cli-creates-file`** / **`cli-json-shape`** / **`cli-flag-supported`** — for CLI tools and binaries.
+- **`library-returns`** — a library function still returns the expected shape.
+
+The detectors are precision-bound: every pin emit has a specific signal, never a generic shape match. The 10-repo dyad dogfood produced **0 false positives** across 63 detections.
+
+### Recognized write libraries
+
+`happy-path-with-side-effect` + `server-action-write` + `edge-function-write` auto-fire on these write shapes (both in new diffs AND retroactively via `pinned sweep`):
 
 | Library | Pattern detected |
 |---|---|
@@ -82,22 +128,44 @@ Three new templates for the contracts a real app actually wants pinned:
 | raw SQL | `INSERT INTO X`, `UPDATE X SET`, `DELETE FROM X` inside `db.execute()` / `sql\`...\`` |
 | resend / sendgrid / nodemailer / aws-ses / postmark | their send / sendMail / sendEmail methods |
 | bullmq / inngest / generic queue | `queue.add()`, `inngest.send()`, `jobs.enqueue()` |
+| supabase-storage / aws-s3 / cloudflare-r2 / vercel-blob | `storage.from(BUCKET).upload`, `PutObjectCommand`, `env.BUCKET.put`, `@vercel/blob put` |
+| Anthropic / OpenAI / Gemini / Stripe (paid API) | `messages.create/parse/stream`, `chat.completions.create`, `responses.create`, `images.generate`, `embeddings.create`, `generateContent`, `checkout.sessions.create`, `billingPortal.sessions.create`, `paymentIntents.create`, `charges.create` |
+
+The widened Supabase client-identifier vocabulary recognizes `admin.from(...)`, `db.from(...)`, `userClient.from(...)`, `serviceClient.from(...)`, etc. — not just the literal `supabase` identifier. Confirmed across 42 Edge Functions on the MediniDyad dogfood repo.
 
 If your repo uses a write library not yet recognized, the pin won't auto-fire — open an issue with the import pattern. Adding a row is two regex lines.
 
-See [CHANGELOG.md](./CHANGELOG.md#020--2026-06-02) for parser phrasings + the side-effect wrapper customers add.
-
 ## What Pinned protects
 
-Pinned focuses on AI-prone failure modes:
+Pinned focuses on AI-prone failure modes. Categories grow with each release:
 
+### App-Router + modern mutation surfaces
+- **Next.js Server Actions** — `"use server"` functions that perform writes (DB / file upload / paid API) with auth gate + zod input schema captured. Direct-invoke verifier with `vi.mock()` for the auth helper runs success path AND reject path → catches silent gate removal too.
+- **Paid-API calls (anywhere)** — model string preserved (no silent `claude-opus` → `claude-haiku` swaps), `max_tokens` cap preserved (no unbounded-spend regressions), call expression preserved (no silent removal). Fires on plain backend services, library helpers, anywhere — not just Server Actions.
+- **Supabase Edge Functions** — Deno-runtime functions invisible to HTTP-route detection. File-existence + write expression + auth-gate idiom all preserved. Three-tier auth posture so soft-warns don't bury truly bare endpoints.
+- **Cron handlers** — Vercel `vercel.json:crons[]` + GitHub Actions `on.schedule`. Schedule drift (`0 4 * * *` → `0 4 * * 0`, daily vs weekly — same shape, very different behavior) + handler renames caught.
+- **Stripe webhook event-type dispatch** — every `case "<event-name>":` arm preserved. One-letter typo / merged fallthrough / deleted case fails the pin even though the signature still verifies.
+
+### Auth / access
+- **Auth gates** — `requireAuth` / `requireAdmin` / middleware matcher coverage; the middleware-aware pin uses `middleware.ts`'s captured auth signature so removing the check fails the guard.
+- **Permission roles** — per-role + per-tier caps preserved.
+- **Client / API mistakes** — missing `authHeaders()`, missing `credentials: "include"`, lost `if (!res.ok)` gates, removed 401/402/403 handling.
+- **Webhook signature verification** — `stripe.webhooks.constructEvent`, `x-hub-signature-256`, `svix.verify`, `twilio.validateRequest`, generic `crypto.createHmac("sha256", ...)`. Removing the verify call fails the pin.
+
+### Visual / usability (🛟 BETA — opt-in)
+- **WCAG-AA contrast / invisible text** — axe-core via Playwright. Catches the "page renders but is unreadable" class (white-on-white text shipped 3 times in real dyad-app dogfood) that plain page-renders pins go GREEN on.
+- **Interaction baselines** — Playwright records the observable effect of a click / scroll / type. Catches `onClick` handler regressions.
+
+### Repo integrity
 - **Guard weakening** — `.skip()`, `.only()`, `xit()`, `.todo()`, `.skipIf(true)`, deleted tests, weakened assertions (`toBe(401)` → `toBeTruthy()`), `|| true`, `?? true`, `catch(() => true)`, `expect(true).toBe(true)` tautologies, commented-out `expect()`, `expect.assertions(0)`, early `return;` in test body.
 - **Pinned-infrastructure tampering** — deletion of `tests/pinned/*`, `.github/workflows/pinned.yml`, `tests/pinned/.registry.json`, `.pinned/ai-lessons.md`, or sneaky rename-to-retired/ without the matching `.audit.json`.
-- **Client / API mistakes** — missing `authHeaders()`, missing `credentials: "include"`, lost `if (!res.ok)` gates, removed 401/402/403 handling. Detected statically per file via path + pattern heuristics.
-- **Auth / middleware regressions** — `requireAuth` / `requireAdmin` / middleware matcher coverage; the middleware-aware pin uses `middleware.ts`'s captured auth signature so removing the auth check fails the guard.
-- **Route / export / reference integrity** — internal `<Link href="/foo">` / `navigate("/foo")` / `router.push("/foo")` that resolve today are pinned; if a future commit removes the target page file, the pin fails.
-- **Webhook signature verification** — `stripe.webhooks.constructEvent`, `x-hub-signature-256`, `svix.verify`, `twilio.validateRequest`, generic `crypto.createHmac("sha256", ...)`. Pinned captures the verify call so removing it fails the guard.
-- **Public exposure no-fixture checks** — `.env` committed without `.gitignore` coverage, `.map` files in `dist/`/`build/`, debug routes (`__debug`, `__test`, `debug.html`, `/admin/console`).
+- **Route / export / reference integrity** — internal `<Link href="/foo">` / `navigate("/foo")` / `router.push("/foo")` that resolve today are pinned; future removal of the target page file fails the pin.
+- **Module exports** — package.json `exports`, named exports from libraries, import-path resolution.
+- **Lockfile + config invariants** — pnpm-lock.yaml sha + critical config keys preserved.
+
+### Public exposure
+- **Secrets in client bundle** — `NEXT_PUBLIC_*SECRET*` / `NEXT_PUBLIC_*KEY*` leaks.
+- **No-fixture checks** — `.env` committed without `.gitignore` coverage, `.map` files in `dist/`/`build/`, debug routes (`__debug`, `__test`, `debug.html`, `/admin/console`).
 
 ---
 
