@@ -289,6 +289,19 @@ export function classifyPinStrength(
       // but does need a fixture (recorded via `pinned record-
       // server-action`) and any env the action depends on.
       return "behavioral";
+    case "stripe-event-handled":
+      // 0.2.19+ static file scan — reads the webhook handler source
+      // and asserts each protected event-name literal still appears
+      // in a case arm. No HTTP, no fixtures, no preconditions. Always
+      // "behavioral" because the assertion has a real signal.
+      return "behavioral";
+    case "paid-api-call":
+    case "edge-function-write":
+    case "cron-handler":
+      // 0.2.19+ static file scans — assert call expression / file
+      // existence / schedule string. All have real signals; no
+      // preconditions. Always behavioral.
+      return "behavioral";
   }
 }
 
@@ -774,7 +787,90 @@ export type Claim =
   | HappyPathWithSideEffectClaim
   | JourneyClaim
   | InteractionBaselineClaim
-  | ServerActionWriteClaim;
+  | ServerActionWriteClaim
+  | StripeEventHandledClaim
+  | PaidApiCallClaim
+  | EdgeFunctionWriteClaim
+  | CronHandlerClaim;
+
+// 0.2.19+: Paid-API call pin. Entry-point-agnostic — fires on any
+// file (plain backend service, library helper, etc.) that calls
+// a paid SDK endpoint (Anthropic / OpenAI / Gemini / Stripe). The
+// headline: "Pinned guards every paid API call in your backend —
+// not just the ones in Next.js Server Actions."
+// Catches: AI silently swaps the model string (quality drop), AI
+// removes max_tokens (unbounded spend), AI removes the call.
+export type PaidApiCallClaim = {
+  template: "paid-api-call";
+  filePath: string;
+  provider: "anthropic" | "openai" | "google-gemini" | "stripe" | "stripe-checkout" | "stripe-portal";
+  // The dotted call expression, e.g. "anthropic.messages.create".
+  callExpr: string;
+  // Model string captured when present (Anthropic/OpenAI/Gemini).
+  // Pin asserts this literal still appears in the call's options.
+  modelString?: string;
+  // Whether max_tokens / max_completion_tokens was present at pin
+  // time. If true, pin asserts a max_tokens-like field is still
+  // present in the call options. If false, the pin doesn't assert
+  // (would create a noisy "you forgot a cap" pin on existing code).
+  hasMaxTokens?: boolean;
+  raw: string;
+};
+
+// 0.2.19+: Supabase Edge Function write pin. Same shape as the
+// Server Action write pin but the entry point is `Deno.serve(...)`
+// or `serve(...)` inside `supabase/functions/<name>/index.ts`.
+// Static check — asserts the file exists + the write call still
+// appears in source (no in-process invoke; Edge Functions run in
+// Deno, not Node/vitest).
+export type EdgeFunctionWriteClaim = {
+  template: "edge-function-write";
+  filePath: string;
+  functionName: string;
+  writeKind: "db-insert" | "db-update" | "db-upsert" | "db-delete" | "email" | "queue" | "http-post" | "file-upload";
+  writeTarget: string;
+  writeLibrary: string;
+  authGate?: string;
+  raw: string;
+};
+
+// 0.2.19+: Cron handler pin. Catches silent schedule drift OR
+// handler renames in Vercel `vercel.json` `crons[]` entries +
+// GitHub Actions `on.schedule[].cron`.
+export type CronHandlerClaim = {
+  template: "cron-handler";
+  source: "vercel" | "github-actions";
+  // The cron path (Vercel) or workflow file (GitHub Actions).
+  identifier: string;
+  schedule: string;
+  // File where the cron is declared (vercel.json or workflow yaml).
+  declarationFile: string;
+  // For Vercel: the resolved handler file. Pin asserts it exists.
+  handlerFile?: string;
+  raw: string;
+};
+
+// 0.2.19+: Stripe webhook event-type dispatch pin. Adjacent to the
+// existing webhook-signature pin (which catches the verify call), this
+// one catches the dispatch layer — the `switch (event.type) { case
+// "X": ... }` block that routes verified events to handlers. The bug
+// it stops: AI silently typos `case "checkout.session.complete":`
+// (one-letter rename) or merges arms / deletes one — signature still
+// verifies, paying customers never get provisioned.
+//
+// Pin shape: file path + list of protected event-name string literals.
+// The emitted test reads the file from disk at runtime + asserts each
+// literal still appears in a `case "..."` arm. No HTTP, no fixture,
+// no preconditions.
+export type StripeEventHandledClaim = {
+  template: "stripe-event-handled";
+  // Path to the webhook handler file, relative to repo root.
+  filePath: string;
+  // Sorted list of protected Stripe event-name string literals
+  // (e.g. ["checkout.session.completed", "invoice.payment_failed"]).
+  events: string[];
+  raw: string;
+};
 
 // A route token: must start with ASCII `/`, must not contain whitespace,
 // trailing punctuation, OR dangerous Unicode characters (RTL-override,
@@ -2211,6 +2307,44 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         check: `Imports the action directly from \`${c.actionModule}\` + calls \`${c.exportName}(fixture)\` with a recorded payload. Asserts the return shape matches the success baseline (default \`{ ok: true }\`). Catches: removed validation, removed write, return-early on the success path, throw on valid input.`,
       };
     }
+    case "stripe-event-handled": {
+      const eventCount = c.events.length;
+      return {
+        title: `Stripe webhook in \`${c.filePath}\` still handles ${eventCount} event type${eventCount === 1 ? "" : "s"}`,
+        promise: `Each protected Stripe event-type literal (${c.events.map((e) => `\`${e}\``).join(", ")}) is still present in a \`case\` arm of the file's event-dispatch switch.`,
+        check: `Reads ${c.filePath} from disk + asserts each event-name literal still appears as a case arm. Catches: AI silently typos \`case "checkout.session.complete":\` (one-letter rename), merges fallthrough arms that drop a case, or wholesale deletes a case. Signature still verifies — paying customers never get provisioned.`,
+      };
+    }
+    case "paid-api-call": {
+      const modelNote = c.modelString ? ` (model: \`${c.modelString}\`)` : "";
+      const capNote = c.hasMaxTokens ? ", with a `max_tokens` cap" : "";
+      return {
+        title: `Paid API call \`${c.callExpr}\` in \`${c.filePath}\` still present${modelNote}`,
+        promise: `\`${c.callExpr}\` still appears in \`${c.filePath}\`${modelNote}${capNote}. The pin asserts the call expression, the model string, and (when present) the \`max_tokens\` cap survive future edits.`,
+        check: `Reads \`${c.filePath}\` + asserts the call expression + model string still appear. Catches: AI silently swaps the model (\`claude-opus\` → \`claude-haiku\`, quality regression), AI removes \`max_tokens\` (unbounded spend), AI removes the call.`,
+      };
+    }
+    case "edge-function-write": {
+      const verb =
+        c.writeKind === "email" ? "sends an email" :
+        c.writeKind === "queue" ? "enqueues a job" :
+        c.writeKind === "file-upload" ? `uploads to ${c.writeTarget}` :
+        c.writeKind === "http-post" ? `POSTs to an external service` :
+        `${c.writeKind === "db-insert" ? "creates" : c.writeKind === "db-update" ? "updates" : c.writeKind === "db-upsert" ? "upserts" : "deletes"} \`${c.writeTarget}\``;
+      const authNote = c.authGate ? ` (gated by ${c.authGate})` : "";
+      return {
+        title: `Supabase Edge Function \`${c.functionName}\` still ${verb}${authNote}`,
+        promise: `\`${c.functionName}\` in \`${c.filePath}\` still ${verb} as part of its handler. The pin asserts the file exists and the write expression survives future edits.`,
+        check: `Reads \`${c.filePath}\` + asserts a recognized write shape (${c.writeKind} via ${c.writeLibrary}) still appears. Catches: AI deletes the function, removes the write, weakens the auth gate.`,
+      };
+    }
+    case "cron-handler": {
+      return {
+        title: `${c.source === "vercel" ? "Vercel cron" : "GH Actions cron"} \`${c.identifier}\` runs on \`${c.schedule}\``,
+        promise: `The cron schedule (\`${c.schedule}\`)${c.handlerFile ? ` + handler file (\`${c.handlerFile}\`)` : ""} survives future edits. Catches: AI silently changes the cron string (\`0 4 * * *\` → \`0 4 * * 0\`) or renames/deletes the handler.`,
+        check: `Reads \`${c.declarationFile}\` + asserts the schedule string is preserved${c.handlerFile ? `, and asserts \`${c.handlerFile}\` exists` : ""}.`,
+      };
+    }
   }
 }
 
@@ -2346,6 +2480,14 @@ export function badCaseForClaim(claim: Claim): string {
       return `🛟 BETA: interaction "${claim.action} ${claim.selector}" on \`${claim.page}\` no longer produces the same observable effect (${claim.observe.kind}) — the handler may be removed/broken, the selector may have changed, or the page no longer renders this element`;
     case "server-action-write":
       return `Server Action \`${claim.exportName}\` in \`${claim.actionModule}\` no longer succeeds with a valid payload — the action may early-return (auth/validation broken), throw on the fixture, or skip its ${claim.writeKind} to ${claim.writeTarget}`;
+    case "stripe-event-handled":
+      return `Stripe webhook in \`${claim.filePath}\` no longer handles one of its ${claim.events.length} protected event types (${claim.events.join(", ")}) — likely a one-letter typo in a case literal, a merged fallthrough, or a deleted arm. Signature still verifies, paying customers go un-provisioned.`;
+    case "paid-api-call":
+      return `Paid API call \`${claim.callExpr}\` in \`${claim.filePath}\` is missing or was changed${claim.modelString ? ` — model literal \`${claim.modelString}\` may have been swapped (silent quality regression) or removed` : ""}${claim.hasMaxTokens ? "; max_tokens cap may have been removed (unbounded spend risk)" : ""}.`;
+    case "edge-function-write":
+      return `Supabase Edge Function \`${claim.functionName}\` (${claim.filePath}) no longer performs its ${claim.writeKind} to \`${claim.writeTarget}\` — the function may have been deleted, the write expression removed, or the auth gate weakened.`;
+    case "cron-handler":
+      return `${claim.source === "vercel" ? "Vercel cron" : "GH Actions cron"} \`${claim.identifier}\` no longer runs on \`${claim.schedule}\` — the schedule was changed${claim.handlerFile ? ` or the handler (${claim.handlerFile}) was renamed/deleted` : ""}.`;
   }
 }
 
@@ -2438,6 +2580,18 @@ export function claimRoute(c: Claim): string | null {
       // No HTTP route — Server Actions are RPC-opaque. Surface the
       // module path so PINS.md groups them by source file.
       return c.actionModule;
+    case "stripe-event-handled":
+      // No HTTP route — the pin is file-bound. Surface the handler
+      // file path so PINS.md groups by webhook handler.
+      return c.filePath;
+    case "paid-api-call":
+      return c.filePath;
+    case "edge-function-write":
+      return c.filePath;
+    case "cron-handler":
+      // Cron pins are config-bound; surface the declaration file
+      // (vercel.json / workflow yaml).
+      return c.declarationFile;
   }
 }
 
@@ -2485,7 +2639,15 @@ export function claimSlug(claim: Claim): string {
                                   ? `interaction-${claim.action}-${claim.page}-${claim.selector}`
                                   : claim.template === "server-action-write"
                                     ? `server-action-${claim.actionModule}-${claim.exportName}`
-                                    : claim.route;
+                                    : claim.template === "stripe-event-handled"
+                                      ? `stripe-events-${claim.filePath}`
+                                      : claim.template === "paid-api-call"
+                                        ? `paid-api-${claim.callExpr}-${claim.filePath}`
+                                        : claim.template === "edge-function-write"
+                                          ? `edge-fn-${claim.functionName}`
+                                          : claim.template === "cron-handler"
+                                            ? `cron-${claim.source}-${claim.identifier}`
+                                            : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -2592,6 +2754,14 @@ export function claimKey(c: Claim): string {
       return `interaction-baseline:${c.page}:${c.selector}:${c.action}:${c.observe.kind}`;
     case "server-action-write":
       return `server-action-write:${c.actionModule}:${c.exportName}`;
+    case "stripe-event-handled":
+      return `stripe-event-handled:${c.filePath}`;
+    case "paid-api-call":
+      return `paid-api-call:${c.filePath}:${c.callExpr}`;
+    case "edge-function-write":
+      return `edge-function-write:${c.filePath}`;
+    case "cron-handler":
+      return `cron-handler:${c.source}:${c.identifier}`;
   }
 }
 

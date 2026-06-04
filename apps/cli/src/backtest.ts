@@ -1002,6 +1002,16 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
       // commits that don't touch it. Conservative: also accept the
       // module's directory so co-located helper imports trigger replay.
       return [claim.actionModule];
+    case "stripe-event-handled":
+    case "paid-api-call":
+    case "edge-function-write":
+      // File-bound pins — only commits touching the file can change
+      // the asserted invariant.
+      return [claim.filePath];
+    case "cron-handler":
+      // Both the declaration (vercel.json / workflow yaml) AND the
+      // resolved handler file (when present) gate replay.
+      return claim.handlerFile ? [claim.declarationFile, claim.handlerFile] : [claim.declarationFile];
   }
 }
 

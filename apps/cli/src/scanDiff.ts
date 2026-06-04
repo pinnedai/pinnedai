@@ -1795,10 +1795,17 @@ const WRITE_SHAPE_PATTERNS: Array<{
   library: string;
 }> = [
   // ── supabase-js ──
-  { re: /\bsupabase\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*insert\b/, kind: "db-insert", targetGroup: 1, library: "supabase-js" },
-  { re: /\bsupabase\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*update\b/, kind: "db-update", targetGroup: 1, library: "supabase-js" },
-  { re: /\bsupabase\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*upsert\b/, kind: "db-upsert", targetGroup: 1, library: "supabase-js" },
-  { re: /\bsupabase\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*delete\b/, kind: "db-delete", targetGroup: 1, library: "supabase-js" },
+  // The supabase client identifier varies in real codebases:
+  //   supabase / supabaseAdmin / admin / db / sb / supa / client / userClient / serviceClient
+  // — all conventional. Widen the LHS to accept any of these. The
+  // RHS chain (`.from(<table>).<write-method>`) is still tight enough
+  // that this doesn't FP on unrelated `client.from(...)` shapes (no
+  // common library uses the same chain). Confirmed catching missed
+  // writes on MediniDyad (47 Edge Functions write via `admin.from(...)`).
+  { re: /\b(?:supabase|supabaseAdmin|admin|adminClient|db|sb|supa|client|userClient|serviceClient|sbAdmin|supabaseClient)\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*insert\b/, kind: "db-insert", targetGroup: 1, library: "supabase-js" },
+  { re: /\b(?:supabase|supabaseAdmin|admin|adminClient|db|sb|supa|client|userClient|serviceClient|sbAdmin|supabaseClient)\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*update\b/, kind: "db-update", targetGroup: 1, library: "supabase-js" },
+  { re: /\b(?:supabase|supabaseAdmin|admin|adminClient|db|sb|supa|client|userClient|serviceClient|sbAdmin|supabaseClient)\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*upsert\b/, kind: "db-upsert", targetGroup: 1, library: "supabase-js" },
+  { re: /\b(?:supabase|supabaseAdmin|admin|adminClient|db|sb|supa|client|userClient|serviceClient|sbAdmin|supabaseClient)\s*\.\s*from\s*\(\s*['"]([\w_-]+)['"]\s*\)\s*\.\s*delete\b/, kind: "db-delete", targetGroup: 1, library: "supabase-js" },
   // ── prisma ──
   { re: /\bprisma\s*\.\s*([a-zA-Z_]\w*)\s*\.\s*create(?:Many)?\b/, kind: "db-insert", targetGroup: 1, library: "prisma" },
   { re: /\bprisma\s*\.\s*([a-zA-Z_]\w*)\s*\.\s*update(?:Many)?\b/, kind: "db-update", targetGroup: 1, library: "prisma" },
@@ -1866,6 +1873,16 @@ const WRITE_SHAPE_PATTERNS: Array<{
   { re: /\bgemini\s*\.\s*generateContent\s*\(/, kind: "http-post", targetGroup: 0, library: "google-gemini" },
   // Stripe payment intent / charge create — cost AND data-integrity surface.
   { re: /\bstripe\s*\.\s*(?:paymentIntents|charges|subscriptions|customers)\s*\.\s*create\s*\(/, kind: "http-post", targetGroup: 0, library: "stripe" },
+  // Stripe checkout.sessions.create — the SaaS-billing money path. Most
+  // apps don't use raw paymentIntents; checkout.sessions is the
+  // hosted-checkout endpoint that 80% of SaaS apps use to take money.
+  // Pattern confirmed across quantasyte + quantapact production code.
+  { re: /\bstripe\s*\.\s*checkout\s*\.\s*sessions\s*\.\s*create\s*\(/, kind: "http-post", targetGroup: 0, library: "stripe-checkout" },
+  // Stripe billingPortal.sessions.create — the customer subscription-
+  // management surface. Same risk class as checkout (silent removal /
+  // wrong return_url / cancelled subscription path breaks paying
+  // customers). Pattern confirmed across quantasyte + quantapact.
+  { re: /\bstripe\s*\.\s*billingPortal\s*\.\s*sessions\s*\.\s*create\s*\(/, kind: "http-post", targetGroup: 0, library: "stripe-portal" },
 ];
 
 // Detect a write shape in a handler body. Returns the FIRST shape
@@ -2846,6 +2863,607 @@ export function detectServerActionWrites(
     }
   }
   return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Paid-API call detector (0.2.19+, HEADLINE)
+// ────────────────────────────────────────────────────────────
+//
+// Entry-point-agnostic. Fires on ANY .ts/.js file (skipping tests
+// + scripts + node_modules + dist) that contains a paid-API call:
+// Anthropic messages.create/parse/stream, OpenAI chat.completions
+// or responses.create, Google Gemini generateContent, Stripe
+// checkout/billingPortal/paymentIntents/charges.create.
+//
+// Adjacent to the Server Action detector — server-action-write
+// catches the auth-gated WRITE inside a "use server" module; this
+// catches paid-API calls EVERYWHERE: plain Express services
+// (sAles repI/server/src/services/extraction.ts), API routes that
+// aren't Server Actions, library helpers, anywhere.
+//
+// The bug class it stops:
+//   1. AI silently swaps the model string ("claude-opus-4-7" →
+//      "claude-haiku-3") — quality drop nobody notices until users
+//      complain. The pin captures the model literal and asserts it
+//      survives.
+//   2. AI removes max_tokens / max_completion_tokens — unbounded
+//      spend regression. The pin captures the cap presence.
+//   3. AI silently removes the call entirely.
+//
+// Confirmed pattern across dyad-apps (sAles repI extraction.ts +
+// socialideagen aiFill.ts already caught via Server Action route).
+// Precision gate: requires SDK import in same file OR the SDK-
+// named identifier (`anthropic.X` / `openai.X` / `stripe.X`).
+//
+// The headline marketing line: "Pinned guards every paid API call
+// in your backend — not just the ones in Next.js Server Actions."
+
+export type PaidApiCallHit = {
+  template: "paid-api-call";
+  filePath: string;
+  provider: "anthropic" | "openai" | "google-gemini" | "stripe" | "stripe-checkout" | "stripe-portal";
+  callExpr: string;            // e.g. "anthropic.messages.create"
+  // Captured options literals — when present, the pin asserts they
+  // still appear in the call's options object.
+  modelString?: string;        // e.g. "claude-sonnet-4-6"
+  hasMaxTokens?: boolean;      // true if `max_tokens` or `max_completion_tokens` was present
+  suggestedPin: string;
+};
+
+// Patterns specifically for the paid-API detector. Subset of
+// WRITE_SHAPE_PATTERNS that are confirmed paid endpoints (not
+// list/retrieve/get which are cheaper read-only paths).
+const PAID_API_CALL_PATTERNS: Array<{
+  re: RegExp;
+  provider: PaidApiCallHit["provider"];
+  callExprFromMatch: (m: RegExpExecArray) => string;
+}> = [
+  // Anthropic — messages.create/parse/stream
+  {
+    re: /\b((?:anthropic|client|ai)\s*\.\s*messages\s*\.\s*(?:create|parse|stream))\s*\(/g,
+    provider: "anthropic",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+  // OpenAI — chat.completions.create / responses.create / images.generate / embeddings.create
+  {
+    re: /\b((?:openai|client)\s*\.\s*chat\s*\.\s*completions\s*\.\s*create)\s*\(/g,
+    provider: "openai",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+  {
+    re: /\b((?:openai|client)\s*\.\s*responses\s*\.\s*create)\s*\(/g,
+    provider: "openai",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+  {
+    re: /\b((?:openai|client)\s*\.\s*images\s*\.\s*generate)\s*\(/g,
+    provider: "openai",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+  {
+    re: /\b((?:openai|client)\s*\.\s*embeddings\s*\.\s*create)\s*\(/g,
+    provider: "openai",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+  // Google Gemini
+  {
+    re: /\b(gemini\s*\.\s*generateContent)\s*\(/g,
+    provider: "google-gemini",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+  // Stripe — checkout / portal / paymentIntents / charges / subscriptions / customers
+  {
+    re: /\b(stripe\s*\.\s*checkout\s*\.\s*sessions\s*\.\s*create)\s*\(/g,
+    provider: "stripe-checkout",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+  {
+    re: /\b(stripe\s*\.\s*billingPortal\s*\.\s*sessions\s*\.\s*create)\s*\(/g,
+    provider: "stripe-portal",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+  {
+    re: /\b(stripe\s*\.\s*(?:paymentIntents|charges|subscriptions)\s*\.\s*create)\s*\(/g,
+    provider: "stripe",
+    callExprFromMatch: (m) => m[1].replace(/\s+/g, ""),
+  },
+];
+
+// Which SDK imports gate which providers? File must import the SDK
+// (directly OR via a local wrapper module — the wrapper name is what
+// production code uses) for an identifier-based call to fire. Filters
+// out `client.X` calls that aren't actually paid APIs (supabase client,
+// redis client, etc.).
+const PROVIDER_IMPORT_PATTERNS: Record<PaidApiCallHit["provider"], RegExp[]> = {
+  anthropic: [
+    /from\s+['"]@anthropic-ai\/sdk['"]/,
+    /import\s+Anthropic\s+from/,
+    /from\s+['"][^'"]*\/anthropic['"]/,
+    /from\s+['"][^'"]*\/llm['"]/,
+  ],
+  openai: [
+    /from\s+['"]openai['"]/,
+    /from\s+['"][^'"]*\/openai['"]/,
+  ],
+  "google-gemini": [
+    /from\s+['"]@google\/generative-ai['"]/,
+    /from\s+['"][^'"]*\/gemini['"]/,
+  ],
+  // Stripe local wrappers are extremely common (`lib/stripe.ts`).
+  // Accept any import path ending in `/stripe`, OR the SDK type
+  // reference (`Stripe.Event` / `Stripe.Checkout.Session`), OR
+  // `new Stripe(`.
+  stripe: [
+    /from\s+['"]stripe['"]/,
+    /from\s+['"][^'"]*\/stripe(?:\.js)?['"]/,
+    /\bStripe\s*\.\s*(?:Event|Checkout|Subscription|Customer|Invoice|PaymentIntent|Charge|BillingPortal)\b/,
+    /\bnew\s+Stripe\s*\(/,
+  ],
+  "stripe-checkout": [
+    /from\s+['"]stripe['"]/,
+    /from\s+['"][^'"]*\/stripe(?:\.js)?['"]/,
+    /\bStripe\s*\.\s*(?:Checkout|BillingPortal)\b/,
+    /\bnew\s+Stripe\s*\(/,
+  ],
+  "stripe-portal": [
+    /from\s+['"]stripe['"]/,
+    /from\s+['"][^'"]*\/stripe(?:\.js)?['"]/,
+    /\bStripe\s*\.\s*BillingPortal\b/,
+    /\bnew\s+Stripe\s*\(/,
+  ],
+};
+
+// Extract the model string from a call's options-object literal.
+// Slices forward from the opening `(` to the matching `)`, then
+// scans for `model: "..."` or `model: '...'`. Returns the captured
+// string when found.
+function extractCallOptionsField(
+  content: string,
+  openParenIdx: number,
+  field: string
+): string | null {
+  // Find matching close-paren, paren-balanced + string-aware.
+  let depth = 1;
+  let j = openParenIdx + 1;
+  while (j < content.length && depth > 0) {
+    const ch = content[j];
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      j += 1;
+      while (j < content.length) {
+        if (content[j] === "\\") { j += 2; continue; }
+        if (content[j] === quote) { j += 1; break; }
+        j += 1;
+      }
+      continue;
+    }
+    if (ch === "(") depth += 1;
+    else if (ch === ")") depth -= 1;
+    j += 1;
+  }
+  if (depth !== 0) return null;
+  const args = content.slice(openParenIdx + 1, j - 1);
+  // Match `<field>: "<value>"` with optional whitespace.
+  const fieldRe = new RegExp(`\\b${field}\\s*:\\s*['"]([^'"\\n]+)['"]`);
+  const m = fieldRe.exec(args);
+  return m ? m[1] : null;
+}
+
+function hasField(content: string, openParenIdx: number, field: string): boolean {
+  // Same slicing as above. Cheap presence check.
+  let depth = 1;
+  let j = openParenIdx + 1;
+  while (j < content.length && depth > 0) {
+    const ch = content[j];
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      j += 1;
+      while (j < content.length) {
+        if (content[j] === "\\") { j += 2; continue; }
+        if (content[j] === quote) { j += 1; break; }
+        j += 1;
+      }
+      continue;
+    }
+    if (ch === "(") depth += 1;
+    else if (ch === ")") depth -= 1;
+    j += 1;
+  }
+  if (depth !== 0) return false;
+  const args = content.slice(openParenIdx + 1, j - 1);
+  return new RegExp(`\\b${field}\\s*:`).test(args);
+}
+
+export function detectPaidApiCalls(
+  filesByPath: Map<string, string>
+): PaidApiCallHit[] {
+  const out: PaidApiCallHit[] = [];
+  const seen = new Set<string>();
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    // Skip scripts / migrations / seed files — those are operator-run
+    // one-shots, not production code paths. FP-prone.
+    if (/(?:^|\/)(?:scripts|migrations|seeds|seed)\//.test(filePath)) continue;
+
+    for (const pat of PAID_API_CALL_PATTERNS) {
+      // Reset stateful regex.
+      pat.re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = pat.re.exec(content)) !== null) {
+        // Gate: file must import the SDK. Otherwise `client.X` calls
+        // on a supabase / redis / etc. client would false-positive.
+        const importPatterns = PROVIDER_IMPORT_PATTERNS[pat.provider];
+        const sdkImported = importPatterns.some((rp) => rp.test(content));
+        if (!sdkImported) continue;
+
+        const callExpr = pat.callExprFromMatch(m);
+        const openParen = m.index + m[0].length - 1;
+        // Heuristic: only extract model for SDKs where it matters
+        // (Anthropic/OpenAI/Gemini). Stripe doesn't take a model
+        // parameter, but it does have other invariants.
+        const modelString =
+          pat.provider === "anthropic" || pat.provider === "openai" || pat.provider === "google-gemini"
+            ? extractCallOptionsField(content, openParen, "model") ?? undefined
+            : undefined;
+        const hasMaxTokens =
+          pat.provider === "anthropic"
+            ? hasField(content, openParen, "max_tokens")
+            : pat.provider === "openai"
+              ? hasField(content, openParen, "max_completion_tokens") || hasField(content, openParen, "max_tokens")
+              : undefined;
+
+        const key = `${filePath}::${callExpr}::${modelString ?? "*"}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const modelNote = modelString ? ` · model=${modelString}` : "";
+        const capNote = hasMaxTokens === true ? " · max_tokens set" : hasMaxTokens === false ? " · ⚠ no max_tokens (unbounded spend risk)" : "";
+        out.push({
+          template: "paid-api-call",
+          filePath,
+          provider: pat.provider,
+          callExpr,
+          modelString,
+          hasMaxTokens,
+          suggestedPin: `Paid API call ${callExpr}() in ${filePath} (${pat.provider})${modelNote}${capNote} — silent removal, model swap, or token-cap removal goes uncaught without a pin.`,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Supabase Edge Function detector (0.2.19+)
+// ────────────────────────────────────────────────────────────
+//
+// Closes another App-Router-adjacent blind spot. Edge Functions
+// at `supabase/functions/<name>/index.ts` carry the same shape as
+// Server Actions — auth gate + DB write — but use `Deno.serve(...)`
+// as entry point instead of "use server". MediniDyad has 127
+// functions, ~47 of them write-bearing. Currently invisible to all
+// existing detectors (no HTTP route convention match, no "use server"
+// directive).
+//
+// Detection signature (precision-gated):
+//   1. Path matches supabase/functions/<name>/index.ts
+//   2. Content contains `Deno.serve(` (the entry-point convention)
+//   3. Content contains a recognized write shape (DB write / file
+//      upload / outbound paid-API call)
+//
+// All three required. Reuses the Server Action template machinery
+// (auth-gate + schema-name extraction); the verifier emits a static
+// "function file exists + write call still present" pin — direct
+// invoke isn't feasible in vitest since these run in Deno runtime.
+export type EdgeFunctionWriteHit = {
+  template: "edge-function-write";
+  filePath: string;
+  functionName: string;  // <name> from the path
+  writeShape: WriteShape;
+  authGate?: string;
+  suggestedPin: string;
+};
+
+export function detectEdgeFunctionWrites(
+  filesByPath: Map<string, string>
+): EdgeFunctionWriteHit[] {
+  const out: EdgeFunctionWriteHit[] = [];
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    const pathMatch = /(?:^|\/)supabase\/functions\/([^/]+)\/index\.(?:ts|tsx|js|jsx|mjs)$/.exec(filePath);
+    if (!pathMatch) continue;
+    const functionName = pathMatch[1];
+    // Two entry-point conventions in Supabase Edge Functions:
+    //   (a) `Deno.serve(...)`  — newer template
+    //   (b) `import { serve } from "https://deno.land/std/.../server.ts"`
+    //       + `serve(async (req) => ...)`  — older template
+    // Path constraint already locks us to supabase/functions/<X>/index.ts
+    // so a bare `serve(` doesn't false-positive elsewhere.
+    const hasDenoServe = /\bDeno\s*\.\s*serve\s*\(/.test(content);
+    const hasImportedServe = /\bimport\s*\{\s*serve\s*\}\s+from\s+['"]https:\/\/deno\.land\/std[^'"]+['"]/.test(content) && /\bserve\s*\(/.test(content);
+    if (!hasDenoServe && !hasImportedServe) continue;
+    const writeShape = detectWriteShape(content);
+    if (!writeShape) continue;
+    // Reuse the Server Action auth-gate extractor (same vocabulary).
+    const authMatch = /\b(is(?:Admin|Authenticated|SignedIn|LoggedIn|Authed)\w*|require(?:Auth|Admin|Session|User|Role)\w*|getServerSession|currentUser|getUser|auth\.getUser|verifyToken)\s*\(/.exec(content);
+    const authGate = authMatch ? authMatch[1] : undefined;
+    const verb =
+      writeShape.kind === "email" ? "sends email" :
+      writeShape.kind === "queue" ? "enqueues job" :
+      writeShape.kind === "file-upload" ? `uploads to ${writeShape.target}` :
+      writeShape.kind === "http-post" ? `calls ${writeShape.library}` :
+      `${writeShape.kind === "db-insert" ? "inserts" : writeShape.kind === "db-update" ? "updates" : writeShape.kind === "db-upsert" ? "upserts" : "deletes"} ${writeShape.target}`;
+    const authNote = authGate ? ` (gated by ${authGate})` : "";
+    out.push({
+      template: "edge-function-write",
+      filePath,
+      functionName,
+      writeShape,
+      authGate,
+      suggestedPin: `Supabase Edge Function "${functionName}" ${verb}${authNote} — invisible to HTTP-route detection (runs in Deno).`,
+    });
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Cron handler detector (Vercel + GH Actions) (0.2.19+)
+// ────────────────────────────────────────────────────────────
+//
+// Cron handlers fire WITHOUT a user in the loop. If auth is dropped,
+// or the handler URL is renamed, or the schedule silently drifts,
+// nothing in normal e2e testing catches it — the cron just stops.
+// quantapact has 11 Vercel crons (rollup, scan, email-deliver, etc.);
+// quantasyte + pinnedai have GH Actions cron schedules.
+//
+// Detection signature:
+//   (a) Vercel: parse `vercel.json` → `crons[]` array. For each
+//       `{path, schedule}` entry, resolve `api/<path-suffix>.ts` or
+//       `app/api/<path-suffix>/route.ts` and pin handler-exists +
+//       schedule-string-preserved.
+//   (b) GH Actions: parse `.github/workflows/*.yml` → `on.schedule[]`.
+//       Pin the workflow file + schedule string preserved.
+//
+// Light parsing (regex, not full YAML) — robust to surface drift,
+// and the only fields we read are flat strings.
+
+export type CronHandlerHit = {
+  template: "cron-handler";
+  source: "vercel" | "github-actions";
+  schedule: string;             // "0 4 * * *"
+  // For vercel: the cron path (e.g. "/api/cron/scan-peers")
+  // For github-actions: the workflow file path
+  identifier: string;
+  // The file that declares the cron (vercel.json or workflow yaml)
+  declarationFile: string;
+  // For vercel only: the resolved handler file path
+  handlerFile?: string;
+  suggestedPin: string;
+};
+
+export function detectCronHandlers(
+  filesByPath: Map<string, string>
+): CronHandlerHit[] {
+  const out: CronHandlerHit[] = [];
+  // Vercel: vercel.json at repo root or workspace root
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (!/(?:^|\/)vercel\.json$/.test(filePath)) continue;
+    let parsed: { crons?: Array<{ path?: unknown; schedule?: unknown }> } | null = null;
+    try {
+      parsed = JSON.parse(content);
+    } catch { continue; }
+    if (!parsed?.crons || !Array.isArray(parsed.crons)) continue;
+    for (const cron of parsed.crons) {
+      if (typeof cron?.path !== "string" || typeof cron?.schedule !== "string") continue;
+      // Resolve handler file. Vercel paths like `/api/cron/scan-peers`
+      // map to `api/cron/scan-peers.ts` (pages-style) or
+      // `app/api/cron/scan-peers/route.ts` (app-router). Try both.
+      const pathSuffix = cron.path.replace(/^\//, "");
+      const candidates = [
+        `${pathSuffix}.ts`,
+        `${pathSuffix}.tsx`,
+        `${pathSuffix}.js`,
+        `${pathSuffix}.mjs`,
+        `app/${pathSuffix}/route.ts`,
+        `app/${pathSuffix}/route.tsx`,
+        `app/${pathSuffix}/route.js`,
+      ];
+      let handlerFile: string | undefined;
+      for (const c of candidates) {
+        if (filesByPath.has(c)) { handlerFile = c; break; }
+      }
+      out.push({
+        template: "cron-handler",
+        source: "vercel",
+        schedule: cron.schedule,
+        identifier: cron.path,
+        declarationFile: filePath,
+        handlerFile,
+        suggestedPin: `Vercel cron "${cron.path}" runs on "${cron.schedule}"${handlerFile ? ` → ${handlerFile}` : " (handler file unresolved)"}. Schedule drift or handler rename = silent SLA break (cron stops, no user notices).`,
+      });
+    }
+  }
+  // GitHub Actions: .github/workflows/*.yml with on.schedule[].cron
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (!/(?:^|\/)\.github\/workflows\/[^/]+\.ya?ml$/.test(filePath)) continue;
+    // Lightweight YAML-shape scan. We only need the cron strings.
+    // Look for `schedule:` indented under `on:`, then `- cron: "..."`
+    // entries. Tolerant of `on: {schedule: [{cron: ...}]}` JSON-flow too.
+    const cronMatches = Array.from(content.matchAll(/\bcron\s*:\s*["']([^"'\n]+)["']/g));
+    if (cronMatches.length === 0) continue;
+    // Also confirm we're under an `on.schedule` block (not random
+    // `cron:` keys in env). Loose check: presence of `schedule:` and
+    // the cron must be after `on:`.
+    const onIdx = content.indexOf("on:");
+    const scheduleIdx = content.indexOf("schedule:");
+    if (onIdx === -1 || scheduleIdx === -1 || scheduleIdx < onIdx) continue;
+    for (const m of cronMatches) {
+      const schedule = m[1];
+      // Cron string sanity: 5 fields (basic) or 6 (with seconds).
+      if (!/^[*\d,\-/?LWa-zA-Z\s]+$/.test(schedule)) continue;
+      const parts = schedule.trim().split(/\s+/);
+      if (parts.length < 5 || parts.length > 6) continue;
+      out.push({
+        template: "cron-handler",
+        source: "github-actions",
+        schedule,
+        identifier: filePath,
+        declarationFile: filePath,
+        suggestedPin: `GitHub Actions workflow ${filePath} runs on "${schedule}". Schedule drift = silent SLA break.`,
+      });
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Stripe webhook event-type dispatch detector (0.2.19+)
+// ────────────────────────────────────────────────────────────
+//
+// Adjacent to detectWebhookSignaturePins (which catches "signature
+// verify is still wired"). This one catches the dispatch layer:
+// the `switch (event.type) { case "checkout.session.completed": ... }`
+// block routing each verified event to its handler.
+//
+// The bug it stops: AI silently typos `case "checkout.session.complete":`
+// (one-letter rename), or merges two arms into a fallthrough that drops
+// one of them, or wholesale deletes a case while "cleaning up." The
+// signature still verifies — and paying customers never get provisioned.
+// Confirmed pattern across 3 dyad-apps (quantapact tier-webhook +
+// badge-webhook + quantasyte billing.ts), each gating real money flows.
+//
+// Precision-gated:
+//   1. File must contain `stripe.webhooks.constructEvent` (the verify
+//      call) — narrows to actual Stripe webhook handlers.
+//   2. File must contain a `switch` block whose discriminant is
+//      `event.type` or `<destructured-from-event>.type` or
+//      `<single-identifier>` that was assigned from `event.type`.
+//   3. The switch block must contain at least one `case "<event-name>":`
+//      arm where the event name matches Stripe's well-known event-name
+//      shape (`<resource>.<action>` like `customer.subscription.updated`).
+//
+// All three required → emit hit. Skipping any one prevents false
+// positives on generic event-bus files / Node.js EventEmitter
+// dispatchers that happen to be in the same repo.
+export type StripeEventDispatchHit = {
+  template: "stripe-event-handled";
+  filePath: string;
+  events: string[];           // ["checkout.session.completed", ...]
+  suggestedPin: string;
+};
+
+// Stripe event-name shape: `<segment>.<segment>(.<segment>)?` with
+// lowercase + underscores. Examples: "customer.subscription.updated",
+// "invoice.payment_failed", "checkout.session.completed",
+// "payment_intent.succeeded". Tight enough to reject "default" /
+// "string" / arbitrary identifiers that some non-Stripe dispatchers
+// use.
+const STRIPE_EVENT_NAME_RE = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,3}$/;
+
+export function detectStripeEventDispatches(
+  filesByPath: Map<string, string>
+): StripeEventDispatchHit[] {
+  const out: StripeEventDispatchHit[] = [];
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    // Gate 1: file must use the Stripe SDK. Accept any of:
+    //   (a) literal `stripe.webhooks.constructEvent(` — direct SDK call
+    //   (b) `Stripe.Event` type reference — quantasyte-shape wrapper
+    //       (`constructWebhookEvent` helper in a separate file, but
+    //       the caller still types `event: Stripe.Event`)
+    //   (c) an import of `from "stripe"` AND a wrapper-named call
+    //       (`*WebhookEvent` / `*WebhookSignature` / `verifyStripe*`)
+    // All three are real-world shapes observed in dyad-apps.
+    const hasDirectVerify = /\bstripe\s*\.\s*webhooks\s*\.\s*constructEvent\s*\(/.test(content);
+    const hasStripeEventType = /\bStripe\s*\.\s*Event\b/.test(content);
+    const hasStripeImport = /\bfrom\s+['"]stripe['"]/.test(content);
+    const hasWrapperCall = /\b(?:construct|verify|build)\w*Webhook\w*\s*\(/i.test(content);
+    if (!hasDirectVerify && !hasStripeEventType && !(hasStripeImport && hasWrapperCall)) continue;
+
+    // Gate 2: a `switch (event.type)` block must exist. Also accept
+    // destructured forms: `switch (type)` where type came from
+    // `const { type } = event` or `event.type`. We're conservative —
+    // require the literal `event.type` OR a `switch (type)` preceded
+    // somewhere by `const { type } = event` / `const type = event.type`.
+    const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    let switchBody: string | null = null;
+    {
+      // Direct `switch (event.type) {`.
+      const direct = /switch\s*\(\s*event\s*\.\s*type\s*\)\s*\{/.exec(stripped);
+      if (direct) {
+        const start = direct.index + direct[0].length;
+        switchBody = sliceBalancedBraces(stripped, start - 1);
+      } else {
+        const indirect = /switch\s*\(\s*(\w+)\s*\)\s*\{/.exec(stripped);
+        if (indirect) {
+          const discriminant = indirect[1];
+          const destructured = new RegExp(`const\\s*\\{\\s*[^}]*\\btype\\s*:\\s*${discriminant}\\b[^}]*\\}\\s*=\\s*event\\b|const\\s*\\{\\s*[^}]*\\b${discriminant}\\b[^}]*\\}\\s*=\\s*event\\b`);
+          const assigned = new RegExp(`(?:const|let|var)\\s+${discriminant}\\s*(?::[^=]+)?=\\s*event\\s*\\.\\s*type\\b`);
+          if (destructured.test(stripped) || assigned.test(stripped)) {
+            const start = indirect.index + indirect[0].length;
+            switchBody = sliceBalancedBraces(stripped, start - 1);
+          }
+        }
+      }
+    }
+    if (!switchBody) continue;
+
+    // Gate 3: extract `case "<event-name>":` arms.
+    const events = new Set<string>();
+    for (const m of switchBody.matchAll(/case\s*['"]([^'"]+)['"]\s*:/g)) {
+      const name = m[1];
+      if (STRIPE_EVENT_NAME_RE.test(name)) events.add(name);
+    }
+    if (events.size === 0) continue;
+
+    const eventList = Array.from(events).sort();
+    out.push({
+      template: "stripe-event-handled",
+      filePath,
+      events: eventList,
+      suggestedPin: `Stripe webhook in ${filePath} routes ${eventList.length} event type${eventList.length === 1 ? "" : "s"} (${eventList.join(", ")}) — silently dropping one breaks SaaS provisioning while the signature still verifies.`,
+    });
+  }
+  return out;
+}
+
+// Slice content from `start` (which points at the `{`) to the matching
+// `}`. Skips strings + comments so braces inside string literals or
+// comments don't unbalance. Returns null if unbalanced.
+function sliceBalancedBraces(content: string, start: number): string | null {
+  if (content[start] !== "{") return null;
+  let depth = 1;
+  let j = start + 1;
+  while (j < content.length && depth > 0) {
+    const ch = content[j];
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      j += 1;
+      while (j < content.length) {
+        if (content[j] === "\\") { j += 2; continue; }
+        if (content[j] === quote) { j += 1; break; }
+        if (quote === "`" && content[j] === "$" && content[j + 1] === "{") {
+          let tdepth = 1;
+          j += 2;
+          while (j < content.length && tdepth > 0) {
+            if (content[j] === "{") tdepth += 1;
+            else if (content[j] === "}") tdepth -= 1;
+            j += 1;
+          }
+          continue;
+        }
+        j += 1;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") depth -= 1;
+    j += 1;
+  }
+  if (depth !== 0) return null;
+  return content.slice(start + 1, j - 1);
 }
 
 // ────────────────────────────────────────────────────────────
@@ -4965,6 +5583,18 @@ export function deriveRouteFromPath(path: string): string | null {
   m = /(?:^|\/)(?:src\/)?pages\/api\/(.+)\.(?:ts|tsx|js|jsx)$/.exec(path);
   if (m) return "/api/" + m[1];
   m = /(?:^|\/)(?:src\/)?routes\/(.+)\.(?:ts|tsx|js|jsx)$/.exec(path);
+  if (m) return "/api/" + m[1].replace(/\/index$/, "");
+  // Vercel pages-style serverless functions in a top-level `api/` dir
+  // (NOT inside `app/` or `pages/`). Production-grade pattern — used
+  // by quantapact's tier-checkout.ts / badge-portal.ts / tier-webhook.ts.
+  // Without this branch, top-level `api/X.ts` returns null and the
+  // route-aware detectors (write endpoints, auth checks) skip the
+  // file silently. Tight constraint: path must START with `api/` at
+  // repo root OR `apps/<workspace>/api/` in a monorepo. Rejects
+  // `lib/api/X.ts`, `src/api/X.ts`, etc. (which aren't routes).
+  m = /^api\/(.+)\.(?:ts|tsx|js|jsx)$/.exec(path);
+  if (m) return "/api/" + m[1].replace(/\/index$/, "");
+  m = /^apps\/[^/]+\/api\/(.+)\.(?:ts|tsx|js|jsx)$/.exec(path);
   if (m) return "/api/" + m[1].replace(/\/index$/, "");
   // Middleware files protect a *family* of routes (typically /admin/*,
   // /account/*, or "everything except public"). The exact protected

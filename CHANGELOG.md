@@ -2,6 +2,80 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.19] — 2026-06-04
+
+Five new coverage gaps closed in a single release, plus a precondition-WARN fix on Server Actions and a long-overdue npm-README sync. The new gaps span the highest-stakes surfaces dyad-app dogfood and a follow-up deep-audit agent both flagged: paid-API calls in plain backend services (the "AI silently swapped my model" defense), Supabase Edge Functions (Deno runtime — HTTP-route detection structurally misses them), Vercel/GH-Actions cron handlers (no user-in-loop, silent SLA-break class), Stripe webhook event-type dispatch (one-letter typo + signature still verifies = paying customers never get provisioned), and Stripe checkout/billingPortal session creation. FP sweep across 10 dyad-apps: 0 spurious hits, every detection confirmed real-world.
+
+### Fixed — Server Action template no longer cry-wolf-reds on precondition failures
+
+When a Server Action returns a recognizable "can't run here" shape — `{ ok: false, error: "Not authorized." }` (no admin session in test env), `{ ok: false, error: "Backend not configured." }` (missing service-role key), `{ status: 503 }` — the test now WARNS and skips instead of failing red. The Pinned thesis on cry-wolf reds: a guard that hard-fails when it simply couldn't run trains people to ignore reds. Precondition failure is NOT a regression.
+
+Recognized signals: unauthorized / sign-in / forbidden vocabulary in `error`; backend-not-configured / service-unavailable / missing-env vocabulary; 503 in `status` or `statusCode`. Genuine returns ("Database write failed: connection refused", thrown errors, success-shape mismatches) still fail red — verified via the matrix: 4 positive WARN cases + 3 negative real-failure cases, all behave correctly.
+
+### Added — Paid-API call detector (the HEADLINE)
+
+`detectPaidApiCalls()` is entry-point-agnostic: it fires on ANY .ts/.js file (skipping tests + scripts + node_modules + dist) that calls a paid SDK endpoint. The 0.2.18 Server Action detector caught these inside `"use server"` modules; this catches them everywhere. Marketing line: *"Pinned guards every paid API call in your backend — not just the ones in Next.js Server Actions."*
+
+The bug classes it stops:
+1. **AI silently swaps the model** — `claude-opus` → `claude-haiku`, `gpt-4o` → `gpt-4o-mini`. Quality regression nobody notices until users complain. Pin captures the model literal + asserts it survives.
+2. **AI removes `max_tokens` / `max_completion_tokens`** — unbounded spend regression. Single runaway payload = $50-200 in API costs. Pin captures the cap's presence (not the value) so adding a Pinned guard to existing code doesn't suddenly flag it as missing a cap.
+3. **AI silently removes the call entirely** — caught by the call-expression assertion.
+
+Coverage: Anthropic (`messages.create/parse/stream`), OpenAI (`chat.completions.create`, `responses.create`, `images.generate`, `embeddings.create`), Google Gemini (`generateContent`), Stripe (`paymentIntents.create`, `charges.create`, `subscriptions.create`, `customers.create`, `checkout.sessions.create`, `billingPortal.sessions.create`). Each gated by an SDK-import requirement so `client.X` calls on supabase/redis/other clients don't false-positive.
+
+Real-world evidence: sAles repI's `server/src/services/extraction.ts:64` calls `anthropic.messages.create` with `claude-sonnet-4-5-20250929` + `max_tokens` — exactly the surface the Server Action detector structurally misses (plain Express service, not a Server Action).
+
+### Added — Supabase Edge Function detector
+
+`detectEdgeFunctionWrites()` finds files matching `supabase/functions/<name>/index.ts` that contain either `Deno.serve(...)` OR `import { serve } from "https://deno.land/std/..." + serve(...)` AND a recognized write shape. Static source-scan pin — Edge Functions run in Deno, not Node, so direct invoke from vitest isn't feasible. The pin asserts: (a) file exists, (b) write expression survives, (c) auth-gate function call survives.
+
+Same WRITE_SHAPE_PATTERNS as Server Action detection, with **widened Supabase client-identifier vocabulary** — production code uses `admin.from(...).insert(...)` / `db.from(...).update(...)` / `userClient.from(...).upsert(...)` not just the literal `supabase.X` identifier. Confirmed: MediniDyad 42 Edge Function writes detected (up from 1 in the initial implementation pass), plus 2 each in Ai-Book + researchAi.
+
+### Added — Cron handler detector (Vercel + GitHub Actions)
+
+`detectCronHandlers()` parses `vercel.json:crons[]` for path + schedule pairs, and `.github/workflows/*.yml:on.schedule[].cron` for workflow schedules. Both surfaces share the same risk: cron fires WITHOUT a user in the loop, so schedule drift (`0 4 * * *` → `0 4 * * 0` runs once a week instead of daily, same shape) or handler rename = silent SLA break.
+
+Vercel pin: file exists + schedule preserved + path still declared + handler file (resolved via path → `api/<path>.ts` or `app/<path>/route.ts`) exists. GH Actions pin: workflow file exists + schedule string preserved. Real-world: quantapact 11 Vercel crons (rollup-scan-events, alert-deliver, scan-peers, etc.), 1 GH Actions schedule on pulse.yml; quantasyte synthetic-monitor.yml; pinnedai itself pulse.yml.
+
+### Added — Stripe webhook event-type dispatch detector
+
+`detectStripeEventDispatches()` finds the dispatch layer above signature-verify: `switch (event.type) { case "checkout.session.completed": ... }`. The bug it stops: AI silently typos a case literal (`"checkout.session.complete"` vs `"checkout.session.completed"`), merges fallthrough arms dropping one, or wholesale deletes a case. Signature still verifies — Stripe still 200s — paying customers never get provisioned.
+
+Precision-gated:
+- File must use the Stripe SDK (direct `stripe.webhooks.constructEvent` call, OR `Stripe.Event` type reference, OR `from "stripe"` import paired with a wrapper-named verify call)
+- File must contain `switch (event.type)` OR `switch (<discriminant>)` where the discriminant was destructured/assigned from `event.type`
+- At least one case arm must match Stripe's `<resource>.<action>` event-name shape (`STRIPE_EVENT_NAME_RE`)
+
+Confirmed across 3 dyad-apps: quantapact `tier-webhook.ts` + `badge-webhook.ts` (each with 4 events), quantasyte `apps/api/src/controllers/billing.ts` (4 events). Quantasyte uses a wrapper-call pattern (`constructWebhookEvent` from a local stripeService); the SDK-detection gate accepts that via the `Stripe.Event` type signal.
+
+### Added — Stripe checkout/billingPortal session patterns
+
+Two missing entries added to `WRITE_SHAPE_PATTERNS`: `stripe.checkout.sessions.create` (the SaaS hosted-checkout endpoint that 80% of SaaS apps use) and `stripe.billingPortal.sessions.create` (the subscription-management surface). The existing Stripe coverage was paymentIntents / charges / subscriptions / customers — common, but not the surface real SaaS apps actually use. Zero-FP shape: confirmed on quantasyte stripeService.ts (lines 77 + 110) and quantapact badge-portal.ts (line 109).
+
+### Added — Vercel pages-style `api/X.ts` route derivation
+
+`deriveRouteFromPath()` now handles top-level `api/X.ts` files (Vercel pages-style serverless functions) and `apps/<workspace>/api/X.ts` (monorepo workspace roots). Previously returned `null` for both — silently skipping write-endpoint detection on production code. Confirmed: quantapact's `api/badge-portal.ts` + 11 `api/cron/*.ts` files now route-derivable. Tightly constrained (regex anchored to repo-root / workspace-root) so `lib/api/X.ts` does NOT match.
+
+### Fixed — npm-published README was stale
+
+`apps/cli/README.md` (what npm publishes when `pnpm pack` runs in that workspace) was frozen circa "9 templates across 3 domains" — missing every feature since 0.2.0. Synced to root README content. Added a `prepublishOnly` script (`cp ../../README.md ./README.md`) so future releases keep the two in lockstep.
+
+### Updated — landing site
+
+`apps/landing` quick-start step 2 now shows `pinned sweep` instead of `pinned guard` (the canonical first-run command). New protection card added: *App-Router mutations — Next.js Server Actions, DB writes, file uploads, paid-API calls; auth gate + input schema captured per action.*
+
+### Tested
+
+Three-test matrix + dyad FP sweep per [[fp-check-everything-with-real-tests]], all run end-to-end through real vitest (no synthetic substitutes):
+- **Server Action precondition WARN**: 4 positive WARN cases (ok:true / Not authorized / Backend not configured / 503) + 3 negative real-failure cases (DB write fail / thrown / wrong-shape). 7/7 ✓
+- **Stripe event-type dispatch**: positive (all events handled → green) + negative (one-letter typo / commented case → red). 3/3 ✓
+- **Paid-API call**: positive (correct model + max_tokens → green) + 3 negatives (model swap / max_tokens removed / call deleted → red). 4/4 ✓
+- **Edge Function write**: positive (auth + write present → green) + 2 negatives (write removed / auth removed → red). 3/3 ✓
+- **Cron handler**: positive (intact → green) + 2 negatives (schedule drift / handler renamed → red). 3/3 ✓
+- **Stripe checkout/portal patterns**: 3/3 ✓ (checkout detected + portal detected + retrieve skipped)
+- **Full vitest suite**: 327/327 ✓; typecheck clean.
+- **FP sweep across 10 dyad-apps**: stripeEvent=2, paidApi=2, edgeFn=46, cron=13. All 63 hits manually verified real (every Vercel cron + every GH Actions schedule + every Stripe webhook + every Edge Function write + sAles-repI + socialideagen aiFill + quantapact badge-portal). **0 spurious hits.**
+
 ## [0.2.18] — 2026-06-03
 
 Two trust-critical fixes shipped together: (1) the retired-pin catch trust bug — phantom catches from retired pins were permanently inflating the "regressions caught" metric with no clean way to remove them. (2) The App-Router mutation blind spot — Server Actions (the modern Next.js mutation pattern) were entirely invisible to `pinned sweep` because write detection only covered HTTP `/api/*` route handlers. Both are P0 per [[strategic-moat-independent-guardrail]] (the trust metric must be trustworthy; the independent guardrail must actually see the high-stakes write surfaces).

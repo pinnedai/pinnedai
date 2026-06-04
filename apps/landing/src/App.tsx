@@ -151,19 +151,23 @@ export function App() {
             </div>
             <div className="quick-step">
               <div className="quick-step-num">2</div>
-              <h3>Let Pinned protect future AI edits</h3>
-              <pre className="quick-step-cmd">{`npx pinnedai guard
+              <h3>Sweep your app for write surfaces</h3>
+              <pre className="quick-step-cmd">{`npx pinnedai sweep
 npx pinnedai audit --learned`}</pre>
               <p>
-                Pinned checks guards, audits similar code paths, and blocks
-                edits that delete, skip, or weaken protected tests.
+                One command finds host-conditional route families, multi-step
+                journeys, Server Action mutations (DB writes, file uploads,
+                paid-API calls), and unprotected write endpoints — then writes
+                guards for each.
               </p>
             </div>
           </div>
           <p className="quick-start-foot">
             <em>PR-claim mode is also available</em> — claims like “/api/users is
             rate-limited” in a PR description become permanent tests
-            automatically.
+            automatically. <em>Browser interaction pins</em> (BETA, opt-in via{" "}
+            <code>pinned add-browser</code>) cover carousel/onClick regressions
+            via Playwright.
           </p>
         </div>
       </section>
@@ -226,7 +230,7 @@ npx pinnedai audit --learned`}</pre>
         <div className="container">
           <h2>What Pinned protects</h2>
           <p className="section-lede">
-            Five categories of AI-prone failure patterns. Pinned detects them
+            Six categories of AI-prone failure patterns. Pinned detects them
             on install, on every PR, and inside the pre-commit hook.
           </p>
           <div className="protects-grid">
@@ -279,6 +283,16 @@ npx pinnedai audit --learned`}</pre>
                 <li>No debug routes left exposed</li>
               </ul>
               <p className="protect-why">If AI exposes server secrets in the client bundle, your keys leak.</p>
+            </div>
+            <div className="protect-card">
+              <div className="protect-icon" aria-hidden>⚡</div>
+              <h3>App-Router mutations</h3>
+              <ul>
+                <li>Next.js Server Actions (<code>"use server"</code>) — DB writes, file uploads, paid-API calls</li>
+                <li>Auth gate + input schema captured per action</li>
+                <li>Direct-invoke verifier with recorded fixture</li>
+              </ul>
+              <p className="protect-why">If AI drops the auth gate on <code>saveIdea</code> / <code>uploadMockup</code> / <code>aiFill</code>, you get data abuse, public file uploads, or a $1k Anthropic bill.</p>
             </div>
           </div>
         </div>

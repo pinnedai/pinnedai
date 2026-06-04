@@ -284,6 +284,31 @@ function preflight(claim: Claim, cwd: string): string | null {
       }
       return null;
     }
+    case "stripe-event-handled": {
+      // Webhook handler file must exist; otherwise the pin reads
+      // nothing and would fail with a confusing ENOENT.
+      const full = join(cwd, claim.filePath);
+      if (!existsSync(full)) {
+        return `webhook handler ${claim.filePath} doesn't exist — pin is saved, will verify once it lands`;
+      }
+      return null;
+    }
+    case "paid-api-call":
+    case "edge-function-write": {
+      // Source file must exist on disk for the read-and-assert pin.
+      const full = join(cwd, claim.filePath);
+      if (!existsSync(full)) {
+        return `source file ${claim.filePath} doesn't exist — pin is saved, will verify once it lands`;
+      }
+      return null;
+    }
+    case "cron-handler": {
+      const full = join(cwd, claim.declarationFile);
+      if (!existsSync(full)) {
+        return `cron declaration ${claim.declarationFile} doesn't exist — pin is saved, will verify once it lands`;
+      }
+      return null;
+    }
   }
 }
 

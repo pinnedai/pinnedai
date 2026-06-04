@@ -304,6 +304,17 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       // touches the pin. No HTTP route exists (Server Actions compile
       // to opaque RPC endpoints).
       return { files: [claim.actionModule] };
+    case "stripe-event-handled":
+      // The webhook handler file is the artifact under test.
+      return { files: [claim.filePath] };
+    case "paid-api-call":
+      return { files: [claim.filePath] };
+    case "edge-function-write":
+      return { files: [claim.filePath] };
+    case "cron-handler":
+      return claim.handlerFile
+        ? { files: [claim.declarationFile, claim.handlerFile] }
+        : { files: [claim.declarationFile] };
   }
 }
 
@@ -474,6 +485,14 @@ function claimLabel(c: Claim): string {
       return `\`🛟 BETA · ${escapeMarkdownCell(c.action)} ${escapeMarkdownCell(c.selector)} @ ${escapeMarkdownCell(c.page)}\``;
     case "server-action-write":
       return `\`server-action ${escapeMarkdownCell(c.actionModule)}:${escapeMarkdownCell(c.exportName)}\` (${c.writeKind} ${escapeMarkdownCell(c.writeTarget)})`;
+    case "stripe-event-handled":
+      return `\`stripe-events ${escapeMarkdownCell(c.filePath)}\` (${c.events.length} event type${c.events.length === 1 ? "" : "s"})`;
+    case "paid-api-call":
+      return `\`paid-api ${escapeMarkdownCell(c.callExpr)}\` (${escapeMarkdownCell(c.filePath)}${c.modelString ? `, model=${escapeMarkdownCell(c.modelString)}` : ""})`;
+    case "edge-function-write":
+      return `\`edge-fn ${escapeMarkdownCell(c.functionName)}\` (${c.writeKind} ${escapeMarkdownCell(c.writeTarget)})`;
+    case "cron-handler":
+      return `\`cron ${escapeMarkdownCell(c.identifier)}\` (${c.source} · ${escapeMarkdownCell(c.schedule)})`;
   }
 }
 

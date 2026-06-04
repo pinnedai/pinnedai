@@ -165,6 +165,38 @@ npx pinned regenerate --all          # re-emit all pin .test.ts files using the 
 npx pinned retire <claim-id> --reason="..."   # legitimate retirement (writes audit entry)
 ```
 
+### Paid-API call pins (silent model swap / token-cap defense)
+
+Pin every paid API call in your backend — not just the ones in Next.js Server Actions. Captures the call expression + model literal + `max_tokens` cap so AI silently swapping `claude-opus` → `claude-haiku` (quality regression) or removing the token cap (unbounded spend) is caught immediately.
+
+```bash
+npx pinned sweep          # auto-detects paid-API calls (Anthropic / OpenAI / Gemini / Stripe)
+```
+
+Coverage: Anthropic (`messages.create` / `parse` / `stream`), OpenAI (`chat.completions.create`, `responses.create`, `images.generate`, `embeddings.create`), Google Gemini (`generateContent`), Stripe (`paymentIntents.create`, `charges.create`, `subscriptions.create`, `customers.create`, `checkout.sessions.create`, `billingPortal.sessions.create`). Entry-point-agnostic — fires anywhere, plain backend service or Server Action.
+
+### Supabase Edge Function pins (Deno runtime)
+
+HTTP-route detection structurally misses Supabase Edge Functions (they run in Deno, not Node). Pin asserts the function file exists, the write expression survives, and the auth gate is preserved.
+
+```bash
+npx pinned sweep          # detects supabase/functions/<name>/index.ts
+```
+
+Catches: AI deletes the function ("dead code cleanup"), removes the write call, weakens the auth gate.
+
+### Cron handler pins (Vercel + GitHub Actions)
+
+Cron fires WITHOUT a user in the loop — schedule drift (`0 4 * * *` → `0 4 * * 0` runs once a week instead of daily) or handler rename = silent SLA break. Pin captures Vercel `vercel.json:crons[]` entries and GH Actions `on.schedule[].cron` schedules.
+
+```bash
+npx pinned sweep          # detects vercel.json + .github/workflows/*.yml
+```
+
+### Stripe webhook event-type dispatch pins
+
+The layer above signature-verify. Catches AI silently typoing `case "checkout.session.complete":` (one-letter rename), merging fallthrough arms dropping one, or wholesale deleting a case. The signature still verifies — Stripe still returns 200 — paying customers never get provisioned.
+
 ### Server-Action pins (Next.js App-Router mutations)
 
 Pin the App-Router mutation pattern that `/api/*` HTTP-route detectors can't see — auth-gated `"use server"` functions that perform DB writes, file uploads, or paid-API calls. Closes the highest-impact coverage gap reported via real-world dogfood.

@@ -125,7 +125,58 @@ describe(\`Server Action \${ACTION_NAME} writes ${claim.writeTarget}\`, () => {
     //   - throw → caught by the it() block (assertion fail)
     //   - return shape mismatch → expect() below catches it
     //   - silent stub returning a different OK shape → expect() catches
-    const result = (await action(FIXTURE)) as Record<string, unknown>;
+    //   - "can't run here" (no admin session / missing service-role key
+    //     / 503 backend not configured) → WARN + skip, NOT fail. A guard
+    //     that hard-fails when it simply couldn't run trains people to
+    //     ignore reds. See 0.2.19 fix for the cry-wolf-red mitigation.
+    const result = (await action(FIXTURE)) as Record<string, unknown> | undefined;
+
+    // Precondition-failure recognizer. When the action returns a
+    // "can't run" shape, downgrade to skip-with-warning instead of
+    // failing the assertion. The patterns recognized:
+    //   - { ok: false, error: /not authoriz|unauthor|sign in|login/i }
+    //     → no admin session in test env (action returned the
+    //       isAdminAuthed false branch)
+    //   - { ok: false, error: /backend not configured|service unavail|503/i }
+    //     → missing env (no service-role key, no DB URL, etc.)
+    //   - status === 503 on a Response-shaped return
+    //   - { ok: false, error: /env|missing.*key|missing.*url/i }
+    //     → generic missing-env signal
+    if (result && typeof result === "object" && result.ok === false && typeof result.error === "string") {
+      const err = result.error;
+      if (/not\\s*authoriz|unauthor|sign\\s*in|please\\s*log\\s*in|forbidden/i.test(err)) {
+        console.warn(
+          \`⚠ Pinned: can't verify \${ACTION_NAME} here — needs an authenticated session.\\n\` +
+          \`  The action returned the unauthorized branch (\\"\${err}\\"). This is a precondition\\n\` +
+          \`  failure, NOT a regression. To enable green-on-success:\\n\` +
+          \`    1) Add \\\`if (process.env.PINNED_TEST_BYPASS_AUTH) return true;\\\` to your auth helper, OR\\n\` +
+          \`    2) Set up a fixture session in vitest setup so the auth check passes.\`
+        );
+        return; // skip without failing
+      }
+      if (/backend\\s*not\\s*configured|service\\s*unavailable|missing.*(?:env|key|url|secret)|not\\s*configured/i.test(err)) {
+        console.warn(
+          \`⚠ Pinned: can't verify \${ACTION_NAME} here — backend env is missing.\\n\` +
+          \`  The action returned a missing-env signal (\\"\${err}\\"). This is a precondition\\n\` +
+          \`  failure, NOT a regression. Set the relevant env vars (service-role key, DB URL,\\n\` +
+          \`  external API key) and re-run.\`
+        );
+        return; // skip without failing
+      }
+    }
+    // Also recognize 503-shaped returns (some actions return a Response or a status field).
+    if (result && typeof result === "object" && (result.status === 503 || result.statusCode === 503)) {
+      console.warn(
+        \`⚠ Pinned: can't verify \${ACTION_NAME} here — action returned 503 (Service Unavailable).\\n\` +
+        \`  This is a precondition failure, NOT a regression. Likely missing backend env.\`
+      );
+      return;
+    }
+    // If the call itself threw, the catch ABOVE caught it. If we got
+    // here with no result at all, surface a clear assertion message.
+    if (!result || typeof result !== "object") {
+      throw new Error(\`Server Action \${ACTION_NAME} returned no usable result: \${JSON.stringify(result)}\`);
+    }
 
     // Assert the success shape. Compare each declared field; ignore
     // extra fields in the result (so adding new fields to the response

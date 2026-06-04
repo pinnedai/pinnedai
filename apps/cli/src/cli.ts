@@ -3298,6 +3298,14 @@ function summarizeClaimForBanner(claim: Claim): string {
       const authNote = claim.authGate ? ` (gated by ${claim.authGate}())` : "";
       return `Server Action \`${claim.exportName}\` ${verb}${authNote} — fixture-recorded direct-invoke pin (catches App-Router mutation regressions that HTTP-route pins structurally miss)`;
     }
+    case "stripe-event-handled":
+      return `Stripe webhook in \`${claim.filePath}\` keeps dispatching ${claim.events.length} protected event type${claim.events.length === 1 ? "" : "s"} (one-letter typo / merged fallthrough / deleted case caught — signature still verifies, paying customers go un-provisioned otherwise)`;
+    case "paid-api-call":
+      return `Paid API call \`${claim.callExpr}\` in \`${claim.filePath}\`${claim.modelString ? ` keeps using model \`${claim.modelString}\`` : ""}${claim.hasMaxTokens ? ` (with max_tokens cap)` : ""} (entry-point-agnostic — catches silent model swap, token-cap removal, or call deletion in plain backend services / library helpers, not just Server Actions)`;
+    case "edge-function-write":
+      return `Supabase Edge Function \`${claim.functionName}\` (${claim.filePath}) keeps performing its ${claim.writeKind} to \`${claim.writeTarget}\`${claim.authGate ? ` (gated by ${claim.authGate})` : ""} (Edge Functions run in Deno — HTTP-route detection structurally misses them; this is a static source-scan pin)`;
+    case "cron-handler":
+      return `${claim.source === "vercel" ? "Vercel cron" : "GH Actions cron"} \`${claim.identifier}\` keeps running on \`${claim.schedule}\`${claim.handlerFile ? ` (handler: ${claim.handlerFile})` : ""} (catches schedule drift + handler renames — cron has no user-in-loop, silent regression class)`;
   }
 }
 
@@ -3633,6 +3641,10 @@ program
       detectHostConditionalInDiff,
       detectRetroactiveJourneys,
       detectServerActionWrites,
+      detectStripeEventDispatches,
+      detectPaidApiCalls,
+      detectEdgeFunctionWrites,
+      detectCronHandlers,
       buildImportGraph,
       findFamilyMembers,
       deriveRouteFromPath: drfp,
@@ -3642,7 +3654,7 @@ program
 
     // 3. Detectors.
     type Proposal = {
-      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write";
+      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler";
       route: string;
       method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
       filePath: string;
@@ -3749,6 +3761,94 @@ program
     // pinned record-server-action" message until the fixture is
     // captured, same posture as interaction-baseline.
     const serverActionHits = detectServerActionWrites(tree);
+
+    // 0.2.19+ Stripe webhook event-type dispatch. Catches the layer
+    // above signature-verify: `switch (event.type) { case "X": ... }`.
+    // One-letter typo / merged fallthrough / deleted case = silent
+    // SaaS provisioning break (signature still verifies). Confirmed
+    // across 3 dyad-apps; zero-FP shape thanks to precision gates.
+    const stripeEventHits = detectStripeEventDispatches(tree);
+    for (const h of stripeEventHits) {
+      proposals.push({
+        kind: "stripe-event-handled",
+        route: h.filePath,
+        filePath: h.filePath,
+        reason: h.suggestedPin,
+        claim: {
+          template: "stripe-event-handled",
+          filePath: h.filePath,
+          events: h.events,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+
+    // 0.2.19+ HEADLINE: paid-API calls anywhere. Entry-point-agnostic.
+    // Catches silent model swaps + token-cap removal + call deletion
+    // in plain backend services, library helpers, anywhere. The
+    // "AI silently swapped my model" defense.
+    const paidApiHits = detectPaidApiCalls(tree);
+    for (const h of paidApiHits) {
+      proposals.push({
+        kind: "paid-api-call",
+        route: `${h.filePath}:${h.callExpr}`,
+        filePath: h.filePath,
+        reason: h.suggestedPin,
+        claim: {
+          template: "paid-api-call",
+          filePath: h.filePath,
+          provider: h.provider,
+          callExpr: h.callExpr,
+          modelString: h.modelString,
+          hasMaxTokens: h.hasMaxTokens,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+
+    // 0.2.19+ Supabase Edge Functions. Deno runtime — HTTP-route
+    // detection structurally misses them. Static source-scan pin
+    // asserts file exists + write call + auth gate survive.
+    const edgeFnHits = detectEdgeFunctionWrites(tree);
+    for (const h of edgeFnHits) {
+      proposals.push({
+        kind: "edge-function-write",
+        route: h.filePath,
+        filePath: h.filePath,
+        reason: h.suggestedPin,
+        claim: {
+          template: "edge-function-write",
+          filePath: h.filePath,
+          functionName: h.functionName,
+          writeKind: h.writeShape.kind,
+          writeTarget: h.writeShape.target,
+          writeLibrary: h.writeShape.library,
+          authGate: h.authGate,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+
+    // 0.2.19+ Cron handlers (Vercel + GH Actions). No user-in-loop;
+    // silent schedule drift / handler rename = silent SLA break.
+    const cronHits = detectCronHandlers(tree);
+    for (const h of cronHits) {
+      proposals.push({
+        kind: "cron-handler",
+        route: h.identifier,
+        filePath: h.declarationFile,
+        reason: h.suggestedPin,
+        claim: {
+          template: "cron-handler",
+          source: h.source,
+          identifier: h.identifier,
+          schedule: h.schedule,
+          declarationFile: h.declarationFile,
+          handlerFile: h.handlerFile,
+          raw: h.suggestedPin,
+        },
+      });
+    }
     for (const h of serverActionHits) {
       proposals.push({
         kind: "server-action-write",
@@ -3802,6 +3902,8 @@ program
       out("  Run `pinned audit` for the read-only retro view.");
       return;
     }
+    // Stripe / paid-api / edge-fn / cron hits already flow through
+    // `proposals` (so they're counted once).
     const totalSurfaced = proposals.length + serverActionHits.length;
     out(`Found ${totalSurfaced} write surface${totalSurfaced === 1 ? "" : "s"} / proposed pin${totalSurfaced === 1 ? "" : "s"}:`);
     out("");
@@ -3836,6 +3938,63 @@ program
         out(`  + ${j.label}`);
         out(`    ${p.reason}`);
       }
+      out("");
+    }
+    if (paidApiHits.length > 0) {
+      out("🤖 Paid-API calls (silent model swap / token-cap removal defense):");
+      out("");
+      for (const h of paidApiHits.slice(0, 10)) {
+        const modelNote = h.modelString ? ` · model=${h.modelString}` : "";
+        const capNote = h.hasMaxTokens === true ? " · max_tokens✓" : h.hasMaxTokens === false ? " · ⚠ no max_tokens (unbounded spend risk)" : "";
+        out(`  + ${h.callExpr}()  @  ${h.filePath}${modelNote}${capNote}`);
+      }
+      if (paidApiHits.length > 10) out(`  + …and ${paidApiHits.length - 10} more`);
+      out("  Pin captures the call expression + model literal + token cap. Catches AI silently");
+      out("  swapping the model (claude-opus → claude-haiku, quality regression) or removing");
+      out("  max_tokens (unbounded spend). Entry-point-agnostic — fires anywhere, not just");
+      out("  Next.js Server Actions.");
+      out("");
+    }
+    if (edgeFnHits.length > 0) {
+      out("🔧 Supabase Edge Function write surfaces (Deno runtime, HTTP-route detection misses):");
+      out("");
+      for (const h of edgeFnHits.slice(0, 10)) {
+        const verb =
+          h.writeShape.kind === "email" ? "sends email" :
+          h.writeShape.kind === "queue" ? "enqueues job" :
+          h.writeShape.kind === "file-upload" ? `uploads to ${h.writeShape.target}` :
+          h.writeShape.kind === "http-post" ? `calls ${h.writeShape.library}` :
+          `${h.writeShape.kind === "db-insert" ? "inserts" : h.writeShape.kind === "db-update" ? "updates" : h.writeShape.kind === "db-upsert" ? "upserts" : "deletes"} ${h.writeShape.target}`;
+        const auth = h.authGate ? ` · gated by ${h.authGate}()` : " · NO AUTH GATE";
+        out(`  + ${h.functionName}  →  ${verb}${auth}`);
+      }
+      if (edgeFnHits.length > 10) out(`  + …and ${edgeFnHits.length - 10} more`);
+      out("");
+    }
+    if (cronHits.length > 0) {
+      out("⏰ Cron handlers (no user-in-loop — schedule drift = silent SLA break):");
+      out("");
+      for (const h of cronHits.slice(0, 10)) {
+        out(`  + [${h.source}] ${h.identifier}  →  ${h.schedule}${h.handlerFile ? ` · ${h.handlerFile}` : ""}`);
+      }
+      if (cronHits.length > 10) out(`  + …and ${cronHits.length - 10} more`);
+      out("");
+    }
+    if (stripeEventHits.length > 0) {
+      out("💳 Stripe webhook event-type dispatch (money path):");
+      out("");
+      for (const h of stripeEventHits.slice(0, 5)) {
+        out(`  ${h.filePath}  →  ${h.events.length} protected event${h.events.length === 1 ? "" : "s"}:`);
+        for (const e of h.events.slice(0, 6)) {
+          out(`    + "${e}"`);
+        }
+        if (h.events.length > 6) out(`    + …and ${h.events.length - 6} more`);
+        out("");
+      }
+      if (stripeEventHits.length > 5) out(`  ... and ${stripeEventHits.length - 5} more webhook handler${stripeEventHits.length - 5 === 1 ? "" : "s"}`);
+      out("  Pin asserts each case-literal still appears. Catches AI silently typoing");
+      out("  \"checkout.session.complete\" / merging fallthrough / deleting a case (signature");
+      out("  still verifies — paying customers go un-provisioned otherwise).");
       out("");
     }
     if (serverActionHits.length > 0) {
@@ -10801,6 +10960,14 @@ function describeClaim(c: Claim): string {
       return `interaction🛟 BETA  ${c.action} ${c.selector} @ ${c.page}  →  ${c.observe.kind}`;
     case "server-action-write":
       return `server-action  ${c.actionModule}:${c.exportName}  →  ${c.writeKind} ${c.writeTarget} (${c.writeLibrary})${c.authGate ? ` · gated by ${c.authGate}` : ""}`;
+    case "stripe-event-handled":
+      return `stripe-events  ${c.filePath}  →  ${c.events.length} event type${c.events.length === 1 ? "" : "s"} (${c.events.slice(0, 3).join(", ")}${c.events.length > 3 ? `, +${c.events.length - 3}` : ""})`;
+    case "paid-api-call":
+      return `paid-api       ${c.callExpr}  @  ${c.filePath}${c.modelString ? ` · model=${c.modelString}` : ""}${c.hasMaxTokens ? " · max_tokens✓" : ""}`;
+    case "edge-function-write":
+      return `edge-fn        ${c.functionName}  →  ${c.writeKind} ${c.writeTarget}${c.authGate ? ` · gated by ${c.authGate}` : ""}`;
+    case "cron-handler":
+      return `cron           ${c.identifier}  →  ${c.schedule} (${c.source})${c.handlerFile ? ` · ${c.handlerFile}` : ""}`;
   }
 }
 

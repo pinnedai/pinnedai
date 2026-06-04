@@ -91,6 +91,10 @@ import { generateHappyPathWithSideEffectTest } from "./templates/happyPathWithSi
 import { generateJourneyTest } from "./templates/journey.js";
 import { generateInteractionBaselineTest } from "./templates/interactionBaseline.js";
 import { generateServerActionWriteTest } from "./templates/serverActionWrite.js";
+import { generateStripeEventHandledTest } from "./templates/stripeEventHandled.js";
+import { generatePaidApiCallTest } from "./templates/paidApiCall.js";
+import { generateEdgeFunctionWriteTest } from "./templates/edgeFunctionWrite.js";
+import { generateCronHandlerTest } from "./templates/cronHandler.js";
 
 // Convenience dispatcher — given any Claim, pick the right generator.
 // Keeps callers (CLI, landing demo, hosted Worker) DRY.
@@ -195,6 +199,14 @@ function dispatchToTemplate(claim: Claim, opts: GenerateOpts): GeneratedTest {
       return generateInteractionBaselineTest(claim, opts);
     case "server-action-write":
       return generateServerActionWriteTest(claim, opts);
+    case "stripe-event-handled":
+      return generateStripeEventHandledTest(claim, opts);
+    case "paid-api-call":
+      return generatePaidApiCallTest(claim, opts);
+    case "edge-function-write":
+      return generateEdgeFunctionWriteTest(claim, opts);
+    case "cron-handler":
+      return generateCronHandlerTest(claim, opts);
   }
   // Exhaustiveness guard — if a new Claim variant is added without a
   // case here, TS will fail to compile this assignment with a clear
