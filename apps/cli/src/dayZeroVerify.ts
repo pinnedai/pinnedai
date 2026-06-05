@@ -314,6 +314,14 @@ function preflight(claim: Claim, cwd: string): string | null {
       // interaction-baseline. Template handles missing-Playwright +
       // missing-PREVIEW_URL via skipIf at test time.
       return null;
+    case "enum-drift": {
+      // Consumer file must exist on disk for the cross-file scan.
+      const full = join(cwd, claim.consumerFile);
+      if (!existsSync(full)) {
+        return `consumer file ${claim.consumerFile} doesn't exist — pin is saved, will verify once it lands`;
+      }
+      return null;
+    }
   }
 }
 

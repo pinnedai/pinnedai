@@ -96,6 +96,7 @@ import { generatePaidApiCallTest } from "./templates/paidApiCall.js";
 import { generateEdgeFunctionWriteTest } from "./templates/edgeFunctionWrite.js";
 import { generateCronHandlerTest } from "./templates/cronHandler.js";
 import { generatePageAccessibilityTest } from "./templates/pageAccessibility.js";
+import { generateEnumDriftTest } from "./templates/enumDrift.js";
 
 // Convenience dispatcher — given any Claim, pick the right generator.
 // Keeps callers (CLI, landing demo, hosted Worker) DRY.
@@ -210,6 +211,8 @@ function dispatchToTemplate(claim: Claim, opts: GenerateOpts): GeneratedTest {
       return generateCronHandlerTest(claim, opts);
     case "page-accessibility":
       return generatePageAccessibilityTest(claim, opts);
+    case "enum-drift":
+      return generateEnumDriftTest(claim, opts);
   }
   // Exhaustiveness guard — if a new Claim variant is added without a
   // case here, TS will fail to compile this assignment with a clear

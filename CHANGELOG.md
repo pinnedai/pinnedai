@@ -2,6 +2,57 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.22] — 2026-06-05
+
+First **first-time-bug** detector. Pinned's other detectors assume a green baseline to regress from — this one catches bugs where consumer + producer never agreed in the first place. Closes the socialideagen-dogfood gap (client polled `status === "done"` but the producer never emits that value).
+
+### Added — `enum-drift` detector + pin template
+
+`detectEnumDrift` performs a cross-file static scan: collects every producer-side write to a string-typed object-literal field (`update({ col: "X" })`, `insert({ col: "X" })`, `return { col: "X" }`, etc.), collects every consumer-side string comparison (`x.col === "Y"`, `x.col !== "Y"`, `switch (x.col) { case "Y": }`, `.includes("Y")`, destructured `const { col } = x; ...col === "Y"`). For each (consumer file, column), flags values the consumer reads that the in-repo producer never emits.
+
+**Two confidence tiers** (precision-gated):
+- **confirmed**: ≥1 expected value overlaps with the producer set (shared vocabulary, real drift on a specific value). Auto-pinned by `pinned sweep`.
+- **review**: zero overlap — usually a cross-table column-name collision, occasionally the user's cross-repo external-producer shape. Surfaced in sweep output but NOT auto-pinned. Opt in via `--include-beta` to pin them too.
+
+**FP gates** (load-bearing — keep tight per dyad-app FP sweep):
+- Producer column set size capped at 12 (filters out id-like columns that slipped past the generic-name filter)
+- 100% missing + tiny producer set (<3 values) → drop (signal too weak)
+- Generic field names skipped (id / name / type / value / etc.)
+- Generic value tokens skipped (true / false / null / get / post / etc.)
+- Test files / scripts / migrations skipped from both sides
+- Only flag columns where the producer also writes (no external-producer false positives — if there's no in-repo producer for the column, no signal)
+
+**Pin template**: emits a vitest file that re-scans the codebase at test time, asserts each `observedValue` (the producer-side emit set at pin-creation) still appears as a producer write somewhere. When AI silently removes a producer write for a value the consumer reads, the pin fails specifically on that value.
+
+### Dyad-app dogfood results
+
+10-repo sweep produced **38 confirmed + 6 review** hits. Confirmed catches include real drift patterns:
+- back-in-play: `confidence === "Medium"` reads but only `"High"` produced; `modelType === "injury"` / `"team"` reads but only `"player"` produced
+- researchAi: `study_type === "meta_analysis"` / `"scoping_review"` reads but only `"systematic_review"` produced
+- MediniDyad: `visit_mode === "virtual"` reads but only `"in_person"` produced
+- quantapact: `direction === "better"` reads but only `"worse"` produced
+
+socialideagen's cross-table column collision (`status` shared between `ideas` and `jobs` tables, different value sets) correctly demoted to review tier.
+
+### How it catches bugs in real time
+
+Same continuous-verification path as every other Pinned pin:
+1. **`pinned sweep`** — surfaces drift on demand. Confirmed-tier hits auto-pin.
+2. **Pre-commit + pre-push hooks** — run `pinned test` (which includes the new enum-drift pins) before code leaves your machine.
+3. **CI workflow** — runs on every PR.
+4. **Claude Code PostToolUse hook** — verifies affected pins after every agent edit. Dedicated "scan just-edited file for new drift" mode shipping in 0.2.23.
+
+### Honest scope
+
+`enum-drift` catches the **in-repo** variant of the user-reported bug class. The specific socialideagen bug (producer is a daemon in a separate repo) lands in the review tier OR isn't caught at all (when the in-repo producer never writes to that column). The cross-repo variant needs a declared contract artifact both sides reference — deferred to a follow-on release.
+
+### Tested
+
+- **Detector matrix**: positive (socialideagen-shape bug caught) + negative (matching consumer/producer green) + negative (external producer skipped — no in-repo writes, no signal) + negative (generic field names like `name` skipped). 4/4 ✓
+- **Template matrix via real vitest**: positive (all producer values intact → 3 sub-tests pass) + negative (AI removes producer write for `completed` → red specifically on that value) + edge case (constant-folded producer values caught as drift, known limitation). 3/3 ✓
+- **Dyad FP sweep**: 10 repos, 38 confirmed + 6 review. socialideagen cross-table case correctly demoted to review. No high-volume FP repos.
+- **Regression**: 327/327 vitest, typecheck clean.
+
 ## [0.2.21] — 2026-06-04
 
 Both gaps from the socialideagen admin-build dogfood closed. Moves page-renders from *"didn't crash"* → *"works + is usable,"* and Server Action pins from *"detected"* → *"verified."* Every contrast bug and every admin write went unguarded in that build; this release pins both classes.

@@ -3556,6 +3556,297 @@ export function detectCronHandlers(
 }
 
 // ────────────────────────────────────────────────────────────
+// Enum-drift detector (0.2.22+) — FIRST-TIME bug catching
+// ────────────────────────────────────────────────────────────
+//
+// Pinned's whole model is regression-detection — assumes a green
+// baseline to regress from. The user dogfood that triggered this
+// detector: socialideagen client polled `status === "done"` but
+// the producer (separate-repo daemon) wrote `status === "completed"`.
+// First-time integration bug. No prior baseline to regress from.
+// All other Pinned detectors ran clean. The bug shipped.
+//
+// This detector catches the IN-REPO variant of that class: when a
+// consumer reads `x === "literal"` (or `switch (x) { case "literal" }`)
+// for a discriminant value that the producer NEVER emits anywhere
+// in the same codebase. Precision-gated — won't fire on external-
+// producer reads (no in-repo producer writes → no signal).
+//
+// Cross-repo variant (the specific socialideagen bug) needs a
+// declared contract artifact both sides reference; deferred to a
+// follow-on release.
+//
+// Precision gates (load-bearing — keep tight):
+//   1. Only flag values where AT LEAST ONE in-repo producer write
+//      exists for the same column. No producer in repo = external
+//      producer = no signal (don't FP on every API client).
+//   2. Column-name matching is by literal field name only. If
+//      consumer reads `job.status` and producer writes
+//      `update({ status: "X" })`, group as same column. We don't
+//      do type-flow analysis.
+//   3. Bare-variable consumer reads (`status === "X"` without an
+//      object prefix) are accepted ONLY when the same file has
+//      a destructuring assignment matching the column name
+//      (`const { status } = job`) — otherwise we can't safely
+//      infer the column.
+//   4. Skip test files + scripts + migrations.
+
+export type EnumDriftHit = {
+  template: "enum-drift";
+  // The consumer file that reads a value the producer doesn't emit.
+  consumerFile: string;
+  // The column / discriminant being compared.
+  column: string;
+  // The set of values the consumer compares against.
+  expectedValues: string[];
+  // The full set of values the producer emits anywhere in repo.
+  observedValues: string[];
+  // The values the consumer reads but the producer never emits — the
+  // drift. These are the bug candidates.
+  missingFromProducer: string[];
+  // Sample of producer write sites (file:line excerpts) so the user
+  // can verify the detector found the right producer. First 3.
+  producerSamples: Array<{ filePath: string; column: string; value: string }>;
+  // Confidence tier:
+  //   * "confirmed" — consumer + producer share ≥1 vocabulary value
+  //                   (same domain, real drift on a specific value).
+  //                   Low FP risk.
+  //   * "review"    — zero overlap. Column name shared but values
+  //                   completely disjoint — usually a cross-table
+  //                   column-name collision, OCCASIONALLY the user's
+  //                   exact cross-repo bug shape (in-repo producer
+  //                   doesn't write to the column at all but consumer
+  //                   compares values from an external producer). The
+  //                   socialideagen `status === "done"` shape lives
+  //                   here. Pinned doesn't auto-pin "review" hits —
+  //                   user confirms before they ship.
+  confidence: "confirmed" | "review";
+  suggestedPin: string;
+};
+
+// Patterns:
+//   * Producer write — object-literal field with a STRING value:
+//     `update({ status: "X" })`, `insert({ status: "X" })`,
+//     `upsert({ status: "X" })`, `data: { status: "X" }`,
+//     `return { ..., status: "X", ... }` (any object literal).
+//   * Consumer read — comparison or switch-case:
+//     `x.col === "Y"`, `x.col !== "Y"`,
+//     `switch (x.col) { case "Y": }`,
+//     destructured + bare: `const { col } = x; ... col === "Y"`,
+//     `[col, ...].includes("Y")` (one variant).
+//
+// We collect both sides per column name, then for each consumer-read
+// (column, value), check if (column, value) is in the producer write
+// set. If not, AND there's at least one producer write to (column, *),
+// emit a drift hit.
+
+// Extract producer writes from content. Returns array of
+// (column, value) tuples + the line excerpt for sample collection.
+function extractProducerWrites(content: string): Array<{ column: string; value: string; sample: string }> {
+  const out: Array<{ column: string; value: string; sample: string }> = [];
+  // Strip comments first so a // commented update() doesn't fire.
+  const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  // Find object literals: `{ ..., <col>: "<value>", ... }`. Match a
+  // field-name + string-literal pair where the value is a simple
+  // ASCII identifier-shaped or kebab-shaped string (lowercase a-z,
+  // 0-9, _, -). This filters out user-facing messages / long strings.
+  const fieldRe = /(?:^|[\s,{(])([a-zA-Z_$][\w$]*)\s*:\s*['"]([a-zA-Z][\w-]*)['"]/g;
+  let m: RegExpExecArray | null;
+  while ((m = fieldRe.exec(stripped)) !== null) {
+    const column = m[1];
+    const value = m[2];
+    // Skip generic identifier names that are nearly always non-enum
+    // (id / key / name / etc would FP).
+    if (GENERIC_FIELD_NAMES.has(column.toLowerCase())) continue;
+    // Skip generic values that are almost certainly not enums.
+    if (GENERIC_VALUE_TOKENS.has(value.toLowerCase())) continue;
+    // Extract the line excerpt for the sample.
+    const lineStart = stripped.lastIndexOf("\n", m.index) + 1;
+    const lineEnd = stripped.indexOf("\n", m.index);
+    const sample = stripped.slice(lineStart, lineEnd === -1 ? stripped.length : lineEnd).trim().slice(0, 120);
+    out.push({ column, value, sample });
+  }
+  return out;
+}
+
+// Consumer reads — values being compared.
+function extractConsumerReads(
+  content: string
+): Array<{ column: string; value: string; line: number }> {
+  const out: Array<{ column: string; value: string; line: number }> = [];
+  const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  // 1. Property-access comparison: `x.col === "Y"` or `x.col !== "Y"`.
+  const propEqRe = /\b\w+(?:\??\.\w+)*\.([a-zA-Z_$][\w$]*)\s*[!=]==?\s*['"]([a-zA-Z][\w-]*)['"]/g;
+  // 2. Reverse: `"Y" === x.col`.
+  const propEqReversedRe = /['"]([a-zA-Z][\w-]*)['"]\s*[!=]==?\s*\b\w+(?:\??\.\w+)*\.([a-zA-Z_$][\w$]*)\b/g;
+  // 3. switch (x.col) { case "Y": ... }
+  const switchPropRe = /\bswitch\s*\(\s*\w+(?:\??\.\w+)*\.([a-zA-Z_$][\w$]*)\s*\)\s*\{([\s\S]*?)\n\s*\}/g;
+  // 4. .includes("Y") on a member-access chain.
+  const includesRe = /\b\w+(?:\??\.\w+)*\.([a-zA-Z_$][\w$]*)\s*\.\s*(?:includes|startsWith|endsWith)\s*\(\s*['"]([a-zA-Z][\w-]*)['"]/g;
+  // 5. Bare-variable comparison: `status === "Y"`. Only accepted when
+  //    the file has a destructure-from-object earlier: `const { status } = x;`
+  //    Captures column name from destructure.
+  const destructured = new Set<string>();
+  const destructureRe = /\bconst\s*\{\s*([^}]+)\s*\}\s*=\s*(?!require)\w/g;
+  let dm: RegExpExecArray | null;
+  while ((dm = destructureRe.exec(stripped)) !== null) {
+    for (const name of dm[1].split(",").map((s) => s.trim().split(":")[0].trim())) {
+      if (/^[a-zA-Z_$][\w$]*$/.test(name) && !GENERIC_FIELD_NAMES.has(name.toLowerCase())) {
+        destructured.add(name);
+      }
+    }
+  }
+  // Now scan bare-variable comparisons but only for destructured names.
+  const bareEqRe = /\b([a-zA-Z_$][\w$]*)\s*[!=]==?\s*['"]([a-zA-Z][\w-]*)['"]/g;
+  const seen = new Set<string>();
+  function addRead(column: string, value: string, idx: number) {
+    if (GENERIC_FIELD_NAMES.has(column.toLowerCase())) return;
+    if (GENERIC_VALUE_TOKENS.has(value.toLowerCase())) return;
+    const key = `${column}::${value}::${idx}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const line = (stripped.slice(0, idx).match(/\n/g) || []).length + 1;
+    out.push({ column, value, line });
+  }
+
+  let m: RegExpExecArray | null;
+  while ((m = propEqRe.exec(stripped)) !== null) addRead(m[1], m[2], m.index);
+  while ((m = propEqReversedRe.exec(stripped)) !== null) addRead(m[2], m[1], m.index);
+  while ((m = includesRe.exec(stripped)) !== null) addRead(m[1], m[2], m.index);
+  while ((m = switchPropRe.exec(stripped)) !== null) {
+    const column = m[1];
+    const body = m[2];
+    const caseRe = /\bcase\s+['"]([a-zA-Z][\w-]*)['"]/g;
+    let cm: RegExpExecArray | null;
+    while ((cm = caseRe.exec(body)) !== null) addRead(column, cm[1], m.index + body.indexOf(cm[0]));
+  }
+  while ((m = bareEqRe.exec(stripped)) !== null) {
+    if (destructured.has(m[1])) addRead(m[1], m[2], m.index);
+  }
+  return out;
+}
+
+// Field names that are NEVER worth treating as enum columns. These
+// almost always carry IDs / display strings / opaque user content.
+const GENERIC_FIELD_NAMES = new Set([
+  "id", "uuid", "key", "name", "title", "description", "email",
+  "url", "href", "src", "path", "to", "from", "by", "for", "of",
+  "as", "at", "on", "in", "is", "or", "if", "do", "no",
+  "value", "data", "result", "response", "request", "input", "output",
+  "message", "content", "text", "body", "html", "subject", "label",
+  "username", "password", "phone", "address", "city", "country", "zip",
+  "image", "avatar", "icon", "logo", "thumbnail", "color", "size",
+  "user", "userId", "user_id", "customer", "customerId", "account",
+  "amount", "price", "total", "count", "quantity", "rate", "limit",
+  "version", "build", "hash", "sha", "ref", "commit", "branch",
+  // Lowercase TypeScript / JS keywords + common destructured names
+  // that aren't enum-y.
+  "type", // too generic — we have a Stripe-event detector for `event.type`
+  "kind", // overloaded
+  "code", // HTTP code / lang code / error code — different domains
+  "role", // already covered by permission-required
+]);
+
+// String tokens that are too generic to be enum drift candidates.
+const GENERIC_VALUE_TOKENS = new Set([
+  "true", "false", "null", "undefined", "0", "1", "yes", "no",
+  "string", "number", "object", "boolean", "function",
+  "get", "post", "put", "patch", "delete", "options", "head",
+  // Module / loader keywords
+  "module", "default", "exports", "require",
+]);
+
+export function detectEnumDrift(filesByPath: Map<string, string>): EnumDriftHit[] {
+  // Pass 1: producer writes — per (column, value), record which files write it.
+  const producerWrites = new Map<string, Map<string, Array<{ filePath: string; sample: string }>>>();
+  // producerColumns: just the set of columns that have ANY in-repo writer
+  // (precision gate — no in-repo writer = external producer, skip).
+  const producerColumns = new Set<string>();
+
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    if (/(?:^|\/)(?:scripts|migrations|seeds|seed|fixtures)\//.test(filePath)) continue;
+    const writes = extractProducerWrites(content);
+    for (const { column, value, sample } of writes) {
+      producerColumns.add(column);
+      if (!producerWrites.has(column)) producerWrites.set(column, new Map());
+      const valMap = producerWrites.get(column)!;
+      if (!valMap.has(value)) valMap.set(value, []);
+      valMap.get(value)!.push({ filePath, sample });
+    }
+  }
+
+  // Pass 2: consumer reads. For each (consumer-file, column), collect
+  // all values + check against producer-emit set.
+  const consumerReadsByFileColumn = new Map<string, { column: string; values: Map<string, number[]> }>();
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    const reads = extractConsumerReads(content);
+    for (const { column, value, line } of reads) {
+      // Precision gate: only consider columns the producer also writes.
+      if (!producerColumns.has(column)) continue;
+      const key = `${filePath}::${column}`;
+      if (!consumerReadsByFileColumn.has(key)) {
+        consumerReadsByFileColumn.set(key, { column, values: new Map() });
+      }
+      const entry = consumerReadsByFileColumn.get(key)!;
+      if (!entry.values.has(value)) entry.values.set(value, []);
+      entry.values.get(value)!.push(line);
+    }
+  }
+
+  // Pass 3: emit drift hits.
+  const out: EnumDriftHit[] = [];
+  for (const [key, { column, values }] of consumerReadsByFileColumn) {
+    const [consumerFile] = key.split("::");
+    const producerValuesMap = producerWrites.get(column) ?? new Map();
+    const observedValues = Array.from(producerValuesMap.keys()).sort();
+    const expectedValues = Array.from(values.keys()).sort();
+    const missingFromProducer = expectedValues.filter((v) => !producerValuesMap.has(v));
+    if (missingFromProducer.length === 0) continue;
+    const overlap = expectedValues.filter((v) => producerValuesMap.has(v));
+    // Precision gates:
+    //   (a) Drop when producer's value set is too large to be enum-like
+    //       (likely an id-like column that slipped past the generic
+    //       filter — e.g., a column with 30+ distinct string literals).
+    //   (b) Drop when 100% missing AND producer set is tiny (≤2) —
+    //       the signal is too weak to call. Could be the user's bug
+    //       OR a column collision. Without ≥3 producer writes the
+    //       evidence is too thin either way.
+    if (observedValues.length > 12) continue;
+    if (missingFromProducer.length === expectedValues.length && observedValues.length < 3) continue;
+    // Confidence tier: shared vocabulary → confirmed; zero overlap →
+    // review. Most cross-table column-name collisions land in review.
+    const confidence: EnumDriftHit["confidence"] = overlap.length > 0 ? "confirmed" : "review";
+
+    // Collect producer samples (3 max).
+    const samples: Array<{ filePath: string; column: string; value: string }> = [];
+    for (const v of observedValues.slice(0, 3)) {
+      const writes = producerValuesMap.get(v) ?? [];
+      if (writes.length > 0) samples.push({ filePath: writes[0].filePath, column, value: v });
+    }
+
+    const confidenceNote = confidence === "review"
+      ? " (REVIEW — zero overlap with in-repo producer; may be a cross-table column collision OR a cross-repo external-producer drift)"
+      : "";
+    out.push({
+      template: "enum-drift",
+      consumerFile,
+      column,
+      expectedValues,
+      observedValues,
+      missingFromProducer,
+      producerSamples: samples,
+      confidence,
+      suggestedPin: `Enum drift in ${consumerFile} on column "${column}": consumer reads ${missingFromProducer.map((v) => `"${v}"`).join(", ")} but in-repo producer only emits ${observedValues.map((v) => `"${v}"`).join(", ")}.${confidenceNote} First-time bug class — won't be caught by regression pins.`,
+    });
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
 // Stripe webhook event-type dispatch detector (0.2.19+)
 // ────────────────────────────────────────────────────────────
 //

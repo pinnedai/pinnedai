@@ -307,6 +307,10 @@ export function classifyPinStrength(
       // needs a browser-reachable PREVIEW_URL. Behavioral when
       // reachable; unverified otherwise.
       return httpVerifiable ? "behavioral" : "unverified";
+    case "enum-drift":
+      // 0.2.22+ static cross-file scan. No HTTP, no preconditions —
+      // assertion has a real signal (producer write set membership).
+      return "behavioral";
   }
 }
 
@@ -804,7 +808,38 @@ export type Claim =
   | PaidApiCallClaim
   | EdgeFunctionWriteClaim
   | CronHandlerClaim
-  | PageAccessibilityClaim;
+  | PageAccessibilityClaim
+  | EnumDriftClaim;
+
+// 0.2.22+: Enum-drift pin — FIRST-TIME bug catching, not regression.
+//
+// Closes the bug class socialideagen dogfood surfaced: client polled
+// `status === "done"` but the producer (separate-repo daemon) writes
+// `status === "completed"`. Every Pinned regression detector ran clean
+// because there was no prior baseline. The pin fails the moment a
+// consumer reads a value the in-repo producer never emits.
+//
+// Pin shape: reads consumer file at test time + asserts each
+// `expectedValue` still appears in a producer-side write somewhere
+// in the repo. Detected via cross-file scan, not type analysis.
+//
+// Confidence tier (carried from the detector):
+//   confirmed — ≥1 expected value overlaps with the producer set;
+//               shared vocabulary, real drift on a specific value.
+//   review    — zero overlap. Soft signal — usually a cross-table
+//               column collision, occasionally a cross-repo external-
+//               producer drift (the user's exact bug shape).
+export type EnumDriftClaim = {
+  template: "enum-drift";
+  consumerFile: string;
+  column: string;
+  expectedValues: string[];
+  observedValues: string[];
+  missingFromProducer: string[];
+  producerSamples: Array<{ filePath: string; column: string; value: string }>;
+  confidence: "confirmed" | "review";
+  raw: string;
+};
 
 // 0.2.21+ BETA: page accessibility pin. Closes the gap socialideagen
 // dogfood exposed — admin pages shipped white-on-white text three
@@ -2396,6 +2431,13 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         check: `(BETA, opt-in) Renders ${c.page} via Playwright, injects axe-core, runs configured a11y rules. WARN-only on violations; catches tagged confidence:"review" so they don't inflate the GA metric.`,
       };
     }
+    case "enum-drift": {
+      return {
+        title: `enum-drift in \`${c.consumerFile}\` on column "${c.column}"${c.confidence === "review" ? " (REVIEW)" : ""}`,
+        promise: `Consumer reads values ${c.expectedValues.map((v) => `"${v}"`).join(", ")} for column "${c.column}". The producer-side writes for these values still exist in the repo.`,
+        check: `Static cross-file scan. Asserts each value the consumer reads still appears as a producer-side write somewhere in the codebase. Catches the FIRST-TIME bug class: AI silently removes a producer write while the consumer keeps reading the value, OR the two sides never agreed in the first place (the socialideagen dogfood shape).`,
+      };
+    }
   }
 }
 
@@ -2541,6 +2583,8 @@ export function badCaseForClaim(claim: Claim): string {
       return `${claim.source === "vercel" ? "Vercel cron" : "GH Actions cron"} \`${claim.identifier}\` no longer runs on \`${claim.schedule}\` — the schedule was changed${claim.handlerFile ? ` or the handler (${claim.handlerFile}) was renamed/deleted` : ""}.`;
     case "page-accessibility":
       return `🛟 BETA: page \`${claim.page}\` failed axe-core a11y check (${claim.rules.join(", ")}) — likely a contrast regression or invisible-text bug that page-renders pins miss.`;
+    case "enum-drift":
+      return `enum drift in \`${claim.consumerFile}\` — values consumer reads (${claim.missingFromProducer.map((v) => `"${v}"`).join(", ")}) for column "${claim.column}" no longer appear as producer writes anywhere in the repo. AI may have silently removed the producer-side write, or the enum was renamed.`;
   }
 }
 
@@ -2648,6 +2692,9 @@ export function claimRoute(c: Claim): string | null {
     case "page-accessibility":
       // Route-bound — same as page-renders.
       return c.page;
+    case "enum-drift":
+      // File-bound — surface the consumer file.
+      return c.consumerFile;
   }
 }
 
@@ -2705,7 +2752,9 @@ export function claimSlug(claim: Claim): string {
                                             ? `cron-${claim.source}-${claim.identifier}`
                                             : claim.template === "page-accessibility"
                                               ? `a11y-${claim.page}`
-                                              : claim.route;
+                                              : claim.template === "enum-drift"
+                                                ? `enum-drift-${claim.consumerFile}-${claim.column}`
+                                                : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -2822,6 +2871,8 @@ export function claimKey(c: Claim): string {
       return `cron-handler:${c.source}:${c.identifier}`;
     case "page-accessibility":
       return `page-accessibility:${c.page}:${c.rules.sort().join(",")}`;
+    case "enum-drift":
+      return `enum-drift:${c.consumerFile}:${c.column}`;
   }
 }
 

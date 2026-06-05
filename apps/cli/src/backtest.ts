@@ -1016,6 +1016,10 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
       // Browser-rendered — no static-file optimization. Replay against
       // full window (same as page-renders / interaction-baseline).
       return null;
+    case "enum-drift":
+      // Cross-file scan — any source file change could shift the
+      // producer write set. Full-window replay.
+      return null;
   }
 }
 

@@ -3308,6 +3308,8 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `${claim.source === "vercel" ? "Vercel cron" : "GH Actions cron"} \`${claim.identifier}\` keeps running on \`${claim.schedule}\`${claim.handlerFile ? ` (handler: ${claim.handlerFile})` : ""} (catches schedule drift + handler renames — cron has no user-in-loop, silent regression class)`;
     case "page-accessibility":
       return `🛟 BETA · Page \`${claim.page}\` keeps passing axe-core a11y rules (${claim.rules.join(", ")}) — catches white-on-white text / invisible labels that page-renders pins go GREEN on`;
+    case "enum-drift":
+      return `Enum drift defense in \`${claim.consumerFile}\` on column "${claim.column}" — asserts producer-side writes for each consumer-read value still appear in the repo. First-time bug class (consumer + producer never agreed) that regression detectors miss.`;
   }
 }
 
@@ -3648,6 +3650,7 @@ program
       detectEdgeFunctionWrites,
       detectCronHandlers,
       detectRetroactivePages,
+      detectEnumDrift,
       buildImportGraph,
       findFamilyMembers,
       deriveRouteFromPath: drfp,
@@ -3657,7 +3660,7 @@ program
 
     // 3. Detectors.
     type Proposal = {
-      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility";
+      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility" | "enum-drift";
       route: string;
       method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
       filePath: string;
@@ -3848,6 +3851,36 @@ program
           schedule: h.schedule,
           declarationFile: h.declarationFile,
           handlerFile: h.handlerFile,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+
+    // 0.2.22+ Enum-drift — FIRST-TIME bug catching (not regression).
+    // Closes the bug class socialideagen dogfood exposed (client reads
+    // `status === "done"` but producer never emits that value). Two
+    // confidence tiers: "confirmed" (shared vocabulary, real drift),
+    // "review" (zero overlap, likely cross-table column collision OR
+    // the user's cross-repo external-producer shape — soft signal).
+    const enumDriftHits = detectEnumDrift(tree);
+    for (const h of enumDriftHits) {
+      proposals.push({
+        kind: "enum-drift",
+        route: `${h.consumerFile}:${h.column}`,
+        filePath: h.consumerFile,
+        reason: h.suggestedPin,
+        // Default to NOT auto-pinning "review" tier — too FP-prone.
+        // Confirmed tier auto-pins.
+        beta: h.confidence === "review",
+        claim: {
+          template: "enum-drift",
+          consumerFile: h.consumerFile,
+          column: h.column,
+          expectedValues: h.expectedValues,
+          observedValues: h.observedValues,
+          missingFromProducer: h.missingFromProducer,
+          producerSamples: h.producerSamples,
+          confidence: h.confidence,
           raw: h.suggestedPin,
         },
       });
@@ -4084,6 +4117,30 @@ program
         out("  Run: pinned add-browser   then: pinned sweep --include-beta");
         out("");
       }
+    }
+    const enumDriftConfirmed = proposals.filter((p) => p.kind === "enum-drift" && (p.claim as Extract<Claim, { template: "enum-drift" }>).confidence === "confirmed");
+    const enumDriftReview = proposals.filter((p) => p.kind === "enum-drift" && (p.claim as Extract<Claim, { template: "enum-drift" }>).confidence === "review");
+    if (enumDriftConfirmed.length > 0 || enumDriftReview.length > 0) {
+      out("🧬 Enum drift — FIRST-TIME bugs (consumer reads value producer never emits):");
+      out("");
+      for (const p of enumDriftConfirmed.slice(0, 8)) {
+        const c = p.claim as Extract<Claim, { template: "enum-drift" }>;
+        out(`  ★ ${c.consumerFile}  col=${c.column}  missing=[${c.missingFromProducer.join(", ")}]`);
+        out(`      producer emits: [${c.observedValues.join(", ")}]`);
+      }
+      if (enumDriftConfirmed.length > 8) out(`  ★ …and ${enumDriftConfirmed.length - 8} more confirmed`);
+      if (enumDriftReview.length > 0) {
+        out("");
+        out("  Review tier (zero overlap — may be cross-table column collision OR cross-repo external producer):");
+        for (const p of enumDriftReview.slice(0, 4)) {
+          const c = p.claim as Extract<Claim, { template: "enum-drift" }>;
+          out(`    ⓘ ${c.consumerFile}  col=${c.column}  missing=[${c.missingFromProducer.join(", ")}]`);
+        }
+        if (enumDriftReview.length > 4) out(`    ⓘ …and ${enumDriftReview.length - 4} more review`);
+        out("");
+        out("  Review-tier hits are not auto-pinned by default (run with --include-beta to pin them too).");
+      }
+      out("");
     }
     const betaA11y = proposals.filter((p) => p.kind === "page-accessibility");
     if (betaA11y.length > 0) {
@@ -11030,6 +11087,8 @@ function describeClaim(c: Claim): string {
       return `cron           ${c.identifier}  →  ${c.schedule} (${c.source})${c.handlerFile ? ` · ${c.handlerFile}` : ""}`;
     case "page-accessibility":
       return `a11y🛟 BETA   ${c.page}  →  axe-core rules: ${c.rules.join(", ")}`;
+    case "enum-drift":
+      return `enum-drift     ${c.consumerFile}  col=${c.column}  missing=[${c.missingFromProducer.slice(0, 3).join(", ")}${c.missingFromProducer.length > 3 ? "..." : ""}]  (${c.confidence})`;
   }
 }
 

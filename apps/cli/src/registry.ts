@@ -319,6 +319,11 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       // Both the page route AND the source file. Either edit warrants
       // re-running the a11y check.
       return { routes: [claim.page], files: [claim.filePath] };
+    case "enum-drift":
+      // Consumer file is the primary surface. Producer files are
+      // discovered at test time, not pin time — so no static-coverage
+      // file list beyond the consumer.
+      return { files: [claim.consumerFile] };
   }
 }
 
@@ -499,6 +504,8 @@ function claimLabel(c: Claim): string {
       return `\`cron ${escapeMarkdownCell(c.identifier)}\` (${c.source} · ${escapeMarkdownCell(c.schedule)})`;
     case "page-accessibility":
       return `\`🛟 BETA · a11y ${escapeMarkdownCell(c.page)}\` (${c.rules.join(", ")})`;
+    case "enum-drift":
+      return `\`enum-drift ${escapeMarkdownCell(c.consumerFile)}\` (${escapeMarkdownCell(c.column)} · ${c.confidence})`;
   }
 }
 
