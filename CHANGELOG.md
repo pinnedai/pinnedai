@@ -2,6 +2,55 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.3.2] — 2026-06-05
+
+Four more Cipherwake-dogfood findings. Three sharpenings + one architectural decouple.
+
+### Fixed — Supabase ANON keys + publishable keys quiet; NEXT_PUBLIC_*SERVICE_ROLE = CRITICAL (inverted)
+
+The "NEXT_PUBLIC_* with KEY-shaped name" heuristic FP-flagged `NEXT_PUBLIC_SUPABASE_ANON_KEY` (designed to be public — the literal token ANON in the name says "not secret"). Rather than just silence it, we **inverted** the check: explicit publishable signals (`*ANON*`, `*PUBLISHABLE*`, `*SITE_KEY*`, `*CLIENT_KEY*`, `*APP_ID*`, `*PUBLIC_KEY*`) now quiet correctly, AND a new `next-public-secret-exposed` rule fires at **block severity** when a NEXT_PUBLIC_* env explicitly signals a secret (`*SERVICE_ROLE*`, `*SECRET*`, `*PRIVATE*`, `*ROOT_KEY*`, `*MASTER_KEY*`, `*ADMIN_KEY*`, Stripe sk_test_/sk_live_).
+
+`NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY` is the load-bearing case — it hands the whole DB (RLS-bypassing) to every visitor, a catastrophic + frequent AI mistake. Catching it at block severity flips an FP into a high-value detector.
+
+Regex fix on the way: `\bANON\b` doesn't form a boundary between `_` chars in JS regex (`NEXT_PUBLIC_*_ANON_KEY` wouldn't match), so we use explicit `(?:^|_)TOKEN(?:_|$)` anchors throughout.
+
+### Fixed — Lint-suppression noise (tiered DANGEROUS vs commonly-legit)
+
+`pinned safety` was flagging every `eslint-disable-next-line` at the same severity, burying the dangerous ones. Now tiered:
+
+- **DANGEROUS (warn):** `@ts-ignore`, `@ts-nocheck`, file-scoped `/* eslint-disable */`, `no-explicit-any`, `no-eval`, `no-unsafe-*`, `security/*`, `no-restricted-imports`.
+- **Quiet (no finding):** `@next/next/no-img-element` (data-URI / dynamic `<img>` is routinely legit), `react-hooks/exhaustive-deps`, `jsx-a11y/*`, `react/display-name`.
+
+Surface signal preserved on the catches that matter; noise on routinely-legitimate suppressions removed.
+
+### Fixed — Enum-drift contracts collided across unrelated `status` columns
+
+A `job-status` contract with `column: "status"` matched EVERY `.status === "..."` in the repo (idea status, comment status, anything). Added `appliesTo: string[]` to the contract schema — contracts only fire on files matching one of the declared globs (`lib/jobs/**`, exact paths, prefix patterns). Absence = repo-wide (back-compat with 0.3.0/0.3.1 contracts).
+
+### Changed — `pinned sweep` decoupled stats from pin-writing (recording happens always)
+
+The 0.3.1 sweep early-returned on `--dry-run` BEFORE writing `.pinned/repo-stats.json`, so dry-run never populated the tracker. Worse: a piped `n` decline (`printf 'n' | pinned sweep`) was consumed by the prompt but pinned everything anyway because the empty-EOF answer fell through to "yes". Both fixed:
+
+- **Stats are now recorded ALWAYS** — before the dry-run gate, before the batch-confirm prompt. `--dry-run` populates the tracker; declined batch-confirm populates the tracker. Pin-file writing only happens when the user explicitly accepts.
+- **Piped non-interactive stdin defaults to decline** — unless an explicit `y`/`yes` is read. Stats still get written; no surprise mass-pinning.
+
+### Tested
+
+- 392/392 vitest (no regression on the 0.3.1 suite)
+- 14/14 A+B+D acceptance matrix (4 publishable-secret cases, 4 lint-tier cases, 6 sweep behavior cases)
+- 16/16 prior 0.3.1 bug-pack acceptance matrix still passes
+- 54/54 dyad-apps FP sweep clean across 9 CLI commands × 6 repos
+
+### Doc / behavior notes (not bugs, surfaced from dogfood C)
+
+`pinned report` model attribution is `unspecified-model` on manual `pinned sweep` because a manual sweep has no AI-agent signal. The per-model analytics ("Sonnet produced X bugs") only populates from in-agent-loop detections (PostToolUse with a known model). This is documented in the report output now so users don't expect model breakdowns from manual sweeps.
+
+### Known follow-up — schema-detector gap
+
+Cipherwake reported a "feature can't actually work" bug where code writes to a table that has no migration. Static detectors saw the write surface but not the missing table — the type of bug only a smoke pin executing against prod would catch (POST → 500 on missing relation). Tracked as the **schema-detector gap**: extending `detectSupabaseColumnExists` (which currently checks columns within declared tables) to ALSO check table existence is a 0.3.3 candidate.
+
+---
+
 ## [0.3.1] — 2026-06-05
 
 Bug-pack release. Six Cipherwake-dogfood-reported issues that compounded into "FP auth pin you can't silence" — the exact adoption-killer the wedge release shouldn't have shipped with.

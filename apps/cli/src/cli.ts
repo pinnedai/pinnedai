@@ -4373,13 +4373,70 @@ program
       out("");
     }
 
-    // 5. Batch confirm.
+    // 5a. 0.3.2 (Cipherwake-dogfood D): decouple scan-stats from
+    // pin-file writing. Recording to .pinned/repo-stats.json happens
+    // ALWAYS — including dry-run, including when the user declines
+    // the batch-confirm. The user wanted: "populate the tracker
+    // without committing to pinning the whole sweep." Previously
+    // dry-run early-returned BEFORE the stats write, so the tracker
+    // never populated unless you accepted every pin.
+    try {
+      const { detectAiModel } = await import("./aiModel.js");
+      const { readRepoStats: rrs, writeRepoStats: wrs, mergeHits: mhs } = await import("./repoStats.js");
+      const aiModel = detectAiModel({ cwd });
+      const hits = proposals.map((p) => {
+        const c = p.claim;
+        const summary =
+          c.template === "enum-drift" ? `consumer reads "${c.missingFromProducer.join(", ")}" but producer only emits "${c.observedValues.join(", ")}"`
+          : c.template === "env-required" ? `${c.requiredKeys.length} env keys read by code`
+          : c.template === "supabase-column" ? `table "${c.table}" — ${c.referencedColumns.length} columns referenced`
+          : c.template === "expected-header" ? `${c.provider} webhook expects "${c.expectedHeader}"`
+          : c.template === "nullable-result" ? `unguarded ${c.source}`
+          : c.template === "response-shape" ? `consumer at ${c.consumerFile} reads keys producer might not emit`
+          : c.template === "mass-mutation" ? `${c.operation.toUpperCase()} on "${c.table}" without filter`
+          : c.template === "server-action-write" ? `${c.exportName}() writes ${c.writeTarget}`
+          : c.template === "stripe-event-handled" ? `${c.events.length} Stripe events dispatched`
+          : c.template === "paid-api-call" ? `${c.callExpr} (${c.modelString ?? "model unknown"})`
+          : c.template === "edge-function-write" ? `${c.functionName} → ${c.writeKind} ${c.writeTarget}`
+          : c.template === "cron-handler" ? `${c.identifier} runs on ${c.schedule}`
+          : c.template === "page-accessibility" ? `axe-core a11y check on ${c.page}`
+          : c.template === "interaction-baseline" ? `${c.action} ${c.selector} on ${c.page}`
+          : c.template === "happy-path-with-side-effect" ? `${c.method} ${c.route}`
+          : c.template === "journey" ? c.label
+          : c.template === "page-renders" ? `GET ${c.route}`
+          : c.template;
+        const line = "line" in c ? (c as { line?: number }).line : undefined;
+        return {
+          detector: c.template as Parameters<typeof mhs>[1][number]["detector"],
+          filePath: p.filePath,
+          line,
+          summary,
+        };
+      });
+      if (hits.length > 0) {
+        const statsDir = ".pinned";
+        const stats = rrs(statsDir);
+        const updated = mhs(stats, hits, aiModel);
+        wrs(statsDir, updated);
+      }
+    } catch (e) {
+      err(`  (stats write failed, non-fatal: ${(e as Error).message})\n`);
+    }
+
+    // 5b. Batch confirm.
     if (opts.dryRun) {
-      out("(--dry-run: no pin files written.)");
+      out("(--dry-run: stats recorded to .pinned/repo-stats.json; no pin files written.)");
       return;
     }
     if (!opts.yes) {
+      // 0.3.2 (Cipherwake-dogfood D): if stdin is non-TTY (piped),
+      // honor the input as the answer. Old behavior consumed the
+      // piped 'n' but then pinned everything anyway because the
+      // promise resolved with an empty string on EOF. Now: if the
+      // resolved answer is empty AND stdin was non-TTY, treat as
+      // 'n' (safe default for non-interactive callers).
       process.stdout.write(`Pin all ${proposals.length}? [Y/review each/n] `);
+      const nonTty = !process.stdin.isTTY;
       const answer = await new Promise<string>((resolve) => {
         let buf = "";
         process.stdin.setEncoding("utf8");
@@ -4392,11 +4449,29 @@ program
             resolve(buf.trim().toLowerCase());
           }
         };
+        const onEnd = () => {
+          process.stdin.removeListener("data", onData);
+          // EOF reached without newline — return whatever's been
+          // buffered (covers `printf 'n' | pinned sweep` without \n).
+          resolve(buf.trim().toLowerCase());
+        };
         process.stdin.on("data", onData);
+        process.stdin.once("end", onEnd);
       });
+      // Safe default for non-interactive callers — never auto-pin
+      // when stdin was piped and no clear yes was given. Stats are
+      // already written above (5a) so the user gets what they want
+      // without having to opt into every pin.
+      if (nonTty && answer !== "y" && answer !== "yes") {
+        out("");
+        out("Non-interactive stdin without explicit 'y' — declining batch-confirm.");
+        out("Stats recorded to .pinned/repo-stats.json; no pin files written.");
+        out("Run interactively (or pass --yes) to write pin files.");
+        return;
+      }
       if (answer === "n" || answer === "no") {
         out("");
-        out("Aborted. No pin files written.");
+        out("Aborted. Stats recorded; no pin files written.");
         return;
       }
       if (answer === "r" || answer === "review" || answer === "review each") {
@@ -4458,7 +4533,7 @@ program
     // baselines exist.
     try {
       const { detectAiModel } = await import("./aiModel.js");
-      const { readRepoStats, writeRepoStats, mergeHits } = await import("./repoStats.js");
+      const { mergeHits } = await import("./repoStats.js");
       const aiModel = detectAiModel({ cwd });
       const hits = proposals.map((p) => {
         const c = p.claim;
@@ -4491,13 +4566,12 @@ program
         };
       });
       if (hits.length > 0) {
-        // Stats live in `.pinned/repo-stats.json`, NOT in tests/pinned —
-        // that directory holds the .test.ts files. .pinned is the
-        // marker/metadata directory (alongside .pinned/ai-lessons.md).
-        const statsDir = ".pinned";
-        const stats = readRepoStats(statsDir);
-        const updated = mergeHits(stats, hits, aiModel);
-        writeRepoStats(statsDir, updated);
+        // Stats are now written ABOVE in section 5a (before the dry-run
+        // gate) so that --dry-run also populates the tracker — see
+        // 0.3.2 Cipherwake-dogfood D. The lessons logic below still
+        // runs here because lessons are tied to PIN CREATION, not
+        // detection — they're only meaningful when the user accepts
+        // the batch-confirm and the pins actually get written.
 
         // 0.2.25+: auto-enrich AI lessons from first-time-bug catches.
         // The existing aiLessons module already powers the rule context

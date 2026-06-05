@@ -22,7 +22,7 @@
 import { readFileSync, existsSync, readdirSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 
-export type Severity = "warn" | "info";
+export type Severity = "block" | "warn" | "info";
 
 export type SafetyFinding = {
   rule: SafetyRule;
@@ -37,6 +37,7 @@ export type SafetyFinding = {
 export type SafetyRule =
   | "env-var-not-documented"
   | "next-public-secret-shape"
+  | "next-public-secret-exposed"
   | "cors-wildcard"
   | "destructive-sql"
   | "lint-escape-hatch";
@@ -95,23 +96,74 @@ export function runSafetyPass(root: string): SafetyFinding[] {
       }
     }
     // Rule 2 fires regardless of .env.example
+    //
+    // 0.3.2 INVERSION (Cipherwake-dogfood A, upgraded): rather than
+    // just suppressing the publishable-key FP, INVERT — recognize
+    // explicit publishable signals AS publishable (quiet), and
+    // recognize explicit secret signals on NEXT_PUBLIC_* as CRITICAL.
+    //
+    // Anon and service-role Supabase keys are both JWTs — identical
+    // value shape — so we can't discriminate on value. The NAME is the
+    // signal. NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY would hand the
+    // whole DB (RLS-bypassing) to every visitor — catastrophic and
+    // a frequent AI mistake. NEXT_PUBLIC_SUPABASE_ANON_KEY is designed
+    // to be public — quiet.
+    // NOTE on regex anchors: `\b` does NOT form a boundary between
+    // `_` and other word chars in JS, so `\bANON\b` does NOT match
+    // inside "NEXT_PUBLIC_SUPABASE_ANON_KEY". We use explicit
+    // underscore-or-edge anchors: (?:^|_)TOKEN(?:_|$).
+    const PUBLISHABLE_NAME_PATTERNS = [
+      /PUBLISHABLE/i,                                              // Stripe-style PUBLISHABLE_KEY
+      /(?:^|_)ANON(?:_|$)/i,                                       // Supabase NEXT_PUBLIC_*_ANON_KEY
+      /(?:^|_)ANON_KEY(?:_|$)/i,                                   // explicit ANON_KEY token
+      /(?:^|_)PUBLIC_KEY(?:_|$)/i,                                 // explicit PUBLIC_KEY label
+      /(?:^|_)SITE_KEY(?:_|$)/i,                                   // reCAPTCHA SITE_KEY
+      /(?:^|_)CLIENT_KEY(?:_|$)/i,                                 // OAuth CLIENT_KEY
+      /(?:^|_)APP_(?:ID|KEY)(?:_|$)/i,                             // Algolia APP_ID, Posthog APP_KEY
+    ];
+    // CRITICAL: NEXT_PUBLIC_* + one of these tokens = secret shipped
+    // to the browser. AI mistake-class, real and frequent.
+    const SECRET_NAME_PATTERNS_ON_NEXT_PUBLIC = [
+      /(?:^|_)SERVICE_ROLE(?:_|$)/i,        // Supabase service-role JWT (RLS-bypass)
+      /(?:^|_)SERVICE_KEY(?:_|$)/i,         // alternate spelling
+      /(?:^|_)SECRET(?:_KEY)?(?:_|$)/i,     // explicit SECRET / SECRET_KEY
+      /(?:^|_)PRIVATE(?:_KEY)?(?:_|$)/i,    // PRIVATE_KEY
+      /(?:^|_)ROOT_KEY(?:_|$)/i,            // root-key shapes
+      /(?:^|_)MASTER_KEY(?:_|$)/i,          // explicit master key
+      /(?:^|_)ADMIN_KEY(?:_|$)/i,           // admin / superuser key
+      /sk_(?:test|live)_/i,                 // Stripe secret key pattern in the name
+    ];
     for (const [name, lineNo] of collectEnvUsage(content)) {
-      if (
-        name.startsWith("NEXT_PUBLIC_") &&
-        /SECRET|TOKEN|KEY|PASSWORD|API_KEY/i.test(name) &&
-        // Exclude common false-positives (PUBLISHABLE_KEY is meant to be public)
-        !/PUBLISHABLE/i.test(name)
-      ) {
+      if (!name.startsWith("NEXT_PUBLIC_")) continue;
+      if (!/SECRET|TOKEN|KEY|PASSWORD|API_KEY|SERVICE_ROLE|PRIVATE/i.test(name)) continue;
+
+      // CRITICAL path first — name explicitly signals a secret.
+      if (SECRET_NAME_PATTERNS_ON_NEXT_PUBLIC.some((re) => re.test(name))) {
         findings.push({
-          rule: "next-public-secret-shape",
-          severity: "warn",
+          rule: "next-public-secret-exposed",
+          severity: "block",
           file,
           line: lineNo,
           snippet: lines[lineNo - 1]?.trim().slice(0, 120),
-          message: `Env var \`${name}\` is exposed to the browser (NEXT_PUBLIC_*) but its name implies a secret.`,
-          suggested: `Move secrets to a server-only env var (drop the NEXT_PUBLIC_ prefix). If this is genuinely a publishable key, rename it (e.g. NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY).`,
+          message: `CRITICAL: \`${name}\` ships a SECRET to the browser. The name explicitly signals a privileged key (service-role / secret / private). Anyone visiting the site can read it from window.process.env at runtime.`,
+          suggested: `Rename to drop the NEXT_PUBLIC_ prefix (server-only). For Supabase: the service-role key bypasses RLS and must NEVER be NEXT_PUBLIC_; use the ANON key on the client. For Stripe: use the PUBLISHABLE_KEY on the client, not the SECRET_KEY.`,
         });
+        continue;
       }
+
+      // Publishable signals — intended-public, no warning.
+      if (PUBLISHABLE_NAME_PATTERNS.some((re) => re.test(name))) continue;
+
+      // Old warn path — ambiguous KEY/TOKEN name on NEXT_PUBLIC_*.
+      findings.push({
+        rule: "next-public-secret-shape",
+        severity: "warn",
+        file,
+        line: lineNo,
+        snippet: lines[lineNo - 1]?.trim().slice(0, 120),
+        message: `Env var \`${name}\` is exposed to the browser (NEXT_PUBLIC_*) but its name implies a secret.`,
+        suggested: `Move secrets to a server-only env var (drop the NEXT_PUBLIC_ prefix). If this is genuinely a publishable key, rename it (e.g. NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY, NEXT_PUBLIC_*_ANON_KEY).`,
+      });
     }
 
     // Rule 3: CORS wildcard
@@ -136,25 +188,64 @@ export function runSafetyPass(root: string): SafetyFinding[] {
       }
     }
 
-    // Rule 5: lint escape hatches
+    // Rule 5: lint escape hatches — TIERED (0.3.2 FIX, Cipherwake-
+    // dogfood B).
+    //
+    // Old behavior flagged every eslint-disable-next-line equally,
+    // including commonly-legitimate ones like @next/next/no-img-element
+    // (data-URIs, dynamic <img>, places next/image doesn't fit). The
+    // dogfood report: "Treating every suppression as dangerous buries
+    // the ones that matter."
+    //
+    // New tiers:
+    //   DANGEROUS (warn) → @ts-ignore, @ts-nocheck, no-explicit-any
+    //                      disabled, file-scoped eslint-disable, any
+    //                      security-related rule (security/, no-eval,
+    //                      no-unsafe-*).
+    //   COMMONLY-LEGIT (info) → no-img-element, scoped exhaustive-deps,
+    //                            jsx-a11y/* (project-specific accessibility
+    //                            calls), display-name.
+    //
+    // The DANGEROUS set is the actual signal; the COMMONLY-LEGIT set is
+    // surface noise. Tiering preserves the catch on the bugs that
+    // matter without burying them.
+    const DANGEROUS_SUPPRESSION_PATTERNS = [
+      /\/\/\s*@ts-ignore/,
+      /\/\/\s*@ts-nocheck/,
+      /\/\*\s*eslint-disable\b/,                                  // file-scoped disable (no -next-line)
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*no-explicit-any/i,
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*@typescript-eslint\/no-explicit-any/i,
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*no-eval/i,
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*no-unsafe-/i,
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*security\//i,
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*no-restricted-imports/i,
+    ];
+    const COMMONLY_LEGIT_SUPPRESSION_PATTERNS = [
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*@next\/next\/no-img-element/i,
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*react-hooks\/exhaustive-deps/i,
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*jsx-a11y\//i,
+      /eslint-disable-(?:next-line|line)\s+(?:[^,]+,\s*)*react\/display-name/i,
+    ];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      if (
-        /\/\/\s*@ts-ignore/.test(line) ||
-        /\/\/\s*@ts-nocheck/.test(line) ||
-        /\/\*\s*eslint-disable/.test(line) ||
-        /\/\/\s*eslint-disable-(next-line|line)/.test(line)
-      ) {
-        findings.push({
-          rule: "lint-escape-hatch",
-          severity: "info",
-          file,
-          line: i + 1,
-          snippet: line.trim().slice(0, 120),
-          message: `Type or lint suppression. AI-generated suppressions often hide real bugs.`,
-          suggested: `Replace with a typed/lint-clean fix, or add a comment explaining why the suppression is necessary.`,
-        });
-      }
+      const isLintEscape = /\/\/\s*@ts-(?:ignore|nocheck)|\/\*\s*eslint-disable\b|\/\/\s*eslint-disable-(?:next-line|line)/.test(line);
+      if (!isLintEscape) continue;
+      const isDangerous = DANGEROUS_SUPPRESSION_PATTERNS.some((re) => re.test(line));
+      const isCommonlyLegit = COMMONLY_LEGIT_SUPPRESSION_PATTERNS.some((re) => re.test(line));
+      // Suppress entirely when ONLY commonly-legit rules are disabled
+      // and no dangerous rules ride along.
+      if (isCommonlyLegit && !isDangerous) continue;
+      findings.push({
+        rule: "lint-escape-hatch",
+        severity: isDangerous ? "warn" : "info",
+        file,
+        line: i + 1,
+        snippet: line.trim().slice(0, 120),
+        message: isDangerous
+          ? `DANGEROUS suppression (${line.includes("@ts-") ? "type-check disabled" : "high-risk lint rule disabled"}). These hide real bugs disproportionately often.`
+          : `Type or lint suppression. AI-generated suppressions sometimes hide real bugs.`,
+        suggested: `Replace with a typed/lint-clean fix, or add a comment explaining why the suppression is necessary.`,
+      });
     }
   }
 
