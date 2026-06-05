@@ -1030,6 +1030,21 @@
       "status": "active",
       "covers": {},
       "badCase": "running `node ./apps/cli/dist/cli.js record-server-action --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-report-help-il5f4m",
+      "prId": "auto-20260605",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js report --help",
+        "raw": "`node ./apps/cli/dist/cli.js report --help` exits 0"
+      },
+      "filename": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-report-help-il5f4m.test.ts",
+      "pinnedAt": "2026-06-05T02:14:51.819Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js report --help` exited with non-zero status (command broken)"
     }
   ]
 }

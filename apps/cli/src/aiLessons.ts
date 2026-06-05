@@ -27,6 +27,16 @@ export type LessonInput = {
   plainEnglish: string;
   /** Where this lesson came from. */
   kind: LessonKind;
+  /**
+   * 0.2.25+: AI model that caused this lesson (when detectable).
+   * Format: `<provider>:<family>:<version>` for known, "unspecified-model"
+   * for unknown. Used by paid-tier provider-mistake analytics. Lessons
+   * SURFACE TO ALL MODELS — the tag is for analytics + filtering, not
+   * gating which AI sees the rule.
+   */
+  aiModel?: string;
+  /** 0.2.25+: tool/agent surface that wrote the buggy code. */
+  aiTool?: string;
 };
 
 export type AiLessonsConfig = {
@@ -120,6 +130,12 @@ export type LessonJsonEntry = {
   plainEnglish: string;
   pastMistakes: string[];
   updatedAt: string;
+  /**
+   * 0.2.25+: Per-AI-model occurrence breakdown. Useful for paid-tier
+   * provider-mistake analytics. Empty when no signal; aggregates over
+   * repeated catches when ≥1 model is identifiable.
+   */
+  byModel?: Record<string, { hits: number; firstSeen: string; lastSeen: string; tool?: string }>;
 };
 
 function syncLessonsJson(repoRoot: string, jsonPath: string, entry: LessonInput): void {
@@ -132,13 +148,27 @@ function syncLessonsJson(repoRoot: string, jsonPath: string, entry: LessonInput)
       if (parsed && Array.isArray(parsed.lessons)) payload = parsed;
     }
   } catch { /* corrupt → reset */ }
+  const now = new Date().toISOString();
   const existingIdx = payload.lessons.findIndex((l) => l.id === entry.guardId);
   if (existingIdx >= 0) {
     const existing = payload.lessons[existingIdx];
     if (!existing.pastMistakes.includes(entry.pastMistake)) {
       existing.pastMistakes.push(entry.pastMistake);
     }
-    existing.updatedAt = new Date().toISOString();
+    existing.updatedAt = now;
+    // 0.2.25+ per-model rollup. Adds to existing model entry, or
+    // initializes a new one. Never overwrites the firstSeen date.
+    if (entry.aiModel) {
+      const byModel = existing.byModel ?? {};
+      const prev = byModel[entry.aiModel] ?? { hits: 0, firstSeen: now, lastSeen: now };
+      byModel[entry.aiModel] = {
+        hits: prev.hits + 1,
+        firstSeen: prev.firstSeen,
+        lastSeen: now,
+        ...(entry.aiTool ? { tool: entry.aiTool } : {}),
+      };
+      existing.byModel = byModel;
+    }
     payload.lessons[existingIdx] = existing;
   } else {
     payload.lessons.push({
@@ -148,7 +178,17 @@ function syncLessonsJson(repoRoot: string, jsonPath: string, entry: LessonInput)
       severity: "block",
       plainEnglish: entry.plainEnglish,
       pastMistakes: [entry.pastMistake],
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
+      ...(entry.aiModel ? {
+        byModel: {
+          [entry.aiModel]: {
+            hits: 1,
+            firstSeen: now,
+            lastSeen: now,
+            ...(entry.aiTool ? { tool: entry.aiTool } : {}),
+          },
+        },
+      } : {}),
     });
   }
   writeFileSync(abs, JSON.stringify(payload, null, 2) + "\n");

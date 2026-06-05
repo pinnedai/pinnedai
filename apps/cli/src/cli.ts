@@ -4376,12 +4376,143 @@ program
     }
     if (written > 0) writeRegistry(opts.dir, registry);
 
+    // 0.2.25+ Per-repo bug-class tracking. Local-first storage in
+    // `.pinned/repo-stats.json`. Updated every sweep so the user (and
+    // eventually the hosted paid-tier dashboard per
+    // [[strategic-moat-independent-guardrail]]) sees per-detector hit
+    // counts + AI-model breakdown + sample hits + trend snapshots.
+    // First-time bug detectors contribute most of the signal — they
+    // catch bugs at the moment they're written, before regression
+    // baselines exist.
+    try {
+      const { detectAiModel } = await import("./aiModel.js");
+      const { readRepoStats, writeRepoStats, mergeHits } = await import("./repoStats.js");
+      const aiModel = detectAiModel({ cwd });
+      const hits = proposals.map((p) => {
+        const c = p.claim;
+        const summary =
+          c.template === "enum-drift" ? `consumer reads "${c.missingFromProducer.join(", ")}" but producer only emits "${c.observedValues.join(", ")}"`
+          : c.template === "env-required" ? `${c.requiredKeys.length} env keys read by code`
+          : c.template === "supabase-column" ? `table "${c.table}" — ${c.referencedColumns.length} columns referenced`
+          : c.template === "expected-header" ? `${c.provider} webhook expects "${c.expectedHeader}"`
+          : c.template === "nullable-result" ? `unguarded ${c.source}`
+          : c.template === "response-shape" ? `consumer at ${c.consumerFile} reads keys producer might not emit`
+          : c.template === "mass-mutation" ? `${c.operation.toUpperCase()} on "${c.table}" without filter`
+          : c.template === "server-action-write" ? `${c.exportName}() writes ${c.writeTarget}`
+          : c.template === "stripe-event-handled" ? `${c.events.length} Stripe events dispatched`
+          : c.template === "paid-api-call" ? `${c.callExpr} (${c.modelString ?? "model unknown"})`
+          : c.template === "edge-function-write" ? `${c.functionName} → ${c.writeKind} ${c.writeTarget}`
+          : c.template === "cron-handler" ? `${c.identifier} runs on ${c.schedule}`
+          : c.template === "page-accessibility" ? `axe-core a11y check on ${c.page}`
+          : c.template === "interaction-baseline" ? `${c.action} ${c.selector} on ${c.page}`
+          : c.template === "happy-path-with-side-effect" ? `${c.method} ${c.route}`
+          : c.template === "journey" ? c.label
+          : c.template === "page-renders" ? `GET ${c.route}`
+          : c.template;
+        // Extract a representative line number when the claim has one.
+        const line = "line" in c ? (c as { line?: number }).line : undefined;
+        return {
+          detector: c.template as Parameters<typeof mergeHits>[1][number]["detector"],
+          filePath: p.filePath,
+          line,
+          summary,
+        };
+      });
+      if (hits.length > 0) {
+        // Stats live in `.pinned/repo-stats.json`, NOT in tests/pinned —
+        // that directory holds the .test.ts files. .pinned is the
+        // marker/metadata directory (alongside .pinned/ai-lessons.md).
+        const statsDir = ".pinned";
+        const stats = readRepoStats(statsDir);
+        const updated = mergeHits(stats, hits, aiModel);
+        writeRepoStats(statsDir, updated);
+
+        // 0.2.25+: auto-enrich AI lessons from first-time-bug catches.
+        // The existing aiLessons module already powers the rule context
+        // every AI agent sees before editing — feeding catches into it
+        // means agents learn from their own bugs (or other agents'
+        // bugs, when teams share rule files). Model-tagged for paid-
+        // tier provider-mistake analytics per [[strategic-moat-
+        // independent-guardrail]]. Limited to FIRST-TIME-BUG detectors
+        // — adding a lesson for every host-conditional family catch
+        // would flood the rule file with noise.
+        const FIRST_TIME_BUG_TEMPLATES = new Set([
+          "enum-drift", "env-required", "supabase-column", "expected-header",
+          "nullable-result", "response-shape", "mass-mutation",
+        ]);
+        try {
+          const { appendLesson } = await import("./aiLessons.js");
+          for (const p of proposals) {
+            if (!FIRST_TIME_BUG_TEMPLATES.has(p.claim.template)) continue;
+            const c = p.claim;
+            const ruleByDetector: Record<string, { title: string; rule: string; plain: string }> = {
+              "enum-drift": {
+                title: `Match consumer reads to producer emits (${"column" in c ? c.column : "enum"})`,
+                rule: `When reading a discriminant value, only compare against values the in-repo producer actually emits. Confirm by grep before adding new === "X" checks.`,
+                plain: "match consumer reads to actual producer values",
+              },
+              "env-required": {
+                title: "Declare every env var your code reads",
+                rule: "Every `process.env.X` read must have a matching entry in .env.example (or vercel.json env / next.config.js env / wrangler.toml [vars]). Cloned-repo first-runs break silently otherwise.",
+                plain: "every process.env read needs a .env.example entry",
+              },
+              "supabase-column": {
+                title: `Match Supabase queries to actual table schema`,
+                rule: "Before referencing a column in `.select` / `.eq` / `.update` / `.insert`, confirm it exists in supabase/migrations/*.sql or database.types.ts. Runtime errors otherwise.",
+                plain: "verify Supabase columns exist in migrations",
+              },
+              "expected-header": {
+                title: `Use canonical webhook header names`,
+                rule: "Webhook handlers must read the SDK's canonical signature header (Stripe: `stripe-signature`, GitHub: `x-hub-signature-256`, Svix: `svix-signature`, Twilio: `x-twilio-signature`). Typos silently break verification.",
+                plain: "use canonical webhook header names (not typo variants)",
+              },
+              "nullable-result": {
+                title: `Guard .find/.match/.exec results before use in route handlers`,
+                rule: "In server-side route handlers (route.ts / actions / Edge Functions), null-check the result of .find / .match / .exec before accessing properties. First edge-case input crashes the route otherwise.",
+                plain: "guard .find/.match/.exec results in route handlers",
+              },
+              "response-shape": {
+                title: `Match consumer JSON-key reads to producer Response.json emits`,
+                rule: "When fetching from an in-repo /api route, only read keys the producer's Response.json literal actually emits. Confirm by checking the route handler before destructuring.",
+                plain: "match consumer body.x reads to producer NextResponse.json keys",
+              },
+              "mass-mutation": {
+                title: `Always filter .update() and .delete()`,
+                rule: "`.from(\"X\").update({...})` and `.from(\"X\").delete()` must be followed by at least one filter clause (.eq / .match / .in / etc). Without a filter, the operation mutates every row in the table.",
+                plain: "always filter .update/.delete with .eq/.match/.in",
+              },
+            };
+            const proto = ruleByDetector[c.template];
+            if (!proto) continue;
+            const hitSummary = hits.find((h) => h.filePath === p.filePath)?.summary ?? "";
+            appendLesson({
+              guardId: `learned-${c.template}`,
+              title: proto.title,
+              pastMistake: hitSummary || `${c.template} detected in ${p.filePath}`,
+              rule: proto.rule,
+              plainEnglish: proto.plain,
+              kind: "real-catch",
+              aiModel: aiModel.model,
+              aiTool: aiModel.tool,
+            });
+          }
+        } catch (e) {
+          // Lessons are nice-to-have, never gate the sweep.
+          err(`  (lesson-enrichment failed, non-fatal: ${(e as Error).message})\n`);
+        }
+      }
+    } catch (e) {
+      // Stats are nice-to-have, never gate the sweep.
+      err(`  (stats write failed, non-fatal: ${(e as Error).message})\n`);
+    }
+
     out("");
     out(`✓ Sweep complete: ${written} pin${written === 1 ? "" : "s"} written, ${skipped} already existed${betaSkipped > 0 ? `, ${betaSkipped} BETA interaction-pins skipped (use --include-beta to enable)` : ""}.`);
     out("");
     out("Next:");
     out("  • Set PREVIEW_URL (or have your dev server up) and run `pinned test` to see green or first catches.");
     out("  • `pinned audit` for the read-only retro view of what just got pinned.");
+    out("  • `pinned report` for the per-detector hit-count dashboard.");
   });
 
 // ---------- audit (0.2.12+) ----------
@@ -5157,6 +5288,81 @@ program
       }
     }
   );
+
+// ---------- report (0.2.25+) ----------
+// Per-detector hit-count dashboard with AI-model breakdown. Reads
+// `.pinned/repo-stats.json` populated by every `pinned sweep`. Per
+// [[strategic-moat-independent-guardrail]] the model-tag dimension
+// is the durable moat lever — Free tier shows local data, Paid
+// (hosted) ships cross-repo + provider-mistake analytics.
+program
+  .command("report")
+  .description("Show per-detector bug-class counts + AI-model breakdown + 7-day trend deltas. Reads .pinned/repo-stats.json populated by `pinned sweep`.")
+  .option("--dir <path>", "Pinned tests directory (default: tests/pinned)", "tests/pinned")
+  .option("--json", "Emit JSON instead of human-readable.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (opts: { dir: string; json?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const pinnedDir = ".pinned";
+    const { readRepoStats, trendDelta } = await import("./repoStats.js");
+    const { formatAiModelLabel, detectAiModel } = await import("./aiModel.js");
+    const stats = readRepoStats(pinnedDir);
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(stats, null, 2) + "\n");
+      return;
+    }
+    const detectors = Object.entries(stats.byDetector);
+    if (detectors.length === 0) {
+      out("No detections recorded yet. Run `pinned sweep` to populate the stats.");
+      return;
+    }
+    // Sort by severity (critical → high → medium → low) then by hit count.
+    const SEVERITY_RANK: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+    detectors.sort(([, a], [, b]) => {
+      const ra = SEVERITY_RANK[a.severity] ?? 2;
+      const rb = SEVERITY_RANK[b.severity] ?? 2;
+      if (ra !== rb) return rb - ra;
+      return b.totalHits - a.totalHits;
+    });
+    out("");
+    out(`◆ Pinned · per-repo bug-class report`);
+    out(`  Last updated: ${stats.lastUpdated.slice(0, 16).replace("T", " ")}`);
+    out("");
+    out(`${"DETECTOR".padEnd(28)} ${"SEV".padEnd(8)} ${"TOTAL".padEnd(8)} ${"7d".padEnd(8)} MODELS`);
+    out("─".repeat(80));
+    for (const [name, ds] of detectors) {
+      const sev = ds.severity.toUpperCase();
+      const t = trendDelta(stats, name, 7);
+      const trend = t.basis === "no-history" ? "—" : (t.delta > 0 ? `+${t.delta}` : `${t.delta}`);
+      const modelSummary = Object.entries(ds.byModel)
+        .sort(([, a], [, b]) => b.hits - a.hits)
+        .slice(0, 3)
+        .map(([m, ms]) => `${m}=${ms.hits}`)
+        .join(" ");
+      out(`${name.padEnd(28)} ${sev.padEnd(8)} ${String(ds.totalHits).padEnd(8)} ${trend.padEnd(8)} ${modelSummary}`);
+    }
+    out("");
+    out("─".repeat(80));
+    out("Recent samples (newest 3 per detector):");
+    out("");
+    for (const [name, ds] of detectors.slice(0, 6)) {
+      const samples = ds.sampleHits.slice(0, 3);
+      if (samples.length === 0) continue;
+      out(`  ${name}:`);
+      for (const s of samples) {
+        const loc = s.line ? `${s.filePath}:${s.line}` : s.filePath;
+        out(`    · ${loc}  →  ${s.summary.length > 70 ? s.summary.slice(0, 67) + "..." : s.summary}`);
+      }
+      out("");
+    }
+    // Current AI-model context.
+    const currentModel = detectAiModel();
+    out(`Current AI context: ${formatAiModelLabel(currentModel)}  (signal: ${currentModel.signal})`);
+    out("");
+    out("Free tier: full local data, all detectors, all model tags.");
+    out("Paid tier (coming): cross-repo aggregation + provider-mistake analytics across your org.");
+    out("");
+  });
 
 // ---------- catches ----------
 // Lifetime catch history — every regression Pinned has caught.

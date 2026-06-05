@@ -1,0 +1,140 @@
+// AI-model detection (0.2.25+) — load-bearing for repo-stats analytics
+// and AI-lesson tagging.
+//
+// Per [[strategic-moat-independent-guardrail]], the provider-analytics
+// dimension is the durable moat lever for paid tier — neither
+// Anthropic nor Cursor can ship "your Claude bugs vs your GPT bugs"
+// analytics for themselves (irreducible conflict of interest).
+//
+// Detection strategy (in priority order):
+//   1. EXPLICIT — env vars set by the user
+//   2. HOOK-CONTEXT — env vars set by the Claude Code PostToolUse hook
+//   3. BYOK — when PINNEDAI_BYOK=<provider> is set
+//   4. HEURISTIC — agent-rule-file presence (CLAUDE.md / .cursorrules /
+//      .github/copilot-instructions.md / AGENTS.md / .windsurfrules /
+//      .clinerules / .codeium / etc)
+//   5. UNSPECIFIED — fallback, no signal found
+//
+// The "tool" dimension (which CLI / IDE) is separate from the "model"
+// dimension (which LLM family + version). A user can run Claude Code
+// (tool) routing through Anthropic Sonnet 4 (model). We tag both
+// independently when known.
+
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+export type AiModelDetection = {
+  // Best-guess model identity. Format: `<provider>:<family>:<version>`
+  // when known (e.g. `anthropic:claude:sonnet-4`), or shorter labels
+  // for heuristic detection (`anthropic:unknown`, `unspecified-model`).
+  model: string;
+  // Best-guess tool / agent surface. Format: `<tool>:<version?>`
+  // (e.g. `claude-code`, `cursor`, `copilot`, `windsurf`, `cline`).
+  // Undefined when no signal.
+  tool?: string;
+  // Confidence in the detection:
+  //   "known"       — directly identifiable (env var / hook context)
+  //   "heuristic"   — inferred from agent-rule-file presence
+  //   "unspecified" — no signal found, default
+  confidence: "known" | "heuristic" | "unspecified";
+  // Signal source for debuggability + audit-trail.
+  signal: string;
+};
+
+// Agent-rule-file conventions, in priority order. The first match
+// wins for tool detection. Same set the existing aiLessons module
+// already recognizes.
+const AGENT_RULE_FILES: Array<{ path: string; tool: string }> = [
+  { path: "CLAUDE.md", tool: "claude-code" },
+  { path: ".claude/CLAUDE.md", tool: "claude-code" },
+  { path: ".cursor/rules", tool: "cursor" },
+  { path: ".cursorrules", tool: "cursor" },
+  { path: ".github/copilot-instructions.md", tool: "copilot" },
+  { path: "AGENTS.md", tool: "agents-md" }, // generic, used by Cursor/Aider/etc
+  { path: ".windsurfrules", tool: "windsurf" },
+  { path: ".windsurf/rules", tool: "windsurf" },
+  { path: ".clinerules", tool: "cline" },
+  { path: ".cline/rules", tool: "cline" },
+  { path: ".codeiumignore", tool: "codeium" },
+];
+
+// BYOK provider → conventional model fallback. When the user has
+// explicit BYOK and no version info, this is the most-likely default.
+const BYOK_DEFAULT_MODEL: Record<string, string> = {
+  anthropic: "anthropic:claude:unknown",
+  openai: "openai:gpt:unknown",
+  "claude-code": "anthropic:claude:via-claude-code",
+  "github-models": "github:models:unknown",
+};
+
+export function detectAiModel(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): AiModelDetection {
+  const cwd = opts.cwd ?? process.cwd();
+  const env = opts.env ?? process.env;
+
+  // 1. EXPLICIT model override — pretty rare but allowed.
+  if (env.PINNED_AI_MODEL) {
+    return {
+      model: env.PINNED_AI_MODEL,
+      tool: env.PINNED_AI_TOOL,
+      confidence: "known",
+      signal: "PINNED_AI_MODEL env var",
+    };
+  }
+
+  // 2. HOOK-CONTEXT — Claude Code's PostToolUse hook sets these.
+  // The hook can pass the model via PINNED_HOOK_AI_MODEL when wired
+  // (0.2.25+ hook update). Tool always claude-code in that path.
+  if (env.PINNED_HOOK_AI_MODEL) {
+    return {
+      model: env.PINNED_HOOK_AI_MODEL,
+      tool: "claude-code",
+      confidence: "known",
+      signal: "Claude Code PostToolUse hook context",
+    };
+  }
+
+  // 3. BYOK — when PINNEDAI_BYOK is set, the provider is known but
+  // the model family isn't necessarily known. Pick a reasonable
+  // default; user can override via PINNED_AI_MODEL.
+  if (env.PINNEDAI_BYOK) {
+    const provider = env.PINNEDAI_BYOK.toLowerCase();
+    const model = BYOK_DEFAULT_MODEL[provider] ?? `${provider}:unknown`;
+    return {
+      model,
+      tool: provider === "claude-code" ? "claude-code" : undefined,
+      confidence: "known",
+      signal: `PINNEDAI_BYOK=${env.PINNEDAI_BYOK}`,
+    };
+  }
+
+  // 4. HEURISTIC — agent-rule-file presence. Walk the priority list
+  // and tag the first hit. This gives tool but not model.
+  for (const { path, tool } of AGENT_RULE_FILES) {
+    if (existsSync(join(cwd, path))) {
+      return {
+        model: "unspecified-model",
+        tool,
+        confidence: "heuristic",
+        signal: `agent rule file: ${path}`,
+      };
+    }
+  }
+
+  // 5. UNSPECIFIED — fallback.
+  return {
+    model: "unspecified-model",
+    confidence: "unspecified",
+    signal: "no model or tool signal found",
+  };
+}
+
+// Friendly display label. Used in `pinned report` + sweep output.
+export function formatAiModelLabel(d: AiModelDetection): string {
+  if (d.confidence === "unspecified") return "unspecified model";
+  if (d.confidence === "heuristic") {
+    return d.tool ? `${d.tool} (model unknown)` : "unspecified model";
+  }
+  // known
+  if (d.tool && d.model.startsWith("unspecified")) return d.tool;
+  return d.tool ? `${d.model} via ${d.tool}` : d.model;
+}

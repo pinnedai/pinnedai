@@ -2,6 +2,55 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.25] — 2026-06-05
+
+Per-repo bug-class tracking foundation + AI-model tagging + `pinned report` dashboard + auto-lesson-enrichment. Sets up the provider-mistake analytics that's the durable paid-tier moat per [[strategic-moat-independent-guardrail]] — neither Anthropic nor Cursor can credibly ship "your Claude bugs vs your GPT bugs" analytics for themselves (irreducible conflict of interest).
+
+### Added — `.pinned/repo-stats.json` (local-first)
+
+Every `pinned sweep` now updates a structured stats file: per-detector hit counts, severity ranking (critical / high / medium / low — `mass-mutation` is critical, money/data-integrity detectors are high, functional regressions are medium, surface checks are low), per-model breakdown, sample hits (bounded to last 10 per detector), 7-day rolling snapshots for trend deltas, repo identity for future cross-repo aggregation.
+
+Atomic write pattern (same as `.last-status.json`). Schema versioned (`version: 1`) so future paid-tier upload doesn't need migration. Free tier: full local data, all detectors, all model tags. Paid tier (coming): cross-repo aggregation + org-wide provider analytics.
+
+### Added — AI-model tagging (`src/aiModel.ts`)
+
+Detection priority:
+1. **Explicit override**: `PINNED_AI_MODEL` env var (and optional `PINNED_AI_TOOL`)
+2. **Hook context**: `PINNED_HOOK_AI_MODEL` set by Claude Code's PostToolUse hook (0.2.25+ hook update wires this)
+3. **BYOK**: `PINNEDAI_BYOK=anthropic|openai|claude-code|github-models` → mapped to a sensible default model label
+4. **Heuristic**: presence of agent-rule-file (`CLAUDE.md` / `.cursorrules` / `.github/copilot-instructions.md` / `AGENTS.md` / `.windsurfrules` / `.clinerules` / etc) → tool tagged, model "unknown"
+5. **Fallback**: `unspecified-model`
+
+The "tool" dimension (which CLI/IDE) is tracked separately from "model" (which LLM). A user can run Claude Code (tool) routing through Anthropic Sonnet 4 (model); both dimensions are captured independently when known.
+
+### Added — `pinned report` command
+
+Local dashboard. Reads `.pinned/repo-stats.json`. Per-detector table sorted by severity then hit count + 7-day trend delta + per-model breakdown + recent samples (newest 3 per detector). Current AI context shown with detection signal for audit trail. `--json` exposes the full schema for the hosted upload path.
+
+### Added — Auto-lesson-enrichment from first-time-bug catches
+
+When `pinned sweep` finds a first-time-bug catch (enum-drift / env-required / supabase-column / expected-header / nullable-result / response-shape / mass-mutation), it auto-appends a model-tagged lesson to `.pinned/ai-lessons.md` + `.pinned/lessons.json`. The lesson surfaces in every agent's rule-context (Claude / Cursor / Copilot) so future edits learn from the catch.
+
+Each lesson carries the AI-model tag. `lessons.json` now includes a `byModel` field per lesson: `{ provider:model:version → { hits, firstSeen, lastSeen, tool } }`. This is the structure the hosted paid-tier dashboard will consume. **Lessons surface to ALL models** — the tag is for analytics + filtering, never for gating which AI sees the rule.
+
+Limited to first-time-bug detectors so the lessons file doesn't flood with noise from happy-path / journey / host-conditional catches (those already create executable pins that ARE the lesson).
+
+### Tier-design notes (free vs paid)
+
+Per [[strategic-moat-independent-guardrail]] + the locked [[free-tier-definition]]:
+- **Free (everything local)**: full `.pinned/repo-stats.json` + model tagging + `pinned report` + auto-lessons. Never gets capped. Local never gets uploaded without explicit opt-in.
+- **Paid (hosted, coming in 0.3.0)**: cross-repo aggregation, org-wide provider-mistake dashboards, anonymized team trends, Slack spike notifications, shared org-wide rule bank. The local schema already structures for this; no migration needed when backend ships.
+
+### Honest scope
+
+0.3.0 hosted analytics endpoint + dashboard UI is **not in this release** — that's backend infrastructure (Cloudflare Worker + paid dashboard at `app.pinnedai.dev`) that needs separate ship. This release is the foundation: local-first data + the upload-ready schema.
+
+### Tested
+
+- All 327/327 vitest tests pass
+- End-to-end manual test: synthetic repo with mass-mutation + enum-drift fixtures → `pinned sweep` writes correctly-tagged stats + lessons → `pinned report` renders dashboard with `anthropic:claude:sonnet-4-6 via claude-code` model attribution when `PINNED_AI_MODEL` is set
+- Stats schema serializes to JSON cleanly via `--json` for paid-tier upload path
+
 ## [0.2.24] — 2026-06-05
 
 ### Added — `mass-mutation` detector (the "AI dropped the `.eq()` filter" defense)
