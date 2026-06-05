@@ -52,30 +52,37 @@ export function App() {
       <header className="hero">
         <div className="container hero-grid">
           <div className="hero-copy">
-            <div className="status-pill">Free beta · Founder Pro waitlist open</div>
-            <h1>Stop your AI coder from repeating bugs.</h1>
+            <div className="status-pill">v0.3.0 · Smoke pins shipped · Free beta</div>
+            <h1>Catch the AI features that look done but never work.</h1>
             <p className="hero-sub">
-              Pinned finds AI-prone failure patterns in your repo and turns them
-              into regression guards.
+              The dominant AI failure mode isn't a crash — it's a feature
+              the agent confidently ships that <em>silently never works</em>.
+              Empty returns. Hung workers. Status strings that don't match
+              the spec. Validation that was never wired up.
             </p>
             <p className="hero-sub hero-sub-2">
-              When your AI drops auth headers, weakens error handling, skips a
-              test, or breaks an app promise, Pinned captures the pattern,
-              audits similar code paths, and keeps future edits from repeating it.
+              Pinned <strong>actually runs your endpoint</strong> and asserts
+              real outcomes — non-empty body, terminal status within bound,
+              rejects bad input, errors cleanly on faults. The assertions are
+              spec-derived invariants (not snapshots of whatever the AI
+              produced), so they catch <em>first-time bugs</em> on day one —
+              no regression baseline needed. Plus the full regression net:
+              Server Actions, paid-API calls, Edge Functions, cron, webhooks,
+              journeys, cross-repo enum-drift contracts.
             </p>
             <p className="loop">
-              <span className="loop-dot">●</span> Bug found
-              <span className="loop-arrow">→</span> guard built
-              <span className="loop-arrow">→</span> siblings audited
-              <span className="loop-arrow">→</span> future edits checked
-              <span className="loop-arrow">→</span> AI lesson saved
+              <span className="loop-dot">●</span> Feature shipped
+              <span className="loop-arrow">→</span> Pinned runs it
+              <span className="loop-arrow">→</span> asserts the spec, not the output
+              <span className="loop-arrow">→</span> RED on broken, GREEN on fixed
+              <span className="loop-arrow">→</span> guards every future edit
             </p>
             <div className="hero-cta-row">
               <a href="#get-started" className="cta cta-primary">Try free beta</a>
               <a href="/proof" className="cta cta-secondary">View proof</a>
             </div>
             <p className="hero-trust">
-              Local-first · No signup · Free beta
+              Local-first · No signup · Free beta · Opt-in execution (safeToExecute defaults to false)
             </p>
           </div>
           <div className="hero-visual">

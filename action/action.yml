@@ -38,7 +38,7 @@
 #         - uses: pinnedai/pinnedai@v0.2.21
 
 name: "pinnedai"
-description: "Permanent guardrails for AI-coded apps. Pin Server Actions, paid-API calls, Edge Functions, cron, Stripe webhooks, journeys + catch first-time bugs (enum drift, undeclared env vars, missing DB columns, webhook header typos, unguarded .find() results, response-shape mismatches) + block AI weakening attempts."
+description: "Smoke-test AI-built features so they actually work — not just parse. Pinned runs your endpoints, asserts real outcomes (non-empty, terminal state within bound, rejects bad input, errors on faults), and catches the AI-shipped-but-never-works bug class. Plus regression net: Server Actions, paid-API calls, Edge Functions, cron, webhooks, journeys; first-time-bug detectors (enum drift incl. cross-repo contracts, undeclared env vars, missing DB columns, webhook header typos, unguarded results, response-shape, mass-mutation); FP suppression + readiness gate + AI-lesson injection + Guard Integrity."
 author: "Michael Zon"
 branding:
   icon: "lock"
