@@ -1020,6 +1020,16 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
       // Cross-file scan — any source file change could shift the
       // producer write set. Full-window replay.
       return null;
+    case "env-required":
+    case "supabase-column":
+    case "response-shape":
+      // Cross-file or repo-wide — any source file change could shift
+      // the invariant. Full-window replay.
+      return null;
+    case "expected-header":
+    case "nullable-result":
+      // File-bound — only touches to this file change the verdict.
+      return [claim.filePath];
   }
 }
 

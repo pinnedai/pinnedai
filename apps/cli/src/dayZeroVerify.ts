@@ -322,6 +322,20 @@ function preflight(claim: Claim, cwd: string): string | null {
       }
       return null;
     }
+    case "env-required":
+    case "supabase-column":
+    case "response-shape":
+      // Cross-file / repo-wide — the test handles missing-source
+      // cases itself with a clear assertion.
+      return null;
+    case "expected-header":
+    case "nullable-result": {
+      const full = join(cwd, claim.filePath);
+      if (!existsSync(full)) {
+        return `file ${claim.filePath} doesn't exist — pin is saved, will verify once it lands`;
+      }
+      return null;
+    }
   }
 }
 

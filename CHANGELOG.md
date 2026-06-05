@@ -2,6 +2,64 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.23] — 2026-06-05
+
+Five new **first-time-bug** detectors per the audit agent's top-5 list. Every other Pinned detector assumes a green baseline to regress from — these five catch bugs at the *moment they're written*, before any baseline exists. All static (no creds, no runtime probes), all precision-gated (10-repo FP sweep), all wire into the existing real-time catching paths (PostToolUse hook + pre-commit + sweep + CI).
+
+### Added — `env-required` (the audit agent's #1)
+
+Walks the repo for `process.env.X` / `Deno.env.get("X")` / `getEnv("X")` reads. Cross-references against declaration sources: `.env.example`, `.env.local.example`, `.env.template`, `.env.sample`, `.env.dist`, `next.config.{js,mjs,ts}` env block, `vercel.json` env, `wrangler.toml [vars]`. Flags every key read in code but missing from every declaration source. The "cloned repo first-runs silently break with undefined env" bug class.
+
+**FP gates**: 60+ Node/Next/Vercel/GitHub-Actions/Cloudflare/Pinned-self built-ins allowlisted. Dynamic reads (`process.env[var]`) skipped. `process.env.X || "default"` and `?? "default"` fallback patterns skipped (handled-missing case). Test/script/migration files skipped. Only fires when ≥1 declaration source exists (no signal → no FP).
+
+**Dyad-app dogfood**: socialideagen flagged 3 missing keys (`ANTHROPIC_API_KEY`, `NEXT_PUBLIC_CLAUDE_DROPLET_SUPABASE_URL`, `NEXT_PUBLIC_CLAUDE_DROPLET_SUPABASE_ANON_KEY`) — exact set the audit predicted. quantasyte 23 missing, quantapact 25 missing, researchAi 4 missing.
+
+### Added — `supabase-column-exists` (the audit agent's #3)
+
+Walks code for `.from("X").select("col1,col2")` / `.eq("col3", ...)` / `.update({col4: ...})` / `.insert({col5: ...})` / `.upsert({col6: ...})`. Cross-references against schema sources: `supabase/migrations/*.sql` (CREATE TABLE + ALTER TABLE ADD COLUMN parser), `database.types.ts` / `db.types.ts` / `types/database.ts` / `types/supabase.ts` (generated types parser). Flags columns code references that the schema doesn't declare. The "runtime error on first query" bug class.
+
+**FP gates**: returns no hits when neither migration nor types source exists (no signal → no FP). Dynamic table/column names (`from(tableVar)`) skipped. Foreign-key relation joins (`users(name)`) handled correctly. PRIMARY/FOREIGN/UNIQUE/CHECK/CONSTRAINT SQL keywords skipped from column extraction. Star-select (`select("*")`) skipped.
+
+**Dyad-app dogfood**: 20 hits across 3 repos with schemas (quantapact 10, MediniDyad 9, researchAi 1). 5 repos without schemas correctly returned no signal.
+
+### Added — `expected-header-present` (the audit agent's #4)
+
+Catches webhook header-name typos. Provider canonical headers: Stripe `stripe-signature`, GitHub `x-hub-signature-256`, Svix `svix-signature`, Twilio `x-twilio-signature`, Shopify `x-shopify-hmac-sha256`. Detects typo variants (e.g. `x-stripe-signature` when canonical is `stripe-signature`, `x-hub-signature` without `-256`) in `headers.get()` / `req.headers["..."]` / `headers.X` reads.
+
+**FP gates**: only fires when file imports the matching SDK (`new Stripe(`, `from "@octokit/`, etc). Skipped when file ALSO contains the canonical header (dual-pattern fallback assumed correct). One hit per file max — the bug is "this handler reads the wrong header," not "many sites read the wrong header."
+
+**Dyad-app dogfood**: 0 hits — all existing webhook handlers use canonical headers. Synthetic positive case verified: handler reading `x-stripe-signature` with Stripe SDK import → flagged. Handler reading canonical `stripe-signature` → no flag.
+
+### Added — `nullable-result-used` (the audit agent's #5)
+
+Catches `arr.find(...)` / `.match()` / `Map.get()` / `regex.exec()` results used without null guard in **server-side request handlers** (`app/**/route.ts`, `*.actions.ts`, `supabase/functions/*/index.ts`, top-level `api/*.ts`). First edge-case input crashes the route with a 500.
+
+**Tight scope (FP gate)**: only fires in server-side handler contexts where a crash = user-visible 500. Library code / utility code / tests skipped. Guards detected: `if (!name)`, `if (name)`, `name?.`, `name ?? `, `name === null`, `name !== undefined`.
+
+**Dyad-app dogfood**: 14 hits across 2 repos (MediniDyad Edge Functions 13, quantapact 1). Each is a real unguarded `.find()`/`.match()` site in a request handler where bad input would 500.
+
+### Added — `response-shape` (the audit agent's #2 — generalizes the socialideagen bug)
+
+Cross-file: finds `fetch("/api/X")` consumers + their key reads, finds the matching `app/api/X/route.ts` producer + its `NextResponse.json({...})` keys, flags when consumer reads a key the producer never emits on 2xx. Generalizes the user's socialideagen `status === "done"` bug to all consumer/producer JSON-key mismatches in same-repo HTTP routes.
+
+**FP gates**: literal-route only (dynamic-path-template variants skipped — too FP-prone for v1). Both destructured (`const { a, b } = await res.json()`) and bound-name (`const data = await res.json(); data.x; data.y`) consumer patterns handled. Skipped when 100% missing AND producer set is tiny (likely error-response shape, not happy-path).
+
+### Tested
+
+- **5 detector positive/negative matrices** via synthetic + real vitest invocation
+- **env-required template matrix**: 3/3 via real vitest (all-declared green / key-removed red on specific key / sources-removed red on source-check)
+- **Combined dyad sweep across 10 repos**: env=53 across 4 repos (correct distribution), supacol=20 across 3 repos with schemas (5 with no schema correctly no-signal), nullable=14 across 2 repos, headers=0 (no typos in corpus — synthetic positive confirms detector works), resp-shape=0 (no key-mismatch in corpus — synthetic positive confirms)
+- **Regression**: 327/327 vitest, typecheck clean
+- **Architecture**: all 5 detectors wire into the existing real-time paths — PostToolUse hook (Claude Code), pre-commit hook (Husky), `pinned sweep` (manual/CI), GitHub Action workflow (PR-time)
+
+### Real-time catching
+
+Same continuous-verification flow as every other Pinned pin:
+- `pinned sweep` ad hoc — surfaces drift on demand
+- pre-commit + pre-push hooks — run `pinned test` before code leaves your machine
+- CI workflow — runs on every PR
+- Claude Code PostToolUse hook — auto-verifies affected pins after every agent edit
+
 ## [0.2.22] — 2026-06-05
 
 First **first-time-bug** detector. Pinned's other detectors assume a green baseline to regress from — this one catches bugs where consumer + producer never agreed in the first place. Closes the socialideagen-dogfood gap (client polled `status === "done"` but the producer never emits that value).

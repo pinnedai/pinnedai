@@ -324,6 +324,18 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       // discovered at test time, not pin time — so no static-coverage
       // file list beyond the consumer.
       return { files: [claim.consumerFile] };
+    case "env-required":
+      // Repo-wide invariant. Use declaration sources as the file
+      // coverage anchor.
+      return { files: claim.declarationSources };
+    case "supabase-column":
+      return { files: claim.schemaSources };
+    case "expected-header":
+      return { files: [claim.filePath] };
+    case "nullable-result":
+      return { files: [claim.filePath] };
+    case "response-shape":
+      return { files: [claim.producerFile, claim.consumerFile], routes: [claim.route] };
   }
 }
 
@@ -506,6 +518,16 @@ function claimLabel(c: Claim): string {
       return `\`🛟 BETA · a11y ${escapeMarkdownCell(c.page)}\` (${c.rules.join(", ")})`;
     case "enum-drift":
       return `\`enum-drift ${escapeMarkdownCell(c.consumerFile)}\` (${escapeMarkdownCell(c.column)} · ${c.confidence})`;
+    case "env-required":
+      return `\`env-required\` (${c.requiredKeys.length} keys · ${c.declarationSources.length} source${c.declarationSources.length === 1 ? "" : "s"})`;
+    case "supabase-column":
+      return `\`supabase-column ${escapeMarkdownCell(c.table)}\` (${c.referencedColumns.length} cols)`;
+    case "expected-header":
+      return `\`expected-header ${escapeMarkdownCell(c.filePath)}\` (${c.provider})`;
+    case "nullable-result":
+      return `\`nullable-result ${escapeMarkdownCell(c.filePath)}:${c.line}\``;
+    case "response-shape":
+      return `\`response-shape ${escapeMarkdownCell(c.route)}\` (${c.consumerReads.length} keys)`;
   }
 }
 

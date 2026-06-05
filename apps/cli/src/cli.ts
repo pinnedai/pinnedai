@@ -3310,6 +3310,16 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `🛟 BETA · Page \`${claim.page}\` keeps passing axe-core a11y rules (${claim.rules.join(", ")}) — catches white-on-white text / invisible labels that page-renders pins go GREEN on`;
     case "enum-drift":
       return `Enum drift defense in \`${claim.consumerFile}\` on column "${claim.column}" — asserts producer-side writes for each consumer-read value still appear in the repo. First-time bug class (consumer + producer never agreed) that regression detectors miss.`;
+    case "env-required":
+      return `Env-var contract: ${claim.requiredKeys.length} key${claim.requiredKeys.length === 1 ? "" : "s"} read by code AND declared in ${claim.declarationSources.join(", ")} stay in sync. First-time bug class — silent undefined-env at deploy time without a regression baseline.`;
+    case "supabase-column":
+      return `Supabase column-exists pin: table "${claim.table}" — ${claim.referencedColumns.length} column${claim.referencedColumns.length === 1 ? "" : "s"} referenced by code stay declared in schema (${claim.schemaSources.join(", ")}). Catches AI removing a column from migrations while code keeps querying it.`;
+    case "expected-header":
+      return `Webhook expected-header: \`${claim.filePath}\` keeps reading the canonical \`${claim.expectedHeader}\` for ${claim.provider}. Catches header-name typos that silently break signature verification.`;
+    case "nullable-result":
+      return `Nullable-result guard: \`${claim.filePath}:${claim.line}\` keeps \`${claim.source}\` either removed OR null-guarded. Catches AI dropping a guard on a route handler that would crash on first edge-case input.`;
+    case "response-shape":
+      return `Response-shape: producer at \`${claim.route}\` keeps emitting ${claim.consumerReads.length} key${claim.consumerReads.length === 1 ? "" : "s"} the consumer reads. Catches AI silently renaming a producer field while consumer code reads the old name.`;
   }
 }
 
@@ -3651,6 +3661,11 @@ program
       detectCronHandlers,
       detectRetroactivePages,
       detectEnumDrift,
+      detectEnvRequired,
+      detectSupabaseColumnExists,
+      detectExpectedHeaders,
+      detectNullableResults,
+      detectResponseShape,
       buildImportGraph,
       findFamilyMembers,
       deriveRouteFromPath: drfp,
@@ -3660,7 +3675,7 @@ program
 
     // 3. Detectors.
     type Proposal = {
-      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility" | "enum-drift";
+      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility" | "enum-drift" | "env-required" | "supabase-column" | "expected-header" | "nullable-result" | "response-shape";
       route: string;
       method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
       filePath: string;
@@ -3851,6 +3866,90 @@ program
           schedule: h.schedule,
           declarationFile: h.declarationFile,
           handlerFile: h.handlerFile,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+
+    // 0.2.23+ Env-required — repo-level config-vs-code invariant.
+    // FIRST-TIME bug class: code reads `process.env.X` for a key that's
+    // not declared in `.env.example` / `vercel.json` env / etc. Cloned-
+    // repo first-runs + deploys silently get undefined.
+    const envHit = detectEnvRequired(tree);
+    if (envHit) {
+      proposals.push({
+        kind: "env-required",
+        route: "env-required",
+        filePath: envHit.declarationSources[0] ?? "",
+        reason: envHit.suggestedPin,
+        claim: {
+          template: "env-required",
+          declarationSources: envHit.declarationSources,
+          requiredKeys: envHit.declaredAndRead,
+          raw: envHit.suggestedPin,
+        },
+      });
+    }
+
+    // 0.2.23+ Four more first-time bug detectors.
+    for (const h of detectSupabaseColumnExists(tree)) {
+      proposals.push({
+        kind: "supabase-column",
+        route: `supacol:${h.table}`,
+        filePath: h.schemaSources[0] ?? "",
+        reason: h.suggestedPin,
+        claim: {
+          template: "supabase-column",
+          table: h.table,
+          referencedColumns: h.referencedColumns,
+          schemaSources: h.schemaSources,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+    for (const h of detectExpectedHeaders(tree)) {
+      proposals.push({
+        kind: "expected-header",
+        route: h.filePath,
+        filePath: h.filePath,
+        reason: h.suggestedPin,
+        claim: {
+          template: "expected-header",
+          filePath: h.filePath,
+          provider: h.provider,
+          expectedHeader: h.expectedHeader,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+    for (const h of detectNullableResults(tree)) {
+      proposals.push({
+        kind: "nullable-result",
+        route: `${h.filePath}:${h.line}`,
+        filePath: h.filePath,
+        reason: h.suggestedPin,
+        claim: {
+          template: "nullable-result",
+          filePath: h.filePath,
+          source: h.source,
+          line: h.line,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+    for (const h of detectResponseShape(tree)) {
+      proposals.push({
+        kind: "response-shape",
+        route: h.route,
+        filePath: h.producerFile,
+        reason: h.suggestedPin,
+        claim: {
+          template: "response-shape",
+          route: h.route,
+          consumerFile: h.consumerFile,
+          producerFile: h.producerFile,
+          consumerReads: h.consumerReads,
+          producerEmits: h.producerEmits,
           raw: h.suggestedPin,
         },
       });
@@ -4117,6 +4216,26 @@ program
         out("  Run: pinned add-browser   then: pinned sweep --include-beta");
         out("");
       }
+    }
+    const envRequiredHits = proposals.filter((p) => p.kind === "env-required");
+    if (envRequiredHits.length > 0 && envHit) {
+      out("🔐 Env-required — first-time deploy bugs (missing-config):");
+      out("");
+      out(`  Declaration sources: ${envHit.declarationSources.join(", ")}`);
+      out(`  Keys read + declared: ${envHit.declaredAndRead.length}`);
+      if (envHit.missingKeys.length > 0) {
+        out("");
+        out(`  ⛔ ${envHit.missingKeys.length} key${envHit.missingKeys.length === 1 ? "" : "s"} READ by code but NOT declared (cloned-repo / deploys silently undefined):`);
+        for (const m of envHit.missingKeys.slice(0, 10)) {
+          out(`     • ${m.key}  (read at ${m.sites.slice(0, 2).map((s) => `${s.filePath}:${s.line}`).join(", ")}${m.sites.length > 2 ? "..." : ""})`);
+        }
+        if (envHit.missingKeys.length > 10) out(`     • …and ${envHit.missingKeys.length - 10} more`);
+        out("");
+        out("  Fix: add the missing keys to your .env.example (or vercel.json env, etc.) — Pinned will keep them in sync going forward.");
+      } else {
+        out("  ✓ Every key code reads is declared somewhere — pin asserts they stay in sync.");
+      }
+      out("");
     }
     const enumDriftConfirmed = proposals.filter((p) => p.kind === "enum-drift" && (p.claim as Extract<Claim, { template: "enum-drift" }>).confidence === "confirmed");
     const enumDriftReview = proposals.filter((p) => p.kind === "enum-drift" && (p.claim as Extract<Claim, { template: "enum-drift" }>).confidence === "review");
@@ -11089,6 +11208,16 @@ function describeClaim(c: Claim): string {
       return `a11y🛟 BETA   ${c.page}  →  axe-core rules: ${c.rules.join(", ")}`;
     case "enum-drift":
       return `enum-drift     ${c.consumerFile}  col=${c.column}  missing=[${c.missingFromProducer.slice(0, 3).join(", ")}${c.missingFromProducer.length > 3 ? "..." : ""}]  (${c.confidence})`;
+    case "env-required":
+      return `env-required   ${c.requiredKeys.length} keys · ${c.declarationSources.join(", ")}`;
+    case "supabase-column":
+      return `supabase-col   table=${c.table}  ${c.referencedColumns.length} cols`;
+    case "expected-header":
+      return `expected-hdr   ${c.filePath}  →  ${c.expectedHeader} (${c.provider})`;
+    case "nullable-result":
+      return `nullable-res   ${c.filePath}:${c.line}  ${c.source}`;
+    case "response-shape":
+      return `response-shape ${c.route}  consumer=${c.consumerFile}  keys=${c.consumerReads.join(",")}`;
   }
 }
 

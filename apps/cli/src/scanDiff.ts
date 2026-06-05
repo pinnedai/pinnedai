@@ -3847,6 +3847,827 @@ export function detectEnumDrift(filesByPath: Map<string, string>): EnumDriftHit[
 }
 
 // ────────────────────────────────────────────────────────────
+// Env-required detector (0.2.23+) — FIRST-TIME bug catching
+// ────────────────────────────────────────────────────────────
+//
+// Catches the class of bug where code reads `process.env.X` for a
+// key that's not declared in `.env.example` / `.env.local.example` /
+// `.env.template` / `next.config.{js,mjs,ts}` env block /
+// `wrangler.toml [vars]` / `vercel.json env`. The deploy goes up,
+// the key is `undefined` in production, the feature silently breaks.
+// No regression baseline needed — the contract is between the code
+// and the declaration source, both inside the same PR.
+//
+// Confirmed real-world bug shape: socialideagen has 13 distinct env
+// reads (ANTHROPIC_API_KEY / SUPABASE_SERVICE_ROLE_KEY / ADMIN_PASSWORD
+// / RESEND_API_KEY / etc) — if `.env.local.example` doesn't list any
+// of them, a developer cloning the repo gets silent `undefined`.
+//
+// Precision gates (kept tight per FP-sweep rule):
+//   1. Built-in / runtime keys always excluded (NODE_ENV, VERCEL_ENV,
+//      npm_*, CI, etc.) — see ENV_BUILTIN_ALLOWLIST.
+//   2. Dynamic reads (`process.env[var]`) skipped — can't know the key.
+//   3. Test files / scripts excluded from the consumer scan.
+//   4. Allow `process.env.X || "default"` and similar `??`/`||` fallbacks
+//      to bypass the check (developer has handled the missing case).
+
+export type EnvRequiredHit = {
+  template: "env-required";
+  // The declaration sources found at repo level + the union of keys
+  // they declare. Tied to the consumer scan so the test can re-verify.
+  declarationSources: string[];
+  declaredKeys: string[];
+  // Map of unrecognized key → list of (file, line) sites that read it.
+  // Only keys with at least one non-fallback read make it here.
+  missingKeys: Array<{ key: string; sites: Array<{ filePath: string; line: number }> }>;
+  // Keys read by code AND declared somewhere. Threaded into the pin so
+  // a future removal-from-declarations fires red.
+  declaredAndRead: string[];
+  suggestedPin: string;
+};
+
+// Built-in env keys that should never be flagged. Adding to this list
+// is cheap; better to over-allowlist than to noisy-FP.
+const ENV_BUILTIN_ALLOWLIST = new Set<string>([
+  // Node + npm tooling
+  "NODE_ENV", "NODE_OPTIONS", "NODE_PATH", "NODE_DEBUG",
+  "PATH", "HOME", "USER", "PWD", "SHELL", "TERM", "LANG",
+  "TMPDIR", "TZ", "CI", "FORCE_COLOR", "NO_COLOR", "COLORTERM",
+  "DEBUG",
+  // Next.js / Vercel
+  "VERCEL", "VERCEL_ENV", "VERCEL_URL", "VERCEL_REGION", "VERCEL_GIT_COMMIT_SHA",
+  "VERCEL_GIT_COMMIT_MESSAGE", "VERCEL_GIT_COMMIT_REF", "VERCEL_GIT_REPO_SLUG",
+  "VERCEL_GIT_REPO_OWNER", "VERCEL_GIT_REPO_ID", "VERCEL_GIT_PROVIDER",
+  "VERCEL_GIT_PULL_REQUEST_ID",
+  "NEXT_RUNTIME", "NEXT_PHASE", "NEXT_PUBLIC_VERCEL_URL", "NEXT_PUBLIC_VERCEL_ENV",
+  "__NEXT_PRIVATE_PREBUNDLED_REACT", "__NEXT_ROUTER_BASEPATH",
+  // GitHub Actions
+  "GITHUB_TOKEN", "GITHUB_ACTOR", "GITHUB_WORKFLOW", "GITHUB_ACTION",
+  "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_JOB", "GITHUB_REF",
+  "GITHUB_SHA", "GITHUB_REPOSITORY", "GITHUB_EVENT_NAME", "GITHUB_HEAD_REF",
+  "GITHUB_BASE_REF", "GITHUB_WORKSPACE", "GITHUB_API_URL", "RUNNER_OS",
+  "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY",
+  "GITHUB_ENV", "GITHUB_PATH", "GITHUB_EVENT_PATH",
+  // GitHub Actions OIDC (set automatically when `id-token: write`)
+  "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL",
+  "ACTIONS_RUNTIME_TOKEN", "ACTIONS_RUNTIME_URL", "ACTIONS_CACHE_URL",
+  // Cloudflare Workers
+  "CF_PAGES", "CF_PAGES_URL", "CF_PAGES_BRANCH", "CF_PAGES_COMMIT_SHA",
+  // Pinned itself (the customer might not have these declared)
+  "PREVIEW_URL", "PINNED_REQUIRE_PREVIEW_URL", "PINNED_ALLOW_PRODUCTION_URL",
+  "PINNED_CATCH_CONFIDENCE", "PINNED_TEST_BYPASS_AUTH", "PINNEDAI_BYOK",
+  "PINNEDAI_ANTHROPIC_KEY", "PINNEDAI_OPENAI_KEY", "PINNEDAI_OPENAI_BASE_URL",
+  "GITHUB_PR_BODY", "GITHUB_PR_TITLE",
+]);
+
+// Files Pinned recognizes as env declaration sources.
+function isEnvDeclarationFile(path: string): boolean {
+  return (
+    /(?:^|\/)\.env(?:\.[\w.-]+)?\.example$/.test(path) ||
+    /(?:^|\/)\.env\.example$/.test(path) ||
+    /(?:^|\/)\.env\.local\.example$/.test(path) ||
+    /(?:^|\/)\.env\.template$/.test(path) ||
+    /(?:^|\/)\.env\.sample$/.test(path) ||
+    /(?:^|\/)\.env\.dist$/.test(path)
+  );
+}
+
+// Extract declared key names from a `.env`-style file. KEY=value
+// lines, with comments stripped + quotes optional.
+function parseEnvFile(content: string): string[] {
+  const keys: string[] = [];
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = /^(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=/i.exec(line);
+    if (m) keys.push(m[1]);
+  }
+  return keys;
+}
+
+// Extract declared env keys from next.config.{js,mjs,ts} `env:` block.
+// Conservative — only handles the literal `env: { KEY: ... }` form.
+function parseNextConfigEnv(content: string): string[] {
+  const keys: string[] = [];
+  const m = /(?:^|[^\w])env\s*:\s*\{([^}]*)\}/.exec(content);
+  if (!m) return keys;
+  const block = m[1];
+  for (const km of block.matchAll(/\b([A-Z][A-Z0-9_]+)\s*:/g)) {
+    keys.push(km[1]);
+  }
+  return keys;
+}
+
+// Extract declared env keys from vercel.json's `env` map.
+function parseVercelJsonEnv(content: string): string[] {
+  try {
+    const j = JSON.parse(content);
+    const env = j?.env;
+    if (env && typeof env === "object" && !Array.isArray(env)) {
+      return Object.keys(env).filter((k) => /^[A-Z][A-Z0-9_]*$/.test(k));
+    }
+  } catch { /* ignore parse fail */ }
+  return [];
+}
+
+// Extract declared keys from wrangler.toml `[vars]` block (Cloudflare).
+function parseWranglerToml(content: string): string[] {
+  const keys: string[] = [];
+  const blockRe = /\[vars\][\s\S]*?(?=\n\[|$)/g;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(content)) !== null) {
+    for (const lm of m[0].matchAll(/^\s*([A-Z][A-Z0-9_]*)\s*=/gm)) {
+      keys.push(lm[1]);
+    }
+  }
+  return keys;
+}
+
+// Extract env-key READS from a source file. Returns (key, line) tuples.
+// Skips reads where the developer immediately provides a fallback
+// (`process.env.X || "default"` / `process.env.X ?? "default"` /
+// `process.env.X || ""`) — those represent handled-missing cases.
+function extractEnvReads(content: string): Array<{ key: string; line: number }> {
+  const out: Array<{ key: string; line: number }> = [];
+  // Strip comments.
+  const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  // Match `process.env.KEY` and `Deno.env.get("KEY")` and `getEnv("KEY")`.
+  const patterns: Array<{ re: RegExp; group: number }> = [
+    { re: /\bprocess\s*\.\s*env\s*\.\s*([A-Z][A-Z0-9_]+)/g, group: 1 },
+    { re: /\bDeno\s*\.\s*env\s*\.\s*get\s*\(\s*['"]([A-Z][A-Z0-9_]+)['"]/g, group: 1 },
+    { re: /\bgetEnv\s*\(\s*['"]([A-Z][A-Z0-9_]+)['"]/g, group: 1 },
+  ];
+  const seenAtIdx = new Set<string>();
+  for (const { re, group } of patterns) {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(stripped)) !== null) {
+      const key = m[group];
+      const idx = m.index;
+      const k = `${key}@${idx}`;
+      if (seenAtIdx.has(k)) continue;
+      seenAtIdx.add(k);
+      // Fallback-check: look ahead for `|| "..."` or `?? "..."` or
+      // `|| ""` immediately after the env read. When present, the
+      // developer has handled the missing case — don't flag.
+      const after = stripped.slice(m.index + m[0].length, m.index + m[0].length + 50);
+      if (/^\s*(?:\|\||\?\?)\s*['"]/.test(after)) continue;
+      const line = (stripped.slice(0, idx).match(/\n/g) || []).length + 1;
+      out.push({ key, line });
+    }
+  }
+  return out;
+}
+
+export function detectEnvRequired(filesByPath: Map<string, string>): EnvRequiredHit | null {
+  // 1. Find declaration sources + collect declared keys.
+  const declaredKeys = new Set<string>();
+  const declarationSources: string[] = [];
+
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isEnvDeclarationFile(filePath)) {
+      declarationSources.push(filePath);
+      for (const k of parseEnvFile(content)) declaredKeys.add(k);
+    } else if (/(?:^|\/)next\.config\.(?:js|mjs|ts|cjs)$/.test(filePath)) {
+      const nextKeys = parseNextConfigEnv(content);
+      if (nextKeys.length > 0) {
+        declarationSources.push(filePath);
+        for (const k of nextKeys) declaredKeys.add(k);
+      }
+    } else if (/(?:^|\/)vercel\.json$/.test(filePath)) {
+      const vercelKeys = parseVercelJsonEnv(content);
+      if (vercelKeys.length > 0) {
+        declarationSources.push(filePath);
+        for (const k of vercelKeys) declaredKeys.add(k);
+      }
+    } else if (/(?:^|\/)wrangler\.toml$/.test(filePath)) {
+      const wranglerKeys = parseWranglerToml(content);
+      if (wranglerKeys.length > 0) {
+        declarationSources.push(filePath);
+        for (const k of wranglerKeys) declaredKeys.add(k);
+      }
+    }
+  }
+
+  // 2. Scan source code for env reads (skip declaration files themselves,
+  // tests, and scripts/migrations/seeds).
+  const reads = new Map<string, Array<{ filePath: string; line: number }>>();
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (isEnvDeclarationFile(filePath)) continue;
+    // Only scan code files for env reads.
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    if (/(?:^|\/)(?:scripts|migrations|seeds|seed|fixtures)\//.test(filePath)) continue;
+    for (const { key, line } of extractEnvReads(content)) {
+      if (ENV_BUILTIN_ALLOWLIST.has(key)) continue;
+      if (!reads.has(key)) reads.set(key, []);
+      reads.get(key)!.push({ filePath, line });
+    }
+  }
+
+  // 3. Bucket reads into declared-and-read vs missing.
+  const missingKeys: Array<{ key: string; sites: Array<{ filePath: string; line: number }> }> = [];
+  const declaredAndRead: string[] = [];
+  for (const [key, sites] of reads.entries()) {
+    if (declaredKeys.has(key)) {
+      declaredAndRead.push(key);
+    } else {
+      missingKeys.push({ key, sites });
+    }
+  }
+
+  // 4. No hit when nothing's missing AND nothing's declared (probably
+  // not a project we should pin).
+  if (missingKeys.length === 0 && declaredAndRead.length === 0) return null;
+  // No hit when there are zero declaration sources — without a declared
+  // ground truth, we can't reliably say what's missing vs intentional.
+  // Surface as a different kind of hit later if needed.
+  if (declarationSources.length === 0) return null;
+
+  declaredAndRead.sort();
+  missingKeys.sort((a, b) => a.key.localeCompare(b.key));
+  const declarationList = declarationSources.sort();
+
+  return {
+    template: "env-required",
+    declarationSources: declarationList,
+    declaredKeys: Array.from(declaredKeys).sort(),
+    missingKeys,
+    declaredAndRead,
+    suggestedPin: missingKeys.length > 0
+      ? `${missingKeys.length} env key${missingKeys.length === 1 ? "" : "s"} read by code but missing from ${declarationList.join(", ")}: ${missingKeys.map((m) => m.key).join(", ")}. New deploys / cloned-repo first-runs will get undefined for these keys.`
+      : `${declaredAndRead.length} env key${declaredAndRead.length === 1 ? "" : "s"} declared + read — pin asserts they stay in sync as the codebase evolves.`,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// Supabase column-exists detector (0.2.23+) — FIRST-TIME bug catching
+// ────────────────────────────────────────────────────────────
+//
+// Catches the bug class: code does `.from("users").select("status,
+// response, error_message")` against a Supabase table where one of
+// those columns doesn't exist. Runtime failure on the first query.
+// No regression baseline needed — schema is the contract.
+//
+// Schema source priority:
+//   1. `supabase/migrations/*.sql` (CREATE TABLE / ALTER TABLE ADD COLUMN)
+//   2. `database.types.ts` (generated types — Tables: { X: { Row: {...} } })
+// If neither exists, the detector returns no signal (skip, don't FP).
+//
+// Cross-repo case (the user's socialideagen-shape bug, where the
+// schema is in a separate daemon repo) lands in "no signal" today.
+// Future: opt-in declared contract artifact, deferred.
+
+export type SupabaseColumnHit = {
+  template: "supabase-column";
+  // The table being queried.
+  table: string;
+  // Columns the code references on this table.
+  referencedColumns: string[];
+  // Columns the schema actually declares for this table.
+  declaredColumns: string[];
+  // Columns referenced but NOT declared — the bug candidates.
+  missingColumns: string[];
+  // Files that reference at least one missing column.
+  consumerSites: Array<{ filePath: string; missingColumns: string[] }>;
+  // The schema source files used as ground truth.
+  schemaSources: string[];
+  suggestedPin: string;
+};
+
+// Parse CREATE TABLE / ALTER TABLE statements from a SQL migration.
+// Returns map of table → set of columns.
+function parseSqlMigration(content: string): Map<string, Set<string>> {
+  const result = new Map<string, Set<string>>();
+  // Strip /* */ comments + -- line comments.
+  const stripped = content
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/--.*$/gm, "");
+  // CREATE TABLE [IF NOT EXISTS] [schema.]name (col defn, ...)
+  const createRe = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.|"public"\.)?["`]?(\w+)["`]?\s*\(([\s\S]*?)\);/gi;
+  let m: RegExpExecArray | null;
+  while ((m = createRe.exec(stripped)) !== null) {
+    const table = m[1];
+    const body = m[2];
+    const cols = new Set<string>();
+    // Split column defs by commas at depth 0 (to skip commas inside
+    // function calls like DEFAULT now() etc).
+    let depth = 0; let start = 0;
+    const parts: string[] = [];
+    for (let i = 0; i < body.length; i++) {
+      const c = body[i];
+      if (c === "(" || c === "[") depth += 1;
+      else if (c === ")" || c === "]") depth -= 1;
+      else if (c === "," && depth === 0) { parts.push(body.slice(start, i)); start = i + 1; }
+    }
+    parts.push(body.slice(start));
+    for (const p of parts) {
+      const t = p.trim();
+      // Skip constraints: PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK, CONSTRAINT
+      if (/^(?:PRIMARY|FOREIGN|UNIQUE|CHECK|CONSTRAINT)\b/i.test(t)) continue;
+      const colMatch = /^["`]?(\w+)["`]?\s/.exec(t);
+      if (colMatch) cols.add(colMatch[1]);
+    }
+    if (!result.has(table)) result.set(table, new Set());
+    for (const c of cols) result.get(table)!.add(c);
+  }
+  // ALTER TABLE name ADD COLUMN col
+  const alterRe = /ALTER\s+TABLE\s+(?:public\.|"public"\.)?["`]?(\w+)["`]?\s+ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?["`]?(\w+)["`]?/gi;
+  while ((m = alterRe.exec(stripped)) !== null) {
+    const table = m[1];
+    const col = m[2];
+    if (!result.has(table)) result.set(table, new Set());
+    result.get(table)!.add(col);
+  }
+  return result;
+}
+
+// Parse `database.types.ts` generated by `supabase gen types`. Looks
+// for `Tables: { <table>: { Row: { <col>: ... } } }`.
+function parseDatabaseTypes(content: string): Map<string, Set<string>> {
+  const result = new Map<string, Set<string>>();
+  // Find `Tables: {` block then per-table Row blocks.
+  const tablesIdx = content.search(/\bTables\s*:\s*\{/);
+  if (tablesIdx === -1) return result;
+  // Walk braces to slice the Tables block.
+  let depth = 0; let start = -1; let end = -1;
+  for (let i = tablesIdx; i < content.length; i++) {
+    const c = content[i];
+    if (c === "{") { if (depth === 0) start = i; depth += 1; }
+    else if (c === "}") { depth -= 1; if (depth === 0) { end = i; break; } }
+  }
+  if (start === -1 || end === -1) return result;
+  const tablesBlock = content.slice(start + 1, end);
+  // Per-table: `<name>: { ... Row: { col: type; ... } ... }`
+  const tableRe = /(\w+)\s*:\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = tableRe.exec(tablesBlock)) !== null) {
+    const table = m[1];
+    if (table === "Row" || table === "Insert" || table === "Update" || table === "Relationships") continue;
+    // Find this table's body
+    let d = 0; let s = -1; let e = -1;
+    for (let i = m.index + m[0].length - 1; i < tablesBlock.length; i++) {
+      const c = tablesBlock[i];
+      if (c === "{") { if (d === 0) s = i; d += 1; }
+      else if (c === "}") { d -= 1; if (d === 0) { e = i; break; } }
+    }
+    if (s === -1 || e === -1) continue;
+    const body = tablesBlock.slice(s + 1, e);
+    // Find Row block within
+    const rowMatch = /\bRow\s*:\s*\{([\s\S]*?)\}/.exec(body);
+    if (!rowMatch) continue;
+    const rowBody = rowMatch[1];
+    const cols = new Set<string>();
+    for (const cm of rowBody.matchAll(/(?:^|\n)\s*(\w+)\s*[:?]/g)) {
+      cols.add(cm[1]);
+    }
+    if (cols.size > 0) {
+      if (!result.has(table)) result.set(table, new Set());
+      for (const c of cols) result.get(table)!.add(c);
+    }
+  }
+  return result;
+}
+
+// Extract Supabase column references from a code file.
+// Returns array of { table, column, kind, line }.
+function extractSupabaseColumnReads(
+  content: string
+): Array<{ table: string; column: string; line: number }> {
+  const out: Array<{ table: string; column: string; line: number }> = [];
+  const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  function lineAt(idx: number) { return (stripped.slice(0, idx).match(/\n/g) || []).length + 1; }
+
+  // .from("<table>").select("col1, col2, ...")
+  const selectRe = /\.\s*from\s*\(\s*['"](\w+)['"]\s*\)\s*\.\s*select\s*\(\s*['"]([^'"]+)['"]/g;
+  let m: RegExpExecArray | null;
+  while ((m = selectRe.exec(stripped)) !== null) {
+    const table = m[1];
+    const selectStr = m[2];
+    // Star or count → no columns to verify.
+    if (selectStr === "*" || selectStr === "count") continue;
+    for (const colRaw of selectStr.split(",")) {
+      // Strip joined-table syntax: `users(name)` → just `users` (foreign-key relation)
+      // Strip alias: `name:profile_name` → use `profile_name`
+      // Strip arrow / count: `count: meta(count)`
+      const col = colRaw.trim().replace(/:.+$/, "").replace(/\(.*$/, "").trim();
+      if (!/^[a-z_][\w]*$/i.test(col)) continue;
+      out.push({ table, column: col, line: lineAt(m.index) });
+    }
+  }
+
+  // .from("<table>").eq("<col>", x) / .order("<col>") / .gt/lt/gte/lte
+  const filterRe = /\.\s*from\s*\(\s*['"](\w+)['"]\s*\)([\s\S]{0,400}?)(?:\.\s*(?:eq|neq|gt|gte|lt|lte|like|ilike|in|order|range|filter)\s*\(\s*['"](\w+)['"])/g;
+  while ((m = filterRe.exec(stripped)) !== null) {
+    const table = m[1];
+    const col = m[3];
+    out.push({ table, column: col, line: lineAt(m.index) });
+  }
+
+  // .from("<table>").update/insert/upsert({ col_a: x, col_b: y })
+  const writeRe = /\.\s*from\s*\(\s*['"](\w+)['"]\s*\)\s*\.\s*(?:update|insert|upsert)\s*\(\s*\{([^{}]*)\}/g;
+  while ((m = writeRe.exec(stripped)) !== null) {
+    const table = m[1];
+    const body = m[2];
+    for (const cm of body.matchAll(/(?:^|[\s,])(\w+)\s*:/g)) {
+      out.push({ table, column: cm[1], line: lineAt(m.index) });
+    }
+  }
+
+  return out;
+}
+
+export function detectSupabaseColumnExists(
+  filesByPath: Map<string, string>
+): SupabaseColumnHit[] {
+  // 1. Build schema source.
+  const tables = new Map<string, Set<string>>();
+  const schemaSources: string[] = [];
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (/(?:^|\/)supabase\/migrations\/[^/]+\.sql$/.test(filePath)) {
+      const parsed = parseSqlMigration(content);
+      if (parsed.size > 0) {
+        schemaSources.push(filePath);
+        for (const [t, cols] of parsed) {
+          if (!tables.has(t)) tables.set(t, new Set());
+          for (const c of cols) tables.get(t)!.add(c);
+        }
+      }
+    } else if (/(?:^|\/)(?:database|db)\.types\.ts$/.test(filePath) ||
+               /(?:^|\/)types\/database\.ts$/.test(filePath) ||
+               /(?:^|\/)types\/supabase\.ts$/.test(filePath)) {
+      const parsed = parseDatabaseTypes(content);
+      if (parsed.size > 0) {
+        schemaSources.push(filePath);
+        for (const [t, cols] of parsed) {
+          if (!tables.has(t)) tables.set(t, new Set());
+          for (const c of cols) tables.get(t)!.add(c);
+        }
+      }
+    }
+  }
+  // No schema source = no signal.
+  if (tables.size === 0) return [];
+
+  // 2. Scan source files for column references.
+  // referencedByTable: table → column → list of sites.
+  const referencedByTable = new Map<string, Map<string, Array<{ filePath: string; line: number }>>>();
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    if (/(?:^|\/)(?:scripts|migrations|seeds|seed|fixtures|supabase\/migrations)\//.test(filePath)) continue;
+    const reads = extractSupabaseColumnReads(content);
+    for (const { table, column, line } of reads) {
+      if (!referencedByTable.has(table)) referencedByTable.set(table, new Map());
+      const byCol = referencedByTable.get(table)!;
+      if (!byCol.has(column)) byCol.set(column, []);
+      byCol.get(column)!.push({ filePath, line });
+    }
+  }
+
+  // 3. Per table, find missing columns.
+  const out: SupabaseColumnHit[] = [];
+  for (const [table, byCol] of referencedByTable) {
+    const declared = tables.get(table);
+    if (!declared) continue; // Code references a table the schema doesn't declare — could be a different schema. Skip.
+    const referencedColumns = Array.from(byCol.keys());
+    const missingColumns = referencedColumns.filter((c) => !declared.has(c));
+    if (missingColumns.length === 0) continue;
+
+    // Group consumer sites.
+    const sitesByFile = new Map<string, string[]>();
+    for (const col of missingColumns) {
+      for (const site of byCol.get(col)!) {
+        if (!sitesByFile.has(site.filePath)) sitesByFile.set(site.filePath, []);
+        if (!sitesByFile.get(site.filePath)!.includes(col)) sitesByFile.get(site.filePath)!.push(col);
+      }
+    }
+    const consumerSites = Array.from(sitesByFile.entries()).map(([filePath, missingColumns]) => ({ filePath, missingColumns }));
+
+    out.push({
+      template: "supabase-column",
+      table,
+      referencedColumns: referencedColumns.sort(),
+      declaredColumns: Array.from(declared).sort(),
+      missingColumns: missingColumns.sort(),
+      consumerSites,
+      schemaSources,
+      suggestedPin: `Supabase column drift on table "${table}": code references ${missingColumns.map((c) => `"${c}"`).join(", ")} but schema (${schemaSources.join(", ")}) doesn't declare them. Runtime error on first query.`,
+    });
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Webhook expected-header detector (0.2.23+) — FIRST-TIME bug catching
+// ────────────────────────────────────────────────────────────
+//
+// Catches header-name typos in webhook handlers. Provider SDKs expect
+// specific header names — Stripe = `stripe-signature`, GitHub = `x-hub-
+// signature-256`, Svix = `svix-signature`, Twilio = `x-twilio-signature`,
+// Resend = `svix-signature`. A handler that reads `x-stripe-signature`
+// (wrong) or `signature` (wrong) on a Stripe webhook silently fails
+// signature-verify on the first request — no regression baseline
+// possible, the bug is wrong from line 1.
+
+export type WebhookHeaderHit = {
+  template: "expected-header";
+  filePath: string;
+  provider: "stripe" | "github" | "svix" | "twilio" | "shopify";
+  readHeader: string;        // what the handler reads
+  expectedHeader: string;    // what the SDK expects
+  line: number;
+  suggestedPin: string;
+};
+
+const PROVIDER_CANONICAL_HEADERS: Array<{
+  provider: WebhookHeaderHit["provider"];
+  expected: string;
+  importMarker: RegExp;
+}> = [
+  { provider: "stripe", expected: "stripe-signature", importMarker: /\bnew\s+Stripe\s*\(|from\s+['"]stripe['"]/ },
+  { provider: "github", expected: "x-hub-signature-256", importMarker: /from\s+['"]@octokit\/|@octokit\/webhooks/ },
+  { provider: "svix", expected: "svix-signature", importMarker: /from\s+['"]svix['"]/ },
+  { provider: "twilio", expected: "x-twilio-signature", importMarker: /\btwilio\s*\(|from\s+['"]twilio['"]/ },
+  { provider: "shopify", expected: "x-shopify-hmac-sha256", importMarker: /from\s+['"]@shopify\/shopify-api['"]/ },
+];
+
+// Common typo variants for canonical header names — any of these
+// strings, when found on a handler that uses the matching SDK, gets
+// flagged.
+const HEADER_TYPO_PATTERNS: Record<string, RegExp[]> = {
+  "stripe-signature": [
+    /\bx-stripe-signature\b/i,
+    /\bstripesignature\b/i,
+    /\bstripe-signature-v\d\b/i,
+    /\bsignature\b/i,
+  ],
+  "x-hub-signature-256": [
+    /\bx-hub-signature\b(?!-256)/i,
+    /\bhub-signature-256\b/i,
+    /\bx-github-signature\b/i,
+    /\bgithub-signature\b/i,
+  ],
+  "svix-signature": [
+    /\bx-svix-signature\b/i,
+    /\bsvix-id\b/i,
+    /\bsvix-timestamp\b/i,
+  ],
+  "x-twilio-signature": [
+    /\btwilio-signature\b/i,
+    /\bx-twilio-sig\b/i,
+  ],
+  "x-shopify-hmac-sha256": [
+    /\bx-shopify-hmac\b(?!-sha256)/i,
+    /\bshopify-hmac-sha256\b/i,
+    /\bx-shopify-signature\b/i,
+  ],
+};
+
+export function detectExpectedHeaders(filesByPath: Map<string, string>): WebhookHeaderHit[] {
+  const out: WebhookHeaderHit[] = [];
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    for (const { provider, expected, importMarker } of PROVIDER_CANONICAL_HEADERS) {
+      if (!importMarker.test(content)) continue;
+      // Skip if file ALSO contains the canonical header — assume the
+      // typo + canonical coexist (e.g. a fallback). Conservative.
+      if (new RegExp(`['"\`]${expected}['"\`]`, "i").test(content)) continue;
+      // Look for typo variants in header-read contexts: headers.get
+      // / req.headers.x / headers["x"]. Dedupe per file (one hit only —
+      // the bug is "this handler reads the wrong header," not "many
+      // sites read the wrong header").
+      let emittedForFile = false;
+      for (const typoRe of HEADER_TYPO_PATTERNS[expected] ?? []) {
+        if (emittedForFile) break;
+        const headerReadRe = new RegExp(
+          `(?:\\bheaders\\s*\\.\\s*get\\s*\\(\\s*['"\`]([^'"\`]+)['"\`]|\\bheaders\\s*\\[\\s*['"\`]([^'"\`]+)['"\`]\\s*\\]|\\bheaders\\s*\\.\\s*([a-zA-Z][\\w-]*)\\b)`,
+          "g"
+        );
+        let hm: RegExpExecArray | null;
+        while ((hm = headerReadRe.exec(content)) !== null) {
+          const readHeader = (hm[1] ?? hm[2] ?? hm[3] ?? "").toLowerCase();
+          if (!readHeader) continue;
+          if (readHeader === expected) continue;
+          if (typoRe.test(readHeader)) {
+            const line = (content.slice(0, hm.index).match(/\n/g) || []).length + 1;
+            out.push({
+              template: "expected-header",
+              filePath,
+              provider,
+              readHeader,
+              expectedHeader: expected,
+              line,
+              suggestedPin: `Webhook handler ${filePath}:${line} reads "${readHeader}" but the ${provider} SDK signs with "${expected}". Signature verification will silently fail on every request.`,
+            });
+            emittedForFile = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Nullable-result-used detector (0.2.23+) — FIRST-TIME bug catching
+// ────────────────────────────────────────────────────────────
+//
+// Catches `arr.find(...)` / `.match()` / `Map.get()` / `regex.exec()`
+// results used without null guard, in server-side request handlers
+// where a crash = 500 to the user. Limited to server-side contexts
+// (`route.ts` / `*.actions.ts` / `supabase/functions/`) to avoid
+// FPs on utility code and tests.
+
+export type NullableResultHit = {
+  template: "nullable-result";
+  filePath: string;
+  // The expression that returned a nullable result.
+  source: string;
+  // The unchecked use site.
+  unguardedAccess: string;
+  line: number;
+  suggestedPin: string;
+};
+
+function isServerSideHandler(path: string): boolean {
+  return /(?:^|\/)(?:app|src\/app)\/.+\/route\.(?:tsx?|jsx?)$/.test(path) ||
+         /\.actions\.(?:tsx?|jsx?)$/.test(path) ||
+         /(?:^|\/)supabase\/functions\/[^/]+\/index\.(?:tsx?|jsx?|mjs)$/.test(path) ||
+         /(?:^|\/)api\/[^/]+\.(?:tsx?|jsx?)$/.test(path);
+}
+
+export function detectNullableResults(filesByPath: Map<string, string>): NullableResultHit[] {
+  const out: NullableResultHit[] = [];
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    if (!isServerSideHandler(filePath)) continue;
+
+    const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    // Pattern: `const <name> = <expr>.find(...)` followed by `<name>.<prop>` or `<name>[<x>]` without prior guard.
+    // Note: `\([^)]*\)` would fail on nested parens (e.g. `find((u) => ...)`).
+    // We use a paren-balanced search instead: match `.find(` / `.match(` /
+    // `.exec(` and walk to the matching close-paren, then look for the
+    // declaration trailer `);`.
+    const callStartRe = /\bconst\s+(\w+)\s*=\s*(\w[\w.()[\]]*?)\.(find|match|exec)\s*\(/g;
+    let dm: RegExpExecArray | null;
+    while ((dm = callStartRe.exec(stripped)) !== null) {
+      const name = dm[1];
+      // Walk paren-balanced from the open paren.
+      const openIdx = dm.index + dm[0].length - 1;
+      let depth = 1;
+      let j = openIdx + 1;
+      while (j < stripped.length && depth > 0) {
+        const c = stripped[j];
+        if (c === '"' || c === "'" || c === "`") {
+          const quote = c;
+          j += 1;
+          while (j < stripped.length && stripped[j] !== quote) {
+            if (stripped[j] === "\\") j += 1;
+            j += 1;
+          }
+        } else if (c === "(") depth += 1;
+        else if (c === ")") depth -= 1;
+        j += 1;
+      }
+      if (depth !== 0) continue;
+      // After the closing paren, expect `;` or whitespace before
+      // statement continuation. Accept either.
+      const source = stripped.slice(dm.index, j).replace(/^\s*const\s+\w+\s*=\s*/, "").trim();
+      const after = stripped.slice(j);
+      // Look for unguarded use: `<name>.<prop>` or `<name>[`. Within 800 chars.
+      const window = after.slice(0, 800);
+      // Guard precedes? `if (!<name>)`, `if (<name>)`, `<name>?.`, `<name> ?? `
+      const guardedRe = new RegExp(
+        `\\bif\\s*\\(\\s*!?\\s*${name}\\s*[)\\?\\&\\|]|\\b${name}\\s*\\?\\.|\\b${name}\\s*\\?\\?\\s|\\b${name}\\s*===\\s*(?:null|undefined)|\\b${name}\\s*!==\\s*(?:null|undefined)`,
+        ""
+      );
+      const useRe = new RegExp(`\\b${name}\\s*\\.\\s*\\w+|\\b${name}\\s*\\[`, "g");
+      let useM: RegExpExecArray | null;
+      while ((useM = useRe.exec(window)) !== null) {
+        const beforeUse = window.slice(0, useM.index);
+        if (guardedRe.test(beforeUse)) break;
+        // Unguarded — emit hit and stop scanning (one per `name`).
+        const line = (stripped.slice(0, dm.index).match(/\n/g) || []).length + 1;
+        out.push({
+          template: "nullable-result",
+          filePath,
+          source,
+          unguardedAccess: useM[0],
+          line,
+          suggestedPin: `Server handler ${filePath}:${line} uses result of \`${source}\` without null-checking — first edge-case input crashes the route with a 500.`,
+        });
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// Response-shape drift detector (0.2.23+) — FIRST-TIME bug catching
+// ────────────────────────────────────────────────────────────
+//
+// Generalizes the user's socialideagen `status === "done"` bug to
+// ALL consumer/producer JSON-key mismatches in same-repo HTTP routes.
+// Find `fetch("/api/X")` consumers + their key reads, find the matching
+// `app/api/X/route.ts` producer + its `NextResponse.json({...})` keys,
+// flag when consumer reads a key the producer never emits on 2xx.
+
+export type ResponseShapeHit = {
+  template: "response-shape";
+  route: string;
+  consumerFile: string;
+  producerFile: string;
+  consumerReads: string[];
+  producerEmits: string[];
+  missingFromProducer: string[];
+  suggestedPin: string;
+};
+
+// Conservative — only fire when route is a literal string in BOTH the
+// fetch call and the file path. Skip path-template variants for v1.
+export function detectResponseShape(filesByPath: Map<string, string>): ResponseShapeHit[] {
+  // 1. Build producer map: route → emitted keys.
+  const producers = new Map<string, { filePath: string; keys: Set<string> }>();
+  for (const [filePath, content] of filesByPath.entries()) {
+    const route = deriveRouteFromPath(filePath);
+    if (!route) continue;
+    const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    const keys = new Set<string>();
+    // NextResponse.json({...}) / Response.json({...}) / res.json({...})
+    const jsonRe = /(?:NextResponse|Response|res)\s*\.\s*json\s*\(\s*\{([^{}]*)\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = jsonRe.exec(stripped)) !== null) {
+      const body = m[1];
+      for (const cm of body.matchAll(/(?:^|[\s,])(\w+)\s*[:,]/g)) keys.add(cm[1]);
+    }
+    if (keys.size > 0) {
+      producers.set(route, { filePath, keys });
+    }
+  }
+
+  // 2. Scan consumers: `fetch("<route>")` / `fetch(\`<route>\`)`,
+  // then capture key reads on the parsed body.
+  const out: ResponseShapeHit[] = [];
+  for (const [consumerFile, content] of filesByPath.entries()) {
+    if (isTestPath(consumerFile)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(consumerFile)) continue;
+    const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    // Find fetch("/api/X") calls.
+    const fetchRe = /\bfetch\s*\(\s*['"`](\/api\/[^'"`?#]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = fetchRe.exec(stripped)) !== null) {
+      const route = m[1];
+      const producer = producers.get(route);
+      if (!producer) continue;
+      if (producer.filePath === consumerFile) continue;
+      // Capture body var: `const <name> = await res.json()` after the fetch.
+      const after = stripped.slice(m.index, m.index + 800);
+      const bodyVarMatch = /\bconst\s+(?:\{\s*([^}]+)\s*\}|(\w+))\s*=\s*await\s+\w+\s*\.\s*json\s*\(\s*\)/.exec(after);
+      const consumerReads = new Set<string>();
+      if (bodyVarMatch) {
+        if (bodyVarMatch[1]) {
+          // Destructured: `const { a, b } = await res.json()`
+          for (const name of bodyVarMatch[1].split(",")) {
+            const n = name.trim().split(":")[0].trim();
+            if (/^[a-zA-Z_$]\w*$/.test(n)) consumerReads.add(n);
+          }
+        } else if (bodyVarMatch[2]) {
+          // Bound name: `const data = await res.json(); data.x; data.y`
+          const name = bodyVarMatch[2];
+          const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const propRe = new RegExp(`\\b${escaped}\\s*\\.\\s*(\\w+)`, "g");
+          let pm: RegExpExecArray | null;
+          while ((pm = propRe.exec(after)) !== null) consumerReads.add(pm[1]);
+        }
+      }
+      if (consumerReads.size === 0) continue;
+      const consumerReadsArr = Array.from(consumerReads).sort();
+      const missing = consumerReadsArr.filter((k) => !producer.keys.has(k));
+      if (missing.length === 0) continue;
+      // Skip when 100% missing AND producer set is tiny (probably an
+      // error-only response shape we shouldn't compare against happy path).
+      if (missing.length === consumerReadsArr.length && producer.keys.size < 2) continue;
+      out.push({
+        template: "response-shape",
+        route,
+        consumerFile,
+        producerFile: producer.filePath,
+        consumerReads: consumerReadsArr,
+        producerEmits: Array.from(producer.keys).sort(),
+        missingFromProducer: missing,
+        suggestedPin: `Response shape drift on ${route}: consumer (${consumerFile}) reads ${missing.map((k) => `"${k}"`).join(", ")} but producer (${producer.filePath}) only emits ${Array.from(producer.keys).sort().map((k) => `"${k}"`).join(", ")}.`,
+      });
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
 // Stripe webhook event-type dispatch detector (0.2.19+)
 // ────────────────────────────────────────────────────────────
 //

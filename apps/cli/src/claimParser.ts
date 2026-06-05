@@ -311,6 +311,13 @@ export function classifyPinStrength(
       // 0.2.22+ static cross-file scan. No HTTP, no preconditions —
       // assertion has a real signal (producer write set membership).
       return "behavioral";
+    case "env-required":
+    case "supabase-column":
+    case "expected-header":
+    case "nullable-result":
+    case "response-shape":
+      // 0.2.23+ static cross-file scans — always behavioral, no preconditions.
+      return "behavioral";
   }
 }
 
@@ -809,7 +816,77 @@ export type Claim =
   | EdgeFunctionWriteClaim
   | CronHandlerClaim
   | PageAccessibilityClaim
-  | EnumDriftClaim;
+  | EnumDriftClaim
+  | EnvRequiredClaim
+  | SupabaseColumnClaim
+  | ExpectedHeaderClaim
+  | NullableResultClaim
+  | ResponseShapeClaim;
+
+// 0.2.23+: Expected-header pin — webhook handler header-name typos.
+export type ExpectedHeaderClaim = {
+  template: "expected-header";
+  filePath: string;
+  provider: "stripe" | "github" | "svix" | "twilio" | "shopify";
+  expectedHeader: string;
+  raw: string;
+};
+
+// 0.2.23+: Nullable-result-used pin — server-side .find()/.match()/etc.
+// result used without null guard. Pin asserts the guard stays in place
+// at the captured site OR the call is removed entirely.
+export type NullableResultClaim = {
+  template: "nullable-result";
+  filePath: string;
+  source: string;       // The .find/.match/.exec call expression
+  line: number;
+  raw: string;
+};
+
+// 0.2.23+: Response-shape drift — consumer reads a JSON key the
+// producer never emits on 2xx.
+export type ResponseShapeClaim = {
+  template: "response-shape";
+  route: string;
+  consumerFile: string;
+  producerFile: string;
+  consumerReads: string[];
+  producerEmits: string[];
+  raw: string;
+};
+
+// 0.2.23+: Supabase column-exists pin — FIRST-TIME bug catching.
+// Catches code that references columns the schema doesn't declare
+// (table `users` queried for column `nickname` that doesn't exist in
+// migrations or database.types.ts). Runtime error on first query.
+export type SupabaseColumnClaim = {
+  template: "supabase-column";
+  table: string;
+  // Columns the code references on this table. Pin asserts each is
+  // still declared in the schema source(s) at test time.
+  referencedColumns: string[];
+  schemaSources: string[];
+  raw: string;
+};
+
+// 0.2.23+: Env-required pin — FIRST-TIME bug catching.
+//
+// Catches the bug class where code reads `process.env.X` but X isn't
+// declared anywhere (`.env.example`, `next.config.js` env block,
+// `vercel.json env`, `wrangler.toml [vars]`). Cloned-repo first-runs
+// + deploys silently get `undefined`. No regression baseline needed —
+// the contract is between the read site and the declaration source,
+// both inside the same PR.
+export type EnvRequiredClaim = {
+  template: "env-required";
+  // Declaration sources found at pin-creation. The test re-checks
+  // these at run time.
+  declarationSources: string[];
+  // Keys read in code AND declared somewhere — these are the live
+  // contract. Test asserts each still appears in a declaration source.
+  requiredKeys: string[];
+  raw: string;
+};
 
 // 0.2.22+: Enum-drift pin — FIRST-TIME bug catching, not regression.
 //
@@ -2438,6 +2515,37 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         check: `Static cross-file scan. Asserts each value the consumer reads still appears as a producer-side write somewhere in the codebase. Catches the FIRST-TIME bug class: AI silently removes a producer write while the consumer keeps reading the value, OR the two sides never agreed in the first place (the socialideagen dogfood shape).`,
       };
     }
+    case "env-required": {
+      return {
+        title: `env-required: ${c.requiredKeys.length} env key${c.requiredKeys.length === 1 ? "" : "s"} read by code AND declared`,
+        promise: `Every env key the code reads (${c.requiredKeys.slice(0, 5).map((k) => `\`${k}\``).join(", ")}${c.requiredKeys.length > 5 ? `, +${c.requiredKeys.length - 5} more` : ""}) is declared in at least one of: ${c.declarationSources.join(", ")}.`,
+        check: `At test time, scans the repo for declaration sources + asserts each captured required-key is still declared. Catches AI silently removing a key from \`.env.example\` while leaving the \`process.env.X\` read — deploys silently break with undefined env.`,
+      };
+    }
+    case "supabase-column":
+      return {
+        title: `supabase-column: table "${c.table}" — ${c.referencedColumns.length} column${c.referencedColumns.length === 1 ? "" : "s"} referenced`,
+        promise: `Every column code references on table \`${c.table}\` is still declared in ${c.schemaSources.join(", ")}.`,
+        check: `Scans migrations / database.types.ts + asserts each captured column is still declared. Catches AI silently removing a column from migrations while the code keeps querying it — runtime error on first query.`,
+      };
+    case "expected-header":
+      return {
+        title: `expected-header: ${c.filePath} reads canonical "${c.expectedHeader}" (${c.provider})`,
+        promise: `The webhook handler keeps reading the canonical ${c.provider} signature header name (\`${c.expectedHeader}\`).`,
+        check: `Asserts the canonical header literal still appears in handler source. Catches typos that silently break signature verification.`,
+      };
+    case "nullable-result":
+      return {
+        title: `nullable-result: ${c.filePath}:${c.line} guards .find/.match/.exec result`,
+        promise: `\`${c.source}\` is either removed OR a null guard was added at the unguarded use site.`,
+        check: `Scans the file at test time. Passes when call is absent, or when a guard pattern (\`if (!x)\` / \`x?.\` / \`x ?? \`) is present near the declaration.`,
+      };
+    case "response-shape":
+      return {
+        title: `response-shape: producer at ${c.route} emits all keys consumer reads`,
+        promise: `Producer ${c.producerFile} still emits ${c.consumerReads.map((k) => `\`${k}\``).join(", ")} in its Response.json(...) literal.`,
+        check: `Asserts each consumer-read key still appears in any Response.json literal in the producer file. Catches AI silently renaming a producer-side field while consumer keeps reading the old name.`,
+      };
   }
 }
 
@@ -2585,6 +2693,16 @@ export function badCaseForClaim(claim: Claim): string {
       return `🛟 BETA: page \`${claim.page}\` failed axe-core a11y check (${claim.rules.join(", ")}) — likely a contrast regression or invisible-text bug that page-renders pins miss.`;
     case "enum-drift":
       return `enum drift in \`${claim.consumerFile}\` — values consumer reads (${claim.missingFromProducer.map((v) => `"${v}"`).join(", ")}) for column "${claim.column}" no longer appear as producer writes anywhere in the repo. AI may have silently removed the producer-side write, or the enum was renamed.`;
+    case "env-required":
+      return `env-required: one or more keys (${claim.requiredKeys.slice(0, 5).map((k) => `\`${k}\``).join(", ")}${claim.requiredKeys.length > 5 ? `, +${claim.requiredKeys.length - 5} more` : ""}) read by code is no longer declared in ${claim.declarationSources.join(", ")} — deploys / cloned repos will silently get undefined.`;
+    case "supabase-column":
+      return `supabase-column: one or more columns on table \`${claim.table}\` referenced by code is no longer declared in ${claim.schemaSources.join(", ")} — runtime error on first query.`;
+    case "expected-header":
+      return `expected-header: webhook handler \`${claim.filePath}\` no longer reads canonical \`${claim.expectedHeader}\` — signature verification silently fails.`;
+    case "nullable-result":
+      return `nullable-result: ${claim.filePath}:${claim.line} still uses \`${claim.source}\` without a null guard — first edge-case input crashes the route.`;
+    case "response-shape":
+      return `response-shape: producer at \`${claim.route}\` no longer emits one or more keys (${claim.consumerReads.slice(0, 3).map((k) => `\`${k}\``).join(", ")}${claim.consumerReads.length > 3 ? `, +${claim.consumerReads.length - 3} more` : ""}) that \`${claim.consumerFile}\` reads.`;
   }
 }
 
@@ -2695,6 +2813,17 @@ export function claimRoute(c: Claim): string | null {
     case "enum-drift":
       // File-bound — surface the consumer file.
       return c.consumerFile;
+    case "env-required":
+      // Repo-level pin — no single file. Surface a sentinel.
+      return null;
+    case "supabase-column":
+      return null;
+    case "expected-header":
+      return c.filePath;
+    case "nullable-result":
+      return c.filePath;
+    case "response-shape":
+      return c.route;
   }
 }
 
@@ -2754,7 +2883,17 @@ export function claimSlug(claim: Claim): string {
                                               ? `a11y-${claim.page}`
                                               : claim.template === "enum-drift"
                                                 ? `enum-drift-${claim.consumerFile}-${claim.column}`
-                                                : claim.route;
+                                                : claim.template === "env-required"
+                                                  ? `env-required-repo`
+                                                  : claim.template === "supabase-column"
+                                                    ? `supacol-${claim.table}`
+                                                    : claim.template === "expected-header"
+                                                      ? `expected-header-${claim.filePath}`
+                                                      : claim.template === "nullable-result"
+                                                        ? `nullable-${claim.filePath}-${claim.line}`
+                                                        : claim.template === "response-shape"
+                                                          ? `response-shape-${claim.route}-${claim.consumerFile}`
+                                                          : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -2873,6 +3012,18 @@ export function claimKey(c: Claim): string {
       return `page-accessibility:${c.page}:${c.rules.sort().join(",")}`;
     case "enum-drift":
       return `enum-drift:${c.consumerFile}:${c.column}`;
+    case "env-required":
+      // Repo-level — one pin per repo. Key on declaration sources so
+      // adding a new source kicks a re-emit.
+      return `env-required:${c.declarationSources.sort().join(",")}`;
+    case "supabase-column":
+      return `supabase-column:${c.table}`;
+    case "expected-header":
+      return `expected-header:${c.filePath}:${c.expectedHeader}`;
+    case "nullable-result":
+      return `nullable-result:${c.filePath}:${c.line}`;
+    case "response-shape":
+      return `response-shape:${c.route}:${c.consumerFile}`;
   }
 }
 
