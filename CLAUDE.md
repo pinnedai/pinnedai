@@ -109,6 +109,40 @@ The iteration went: Migration Guard → AI Change Verifier → Pinned (claims-as
 ### Default behavior
 - Default to **auto mode** in `pinned init` — enables auto-protect (safe mode), pre-commit hook, pre-push hook, Claude statusline, and AI-coder rules in one prompt. Manual mode asks each individually. Auto-commit (PR side, GitHub Action) is also Free as of v0.1 — see updated tier model below for full Free/Pro split.
 
+### Testing rule (LOCKED — every code change must run this before "done")
+
+**HARD TRIGGER:** Before writing any of these words — `tested` / `ready` / `complete` / `done` / `ready to push` / `ready to ship` / `matrix passed` / `shippable` / `verified` — you MUST emit the checklist below with `[x]` or `[ ]` per box. **If any box is `[ ]`, you cannot use the trigger word.** Either do the missing work, or say "skipped X because Y" explicitly. No exceptions.
+
+```
+- [ ] Built clean (typecheck + tsup)
+- [ ] Positive-catch case ran end-to-end against new code path
+- [ ] Negative-skip case ran end-to-end against new code path
+- [ ] Dyad-apps sweep regression (6 repos, exit=0, no novel errors)
+- [ ] Network-touching: server-error path ran (402/429/5xx/unreachable)
+- [ ] vitest existing suite green
+```
+
+Before reporting any code change as complete — feature, fix, refactor, or "tiny" cleanup — you MUST run BOTH halves of the matrix. "Built clean + existing vitest pass" is NOT sufficient.
+
+1. **Positive-catch cases** — assemble a fresh minimal repo (or use a known-good fixture) that the new code SHOULD trigger / fire / catch / upload / write on. Run the changed code path end-to-end and verify the expected observable side-effect actually occurred (network request received, file written, exit code expected, output line matches). Do NOT trust "no error thrown" as proof — per [[feature-audit-signals-must-be-falsifiable]] every test must name the specific observable signal.
+
+2. **Negative-skip cases** — assemble a repo (or set of env conditions) that the new code SHOULD NOT trigger on. Run and verify the side-effect did NOT occur. Disabled / unconfigured / missing-token / wrong-shape — at least one explicit "expected to do nothing" test.
+
+3. **Dyad-apps regression sweep** — per [[fp-check-everything-with-real-tests]] Rule #1, run the changed code path against the dyad-apps real repos (back-in-play / myhpifinal / TradingAndArbIB / aiconciergeairbnb / socialideagen / quantasyte) and verify (a) no crashes, (b) no novel-FP errors introduced. Even when the change isn't a detector edit, sweep-path edits, hook edits, config-write edits, and statusline edits all need this.
+
+4. **Network-touching changes** add a 4th case: the **server-error path**. Stand up a stub server that returns the failure mode (402 / 429 / 5xx / unreachable) and verify the CLI handles it without crashing and writes a usable `lastUploadResult` (or equivalent diagnostic) so the user can see what failed.
+
+If any of those four is "I didn't run it" — say so honestly to the user instead of claiming "tested." Do NOT roll forward to commit/publish until you've actually verified the matrix. The user has caught the "tested → didn't actually test" pattern multiple times in this project; treat this as a P0 rule per [[dont-defer-buildable-fixes]] mentality.
+
+Operational checklist when finishing a code change:
+- [ ] Built clean
+- [ ] vitest green (existing + any new matrix you added)
+- [ ] Positive-catch case ran end-to-end against the new code path
+- [ ] Negative-skip case ran end-to-end against the new code path
+- [ ] Dyad-apps sweep regression (6 repos, exit=0 expected, no novel errors)
+- [ ] Network-touching: server-error path ran; lastUploadResult or equivalent populated
+- [ ] If any box is unchecked, explicitly tell the user before saying "ready to push"
+
 ### What we are NOT
 
 - **Not a code-review bot** (CodeRabbit, Greptile, Copilot Workspace own that)

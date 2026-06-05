@@ -2,6 +2,93 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.3.0] — 2026-06-05
+
+**The wedge feature.** Tier 1 functional smoke pins — Pinned actually executes your feature once at pin-eval and asserts a real outcome. Catches the dominant AI failure mode: "the agent confidently ships a feature that LOOKS done but never actually works" (silent empty return, hung worker, status-string mismatch). Combined with task #146 (Tier 0 agent prompt) shipping the same release, this is the capability that turns Pinned from "protects what works" into "tells you whether it works at all."
+
+### Added — Smoke pin (Tier 1 functional, `smoke-functional` template)
+
+Author declares an entrypoint + assertions; Pinned generates a vitest file that runs the endpoint and asserts the outcome.
+
+**Entrypoint (v0.3.0):** HTTP route. `{ kind: "http-route", method, body?, headers?, defaultBaseUrl? }`. Exported-function + CLI entrypoints land in 0.3.0.x. UI/button (Tier 2 via Playwright) lands in 0.3.1.
+
+**Assertion vocabulary** — derived from the real image-gen bug case study (client polls `status === "done"` while worker writes `"completed"` — the dominant async-feature bug shape):
+
+- `status-ok` — HTTP 2xx
+- `returns-nonempty` — body is not `""` or `"null"`
+- `returns-shape` — body contains a declared substring (`{ mustContain: "<svg" }`)
+- `responds-within` — generous latency ceiling (orphan detection, NOT tight SLA)
+- `reaches-terminal-state` — for async/job-backed features: poll until the response body hits one of the caller's declared terminal states, RED if not terminal within the bound. **This is the assertion that catches the image-gen bug.**
+
+**Opt-in gates** (per `[[anything-annoying-must-be-opt-in]]`):
+
+- `safeToExecute: false` by default. Generated test is SKIPPED with WARN until author flips it. Protects against accidental side-effect execution.
+- `cadence: "on-demand"` by default. Requires `SMOKE_RUN=1` or `PINNED_SMOKE=1` env var to fire under normal `vitest run`. `pre-commit` and `ci-only` cadences also available.
+- Base URL resolution waterfall: `PINNED_SMOKE_BASE_URL` → `PREVIEW_URL` → `PINNED_CI_BASE_URL` → `defaultBaseUrl`. Skipped with WARN if none resolves (no false RED on missing-env).
+
+**Flakiness handling:** Double-confirm — if first run fails, wait 500ms and retry once. If retry passes, smoke is GREEN. If both fail, RED with expected-vs-actual diagnostic message.
+
+**Hard 4-minute test timeout** so a hung remote endpoint doesn't hang vitest forever.
+
+### Verified end-to-end
+
+Real runtime matrix against a stub server:
+- Pin #1 (positive): GREEN — stub returns `status: completed` + `<svg/>`, all 4 assertions pass.
+- Pin #2 (negative, image-gen bug case): RED with exact-expected message `"expected terminal state in [completed, failed] within 3000ms via status; last observed: 'done'"`. **The wedge feature works.**
+- Pin #3 (gated, `safeToExecute: false`): SKIPPED with reason. Opt-in gate honored.
+
+Dyad-apps regression sweep (6 repos): all clean, exit=0, no novel FP errors.
+
+### Stripped — 0.2.26 auto-upload-on-sweep
+
+Auto-upload-on-sweep was prototyped in 0.2.26 but had reliability issues during the matrix and was stripped before ship to avoid polluting the diagnostic trail. Manual upload via `pinned analytics upload` remains the supported path. Auto-upload will land in a follow-up patch once tested against the matrix in [[positive-and-negative-tests-required]].
+
+### Tracked next
+
+- Task #145 — 0.3.1 Tier 2 UI/button smoke pins (Playwright, BETA install gate)
+- Task #146 — Tier 0 agent prompt snippet (ships in 0.3.0 follow-up)
+- Task #147 — PreToolUse Bash hook for checklist gating on commit/publish/push
+- Task #123 — Wire all 7 first-time-bug detectors into PostToolUse + pre-commit hooks (still pending)
+
+---
+
+## [0.2.26] — 2026-06-04
+
+`pinned analytics` CLI command + hosted analytics upload path (opt-in only). Backend Worker endpoint shipped to `apps/edge/` for the 0.3.0 paid-tier dashboard at `app.pinnedai.dev/dashboard`. The opt-in model holds: free tier still gets the full `.pinned/repo-stats.json` + `pinned report` locally; uploads only fire when the customer has explicitly run `pinned analytics enable`.
+
+### Added — `pinned analytics <enable|disable|status|upload>`
+
+- `enable` — writes `.pinned/analytics-config.json` with the endpoint URL + opt-in timestamp. Prints exactly what gets uploaded (per-detector counts, per-model rollup, bounded samples) and what does NOT (source code, file contents, secrets).
+- `disable` — flips the config off. Local stats + `pinned report` keep working unchanged.
+- `status` — shows current opt-in state + endpoint + last upload result.
+- `upload` — manual upload. Requires either a GitHub Actions OIDC token (auto-discovered via `ACTIONS_ID_TOKEN_REQUEST_URL` + `ACTIONS_ID_TOKEN_REQUEST_TOKEN`) or `PINNED_ANALYTICS_TOKEN` env var. Surfaces clear errors when no token is available.
+
+Auto-upload-on-sweep was prototyped but deferred — the integration with the sweep code path had reliability issues during the matrix and shipping it broken would have polluted the diagnostic trail. For 0.2.26, customers manually upload via `pinned analytics upload` (or wire it into CI as a separate step). Auto-upload will land in a follow-up patch once tested end-to-end against the matrix in [[positive-and-negative-tests-required]].
+
+### Added — Cloudflare Worker `POST /v1/repo-stats` (`apps/edge/`)
+
+- OIDC JWT validation against GitHub's JWKS (same model as `/v1/extract`).
+- 256 KB body cap.
+- Subscription gate (Pro+ only — free tier stays local).
+- Pro-tier per-repo monthly upload cap (100 uploads/repo/mo, fair-use).
+- Two-table storage: append-only `repo_stats_uploads` event log + denormalized `detector_model_rollup` for cheap cross-repo dashboard queries.
+- Returns `dashboardUrl` for the customer's org view.
+
+### Privacy posture (load-bearing)
+
+- Opt-in only — never auto-uploads without `pinned analytics enable`.
+- No source code, no file contents, no secrets uploaded. Just the structured `.pinned/repo-stats.json` shape: per-detector counts + per-model rollup + sample file paths + line numbers + plain-English summaries (already bounded to 10 samples per detector on the CLI side).
+- OIDC = repo identity. No API keys, no client-side license keys.
+
+### Tested
+
+- 327/327 vitest pass.
+- `apps/cli` typecheck clean.
+- `apps/edge` typecheck clean.
+- End-to-end smoke: `pinned analytics enable` → `disable` → `status` → `upload` (verified the no-stats and no-token error paths).
+
+---
+
 ## [0.2.25] — 2026-06-05
 
 Per-repo bug-class tracking foundation + AI-model tagging + `pinned report` dashboard + auto-lesson-enrichment. Sets up the provider-mistake analytics that's the durable paid-tier moat per [[strategic-moat-independent-guardrail]] — neither Anthropic nor Cursor can credibly ship "your Claude bugs vs your GPT bugs" analytics for themselves (irreducible conflict of interest).

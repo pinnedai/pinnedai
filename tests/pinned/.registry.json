@@ -1045,6 +1045,81 @@
       "status": "active",
       "covers": {},
       "badCase": "running `node ./apps/cli/dist/cli.js report --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-suggest-context-help-1ek3ae",
+      "prId": "auto-20260605",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js suggest-context --help",
+        "raw": "`node ./apps/cli/dist/cli.js suggest-context --help` exits 0"
+      },
+      "filename": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-suggest-context-help-1ek3ae.test.ts",
+      "pinnedAt": "2026-06-05T13:06:53.963Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js suggest-context --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-check-ready-help-1eqj98",
+      "prId": "auto-20260605",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js check-ready --help",
+        "raw": "`node ./apps/cli/dist/cli.js check-ready --help` exits 0"
+      },
+      "filename": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-check-ready-help-1eqj98.test.ts",
+      "pinnedAt": "2026-06-05T13:06:53.963Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js check-ready --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-blast-radius-help-pejgdh",
+      "prId": "auto-20260605",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js blast-radius --help",
+        "raw": "`node ./apps/cli/dist/cli.js blast-radius --help` exits 0"
+      },
+      "filename": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-blast-radius-help-pejgdh.test.ts",
+      "pinnedAt": "2026-06-05T13:06:53.964Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js blast-radius --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-confirm-help-icr4q2",
+      "prId": "auto-20260605",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js confirm --help",
+        "raw": "`node ./apps/cli/dist/cli.js confirm --help` exits 0"
+      },
+      "filename": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-confirm-help-icr4q2.test.ts",
+      "pinnedAt": "2026-06-05T13:06:53.964Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js confirm --help` exited with non-zero status (command broken)"
+    },
+    {
+      "claimId": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-dismiss-help-175hpy",
+      "prId": "auto-20260605",
+      "claim": {
+        "template": "cli-exits-zero",
+        "route": "node ./apps/cli/dist/cli.js dismiss --help",
+        "raw": "`node ./apps/cli/dist/cli.js dismiss --help` exits 0"
+      },
+      "filename": "auto-20260605-cli-exits-zero-node-apps-cli-dist-cli-js-dismiss-help-175hpy.test.ts",
+      "pinnedAt": "2026-06-05T13:06:53.964Z",
+      "pinnedBy": "michaelzon",
+      "status": "active",
+      "covers": {},
+      "badCase": "running `node ./apps/cli/dist/cli.js dismiss --help` exited with non-zero status (command broken)"
     }
   ]
 }

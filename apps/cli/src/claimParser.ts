@@ -319,6 +319,12 @@ export function classifyPinStrength(
     case "mass-mutation":
       // 0.2.23/0.2.24+ static cross-file scans — always behavioral, no preconditions.
       return "behavioral";
+    case "smoke-functional":
+      // 0.3.0+ smoke pins. Behavioral when a base URL is resolvable
+      // (PINNED_SMOKE_BASE_URL / PREVIEW_URL / etc.) — the test
+      // actually executes the endpoint. Unverified otherwise — same
+      // gating as HTTP templates.
+      return httpVerifiable ? "behavioral" : "unverified";
   }
 }
 
@@ -823,7 +829,236 @@ export type Claim =
   | ExpectedHeaderClaim
   | NullableResultClaim
   | ResponseShapeClaim
-  | MassMutationClaim;
+  | MassMutationClaim
+  | SmokeFunctionalClaim;
+
+// 0.3.0+: Smoke / golden-path pin (Tier 1 — functional smoke).
+//
+// THE wedge feature. Existing detectors catch regressions on things that
+// already work. Smoke pins catch the dominant AI failure mode: the agent
+// confidently ships a feature that LOOKS done but never actually works
+// (silent-empty-return, hung worker, status-string-mismatch). The pin
+// actually exercises the feature once at creation and asserts a real
+// outcome. RED on day one if it never worked = first-time-bug catch with
+// no baseline needed. GREEN = snapshot the observed outcome as the
+// regression baseline for ongoing protection.
+//
+// Real bug class this covers: client polls `status === "done"` while the
+// producer writes `"completed"` — the code parses, types check, every
+// existing detector misses it. A smoke pin asserting `reaches-terminal-
+// state` (with `terminalStates: ["completed", "failed"]`) catches it
+// immediately because the polled value never reaches a declared
+// terminal state within the bound.
+//
+// Tier 1 entrypoints (this release): http-route only. Tier 1.x:
+// exported-function + cli. Tier 2 (0.3.1): ui-button via Playwright.
+// See [[full-stack-roadmap-2026-06-03]] for the BETA browser-adapter
+// install gate.
+// IMPORTANT — anti-snapshot design rule (load-bearing):
+//
+// Smoke-pin assertions MUST be invariants the feature is required to
+// satisfy, NOT snapshots of whatever value the AI's implementation
+// happened to produce. The failure mode being prevented: AI writes
+// the feature, declares "expected = whatever my code returned," pin
+// is green even when the feature is wrong — AI grades its own
+// homework. That's literally the "AI confidently ships broken thing
+// + passing test that agrees with it" bug Pinned exists to catch.
+//
+// Each assertion type below is shaped to be invariant-only:
+//   - `returns-nonempty` — no value to snapshot
+//   - `status-ok` — no value
+//   - `responds-within` — generous bound, not tight SLA
+//   - `reaches-terminal-state` — caller declares terminalStates from
+//     the SPEC, not from the polled value
+//   - `returns-shape` — the ONE assertion with snapshot-risk; the
+//     `mustContain` value should be a spec-derived schema marker
+//     (e.g. "<svg", "\"id\":") NOT a literal of the response body
+//     the AI just produced. See the task #146 agent prompt guidance.
+//
+// Future assertion types added here MUST be designed to be invariant-
+// shaped — never accept an "expected exact value" knob without
+// surrounding guard logic that prevents self-grading.
+export type SmokeAssertion =
+  | { kind: "returns-nonempty" }
+  | { kind: "status-ok" }
+  | { kind: "returns-shape"; mustContain: string }   // spec-derived schema marker, NOT a snapshot of the AI's own output
+  | { kind: "responds-within"; ms: number }          // generous latency ceiling, NOT a tight SLA
+  | {
+      kind: "reaches-terminal-state";
+      // The polling shape. For http-route entrypoint: poll the response
+      // body's `statusPath` until it hits one of `terminalStates`.
+      // For db / log / http-poll sources, see the 0.3.1 hang-detector
+      // expansion (per [[full-stack-roadmap-2026-06-03]] memo).
+      statusPath: string;         // e.g. "status" or "data.status"
+      terminalStates: string[];   // e.g. ["completed", "failed"] — derive from the SPEC, not from the value the worker happens to write
+      boundMs: number;            // e.g. 200000 (3.3 min) — generous, orphan-detection not SLA
+      pollIntervalMs?: number;    // default 2000
+    }
+  | {
+      // 0.3.0+ guard-path assertion. Feed a CONCRETE invalid/disallowed
+      // input, assert the endpoint REJECTS with the expected error shape.
+      // Catches "AI built it but forgot to validate" + "AI built it but
+      // forgot to authorize." The spec said: assert the EXACT rejection,
+      // not "an error."
+      kind: "rejects";
+      // The input override that should trigger rejection (replaces the
+      // entrypoint's normal body for this assertion only).
+      withInput: string | Record<string, unknown>;
+      // What "rejected" looks like — any of these match counts as a
+      // valid rejection. At least one must be specified.
+      expect: {
+        status?: number | number[];       // e.g. 400 / 401 / 403 / 422
+        bodyContains?: string;            // e.g. "validation failed"
+        errorShape?: "json-error" | "text-error"; // basic shape check
+      };
+    }
+  | {
+      // 0.3.0+ failure-path assertion. Simulate a real upstream fault,
+      // assert the feature surfaces a CLEAR error and NEVER silently
+      // passes or hangs. Maps 1:1 onto "AI returned empty after 3min"
+      // failure class.
+      //
+      // Implementation: for http-route entrypoint, the test points the
+      // request at a stub that produces the fault (the customer wires
+      // PINNED_SMOKE_FAULT_URL to a local stub or uses our built-in
+      // fault-injection middleware once that ships). For fn entrypoint
+      // (0.3.0+ task #151) the test stubs the inner dependency.
+      kind: "errors-on";
+      fault: "upstream-empty" | "upstream-hang" | "upstream-5xx" | "upstream-malformed-json";
+      // What "surfaces a clear error" looks like — at least one must
+      // be specified. Either the test should throw, OR the response
+      // shape should clearly indicate failure.
+      expect: {
+        throws?: boolean;                 // function/CLI entrypoint: should throw
+        status?: number | number[];       // http: 5xx code expected
+        bodyContains?: string;            // body should mention the error
+        // Hard timeout — if the feature hasn't surfaced an error or
+        // a success within boundMs, it has SILENTLY HUNG. RED.
+        withinMs: number;
+      };
+    };
+
+export type SmokeFunctionalClaim = {
+  template: "smoke-functional";
+  // The unique-ish identifier — used by claimKey for dedupe + by the
+  // pin filename. For http-route: the route path. The slot is named
+  // `route` for consistency with the existing route-shaped templates
+  // (auth-required, rate-limit, etc.) so the registry/PINS.md/show
+  // renderers don't need a separate code path.
+  route: string;
+  entrypoint:
+    | {
+        kind: "http-route";
+        method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+        // Where to point the request at run time. Resolution order:
+        // PINNED_SMOKE_BASE_URL env → PREVIEW_URL env → CI base ref →
+        // localhost:3000. WARN-on-missing if unresolved.
+        // Author-provided base URL ALWAYS overridden by env at run time
+        // so the same pin works in local-dev / CI / preview.
+        defaultBaseUrl?: string;
+        // Optional request body (JSON).
+        body?: string;
+        // Optional request headers (e.g. content-type, auth).
+        headers?: Record<string, string>;
+      }
+    | {
+        // 0.3.0+ exported-function entrypoint. Pinned imports the
+        // module dynamically, calls the named export with `input`,
+        // asserts the resolved value (or thrown error for failure-path).
+        kind: "fn";
+        // Module path relative to the repo root, e.g. "src/lib/generate.ts".
+        modulePath: string;
+        // Named export to call. "default" supported.
+        exportName: string;
+        // Args passed positionally to the function. JSON-serializable.
+        args: unknown[];
+      }
+    | {
+        // 0.3.0+ CLI entrypoint. Pinned spawns the command, captures
+        // stdout/stderr/exit-code, asserts.
+        kind: "cli";
+        // The bin name (resolved via the customer's node_modules/.bin
+        // or PATH). E.g. "my-tool" or "node".
+        command: string;
+        // Arguments passed to the command.
+        args: string[];
+        // Optional stdin content piped to the command.
+        stdin?: string;
+        // Working directory relative to the repo root. Default ".".
+        cwd?: string;
+      }
+    | {
+        // 0.3.1 BETA Tier 2 ui-button entrypoint. Drives a real
+        // browser via Playwright: navigate to a page, click a
+        // selector, assert DOM/network outcome.
+        //
+        // OPT-IN GATE per [[anything-annoying-must-be-opt-in]] +
+        // [[full-stack-roadmap-2026-06-03]]: the generated test
+        // dynamically imports "@playwright/test" — if Playwright
+        // isn't installed (run `pinned add-browser` to install),
+        // the test SKIPS with a WARN, never RED. Customer pays the
+        // browser install cost only when they want this signal.
+        //
+        // Catches the "AI built the UI but wired it to nothing"
+        // failure class — the bug Tier 1 (functional smoke) misses.
+        kind: "ui-button";
+        // Page URL to navigate to (relative to base URL). Same base-
+        // URL resolution as http-route.
+        page: string;
+        // CSS selector for the element to interact with.
+        selector: string;
+        // What to do — click is the common case.
+        action: "click" | "type" | "select";
+        // For type/select: the value to enter/select.
+        value?: string;
+        // Optional: wait for a specific selector to appear before
+        // asserting (e.g. ".result-image" after clicking generate).
+        waitFor?: string;
+        // Default base URL (overridden by PINNED_SMOKE_BASE_URL env).
+        defaultBaseUrl?: string;
+      }
+    | {
+        // 0.3.0+ async-job entrypoint. Submits a job (via http or fn),
+        // then polls a status source until terminal. Consolidates the
+        // "Tier 1 smoke for async features" and "hang detector"
+        // primitives per the build plan's call-out.
+        kind: "job";
+        submit: {
+          kind: "http" | "fn";
+          // For http: { method, path, body? }
+          // For fn: { modulePath, exportName, args }
+          // Stored as JSON so the template can read it without
+          // discriminating on this union at template-emit time.
+          ref: string;
+          input?: unknown;
+        };
+        poll: {
+          // Where to read the status from. Same `source` shape as the
+          // hang-detector primitive — sweep-time snapshot, not daemon.
+          // - http:<route>            — GET <baseUrl + route>, dig statusPath
+          // - fn:<modulePath#export>  — call the export, dig statusPath
+          // - db / log (0.3.1+)       — future expansion behind L1
+          //   consent flag per [[anything-annoying-must-be-opt-in]]
+          source: string;
+          statusPath: string;       // e.g. "status"
+          terminalStates: string[]; // e.g. ["completed", "failed"]
+          boundMs: number;
+          pollIntervalMs?: number;
+        };
+      };
+  assertions: SmokeAssertion[];
+  // Strictly opt-in execution. False (default) means the generated test
+  // skips itself with a WARN — author flips this once they've reviewed
+  // the side-effect surface. Per the safe-to-execute design.
+  safeToExecute: boolean;
+  // Cadence — author picks where this pin runs. "on-demand" (default)
+  // means it only runs when explicitly invoked (vitest filter / `pinned
+  // smoke run`). "pre-commit" wires it into the hook. "ci-only" gates
+  // it to CI env. Heavy/networked paths default to on-demand so they
+  // don't slow the dev loop.
+  cadence: "on-demand" | "pre-commit" | "ci-only";
+  raw: string;
+};
 
 // 0.2.24+: Mass-mutation pin — catches `.from("X").update({...})` /
 // `.from("X").delete()` calls that no longer have a filter clause.
@@ -2566,6 +2801,17 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         promise: `\`.from("${c.table}").${c.operation}(...)\` at \`${c.filePath}:${c.line}\` still has at least one filter clause (.eq/.match/.in/etc) — OR the call is removed entirely.`,
         check: `Catches AI dropping the .eq() filter clause from an update/delete chain, which would otherwise mutate every row in the table.`,
       };
+    case "smoke-functional": {
+      const epDesc = c.entrypoint.kind === "http-route"
+        ? `${c.entrypoint.method} ${c.route}`
+        : c.route;
+      const assertKinds = c.assertions.map(a => a.kind).join(", ");
+      return {
+        title: `smoke: ${epDesc} actually returns a real outcome`,
+        promise: `Hitting \`${epDesc}\` produces a real, non-broken response (${assertKinds}) — not "the code parses but the feature never works."`,
+        check: `Runs the endpoint at pin-eval; checks each declared assertion (e.g. non-empty body, terminal status, response shape) within the bound. WARN-on-missing-env when no base URL is resolvable. RED on actual feature breakage.`,
+      };
+    }
   }
 }
 
@@ -2725,6 +2971,12 @@ export function badCaseForClaim(claim: Claim): string {
       return `response-shape: producer at \`${claim.route}\` no longer emits one or more keys (${claim.consumerReads.slice(0, 3).map((k) => `\`${k}\``).join(", ")}${claim.consumerReads.length > 3 ? `, +${claim.consumerReads.length - 3} more` : ""}) that \`${claim.consumerFile}\` reads.`;
     case "mass-mutation":
       return `mass-mutation safety: ${claim.operation.toUpperCase()} on "${claim.table}" in \`${claim.filePath}:${claim.line}\` lost its filter clause — would mutate every row in the table.`;
+    case "smoke-functional": {
+      const epDesc = claim.entrypoint.kind === "http-route"
+        ? `${claim.entrypoint.method} ${claim.route}`
+        : claim.route;
+      return `smoke: \`${epDesc}\` no longer produces a real outcome — the feature looks built but fails one of its declared assertions (silent empty return, missing terminal state, wrong shape, or hung worker).`;
+    }
   }
 }
 
@@ -2848,6 +3100,8 @@ export function claimRoute(c: Claim): string | null {
       return c.route;
     case "mass-mutation":
       return c.filePath;
+    case "smoke-functional":
+      return c.route;
   }
 }
 
@@ -3052,6 +3306,14 @@ export function claimKey(c: Claim): string {
       return `response-shape:${c.route}:${c.consumerFile}`;
     case "mass-mutation":
       return `mass-mutation:${c.filePath}:${c.line}:${c.operation}:${c.table}`;
+    case "smoke-functional":
+      // Key on entrypoint kind + identifier so two smoke pins on the
+      // same route but different methods (GET vs POST) get distinct
+      // slots. Assertions are intentionally NOT in the key — adding a
+      // new assertion to an existing pin should update, not duplicate.
+      return c.entrypoint.kind === "http-route"
+        ? `smoke-functional:${c.entrypoint.method}:${c.route}`
+        : `smoke-functional:${c.route}`;
   }
 }
 

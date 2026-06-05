@@ -337,6 +337,14 @@ function preflight(claim: Claim, cwd: string): string | null {
       }
       return null;
     }
+    case "smoke-functional":
+      // Smoke pins assert against a live endpoint, not a source file.
+      // The day-zero verifier's check is "is the underlying artifact
+      // present" — for smoke pins that's "is there a resolvable base
+      // URL". Resolution is run-time only, so day-zero can't fail it
+      // here — the generated test handles missing-env itself with a
+      // WARN skip per the spec.
+      return null;
   }
 }
 

@@ -64,6 +64,34 @@ deprecated, intentional behavior change), run:
 
 Do not just delete the test file — that loses the audit trail.
 
+### When you build a feature that does something — prove it works AND fails right
+
+This is a hard rule. Regression detectors only protect things that already work. They cannot catch the dominant AI failure mode: confidently shipping a feature that LOOKS done but never actually works (silent empty return, hung worker, status-string mismatch). The only thing that catches that is executing the feature and asserting a real outcome.
+
+When you build or change a feature that does something — an endpoint, a button, a generation, a job, an action — do not consider it done until you've written executable tests that actually run it AND cover all three of these, then run them and confirm they pass:
+
+1. **Happy path** — a realistic valid input/interaction. Assert a CONCRETE real outcome — non-empty result, correct shape/fields, success status, and (for async/job-backed features) that it reaches a terminal state within a bound. NOT "it returns 200" — assert the content is actually there. Example: "Submitting a generate request returns a non-empty SVG within 60 seconds."
+2. **Guard path** — a concrete invalid or disallowed input (unauthorized caller, bad/missing field, an action that should be refused). Assert the rejection is the SPECIFIC expected behavior AND no side effect occurred (nothing written, no action taken). Assert the exact rejection, not just "an error."
+3. **Failure path (MANDATORY — non-negotiable)** — simulate a real fault: empty/garbage upstream response, a dependency that times out or hangs, a downstream failure. Assert the feature surfaces a CLEAR error and never silently succeeds or hangs forever. A function that returns empty/null on failure instead of erroring IS A BUG. Write the test that catches it. This is the case that maps 1:1 onto the "AI shipped a feature that returns empty after 3 minutes" failure class.
+
+**Rules so these tests are real, not theater:**
+
+- **Derive the three cases from the requirement / acceptance criteria, NOT from your implementation.** If you only test what you built, your test inherits your bug. Start from "what is this feature supposed to guarantee?" — not from the output values your code happens to produce. Asserting "expected = whatever my code returned" is rubber-stamping your own work; if your code is wrong, your test will be wrong in the same way.
+- **Use concrete inputs and specific assertions.** No \`expect(true)\`, no "it didn't throw." State the exact input and the exact expected output/error.
+- **The tests must EXECUTE the feature** (call the function/route/job, or drive the UI). Don't assert about the source code; assert about the behavior.
+- **If you genuinely can't run a path** (needs prod creds, external service), say so explicitly and mark it as unverified — don't write a fake passing test.
+
+**Anti-snapshot examples:**
+
+- ❌ Don't write: \`expect(response.status).toBe("done")\` if you picked "done" because that's what your code happens to write. Tomorrow another agent reads the spec ("terminal states are completed or failed"), changes your code, and your snapshot test goes red even though the code is now correct.
+- ✅ Do write: \`expect(["completed", "failed"]).toContain(response.status)\` — derived from the spec, robust to your implementation choice.
+- ❌ Don't write: \`expect(body).toBe("<svg width='10' height='10'/>")\` if your code happens to produce that exact SVG. If your code silently returns empty, snapshotting "" as expected leaves the bug invisible.
+- ✅ Do write: \`expect(body.length).toBeGreaterThan(0)\` AND \`expect(body).toContain("<svg")\` — invariants derived from "the feature is supposed to return a non-empty SVG."
+
+Pinned will pin these three so they keep running on every change — and the failure/guard cases are usually the ones that catch "the AI shipped it and it looks done but doesn't actually work."
+
+You can also use \`pinned smoke add\` to declare a Tier 1 smoke pin that Pinned executes itself (with the same invariant-only assertion vocabulary). That's the next rung up — Tier 0 (you write the tests) ladders into Tier 1 (Pinned runs the feature directly) into Tier 2 (Pinned drives the UI in a browser).
+
 ### Never modify these
 
 - \`tests/pinned/*.test.ts\` (generated test files — change only via

@@ -1031,6 +1031,10 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
     case "mass-mutation":
       // File-bound — only touches to this file change the verdict.
       return [claim.filePath];
+    case "smoke-functional":
+      // Smoke pins assert against a runtime endpoint. There's no
+      // single source file we can scope replay to. Full-window replay.
+      return null;
   }
 }
 

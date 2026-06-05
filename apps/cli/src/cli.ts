@@ -3322,6 +3322,13 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `Response-shape: producer at \`${claim.route}\` keeps emitting ${claim.consumerReads.length} key${claim.consumerReads.length === 1 ? "" : "s"} the consumer reads. Catches AI silently renaming a producer field while consumer code reads the old name.`;
     case "mass-mutation":
       return `Mass-mutation safety: ${claim.operation.toUpperCase()} on \`${claim.table}\` in \`${claim.filePath}:${claim.line}\` keeps at least one filter clause. Catches AI dropping the .eq() filter that would mass-mutate every row.`;
+    case "smoke-functional": {
+      const epDesc = claim.entrypoint.kind === "http-route"
+        ? `${claim.entrypoint.method} ${claim.route}`
+        : claim.route;
+      const assertSummary = claim.assertions.map(a => a.kind).join(" + ");
+      return `Smoke pin: \`${epDesc}\` actually returns a real outcome (${assertSummary}). Catches the AI-shipped-but-never-worked failure mode — silent empty returns, hung workers, status-string mismatches.`;
+    }
   }
 }
 
@@ -3980,6 +3987,43 @@ program
     // confidence tiers: "confirmed" (shared vocabulary, real drift),
     // "review" (zero overlap, likely cross-table column collision OR
     // the user's cross-repo external-producer shape — soft signal).
+    // 0.3.0+: cross-repo enum-drift contracts. Load any
+    // .pinned/contracts/*.json the user has dropped — for each, check
+    // every consumer comparison and producer write against the
+    // declared vocabulary. Catches the cross-repo case where the
+    // producer is in another repo and detectEnumDrift's in-repo
+    // precision gate would otherwise drop the signal entirely.
+    try {
+      const { loadContracts, detectContractDrift, describeContractHit } = await import("./contracts.js");
+      const contracts = loadContracts(process.cwd());
+      if (contracts.length > 0) {
+        const contractHits = detectContractDrift(tree, contracts);
+        for (const h of contractHits) {
+          const fakeConsumerFile = h.kind === "consumer-uses-undeclared" ? h.filePath : `${h.filePath} (producer)`;
+          proposals.push({
+            kind: "enum-drift",
+            route: `${h.filePath}:${h.column}`,
+            filePath: h.filePath,
+            reason: describeContractHit(h),
+            beta: false, // contract hits are high-confidence by construction (the user explicitly declared the vocabulary)
+            claim: {
+              template: "enum-drift",
+              consumerFile: fakeConsumerFile,
+              column: h.column,
+              expectedValues: [h.value],
+              observedValues: h.contract.values,
+              missingFromProducer: h.kind === "consumer-uses-undeclared" ? [h.value] : [],
+              producerSamples: [{ filePath: h.contract.sourcePath, column: h.column, value: h.contract.values[0] }],
+              confidence: "confirmed",
+              raw: describeContractHit(h),
+            },
+          });
+        }
+      }
+    } catch {
+      // Contract loading should never block sweep.
+    }
+
     const enumDriftHits = detectEnumDrift(tree);
     for (const h of enumDriftHits) {
       proposals.push({
@@ -4069,10 +4113,38 @@ program
       });
     }
 
+    // 0.3.0+: filter out suppressed proposals per the FP-suppression
+    // store. Per [[anything-annoying-must-be-opt-in]] and the build
+    // plan's "FP fatigue kills adoption faster than misses" rule.
+    let suppressedCount = 0;
+    try {
+      const { readStore, isSuppressed, fingerprintFor } = await import("./suppressions.js");
+      const store = readStore(process.cwd());
+      if (store.suppressions.length > 0) {
+        const filtered: Proposal[] = [];
+        for (const p of proposals) {
+          const fp = fingerprintFor(p.claim.template, p.claim as unknown as Record<string, unknown>);
+          if (isSuppressed(store, p.claim.template, p.filePath ?? "", fp)) {
+            suppressedCount++;
+            continue;
+          }
+          filtered.push(p);
+        }
+        proposals.length = 0;
+        proposals.push(...filtered);
+      }
+    } catch {
+      // Suppression store should never block sweep.
+    }
+
     // 4. Print summary.
     out("");
     out("◆ Pinned · SWEEP");
     out("");
+    if (suppressedCount > 0) {
+      out(`(${suppressedCount} hit${suppressedCount === 1 ? "" : "s"} suppressed via .pinned/suppressions.json — see \`pinned suppress list\`)`);
+      out("");
+    }
     if (proposals.length === 0 && serverActionHits.length === 0) {
       out("✓ No new families or unprotected flows found. Your tree is fully covered against the");
       out("  precision-bound detectors (host-conditional, write-endpoint, retroactive journey).");
@@ -5328,8 +5400,9 @@ program
     out(`◆ Pinned · per-repo bug-class report`);
     out(`  Last updated: ${stats.lastUpdated.slice(0, 16).replace("T", " ")}`);
     out("");
-    out(`${"DETECTOR".padEnd(28)} ${"SEV".padEnd(8)} ${"TOTAL".padEnd(8)} ${"7d".padEnd(8)} MODELS`);
-    out("─".repeat(80));
+    const { catchConfirmedRate } = await import("./repoStats.js");
+    out(`${"DETECTOR".padEnd(26)} ${"SEV".padEnd(6)} ${"TOTAL".padEnd(6)} ${"REAL".padEnd(6)} ${"FP".padEnd(5)} ${"RATE".padEnd(7)} ${"7d".padEnd(6)} MODELS`);
+    out("─".repeat(95));
     for (const [name, ds] of detectors) {
       const sev = ds.severity.toUpperCase();
       const t = trendDelta(stats, name, 7);
@@ -5339,7 +5412,37 @@ program
         .slice(0, 3)
         .map(([m, ms]) => `${m}=${ms.hits}`)
         .join(" ");
-      out(`${name.padEnd(28)} ${sev.padEnd(8)} ${String(ds.totalHits).padEnd(8)} ${trend.padEnd(8)} ${modelSummary}`);
+      // 0.3.0+ catch-confirmed-rate columns (task #158)
+      const real = String(ds.confirmedReal ?? 0);
+      const fp = String(ds.dismissedFP ?? 0);
+      const rate = catchConfirmedRate(ds);
+      const rateStr = rate === null ? "—" : `${Math.round(rate * 100)}%`;
+      out(`${name.padEnd(26)} ${sev.padEnd(6)} ${String(ds.totalHits).padEnd(6)} ${real.padEnd(6)} ${fp.padEnd(5)} ${rateStr.padEnd(7)} ${trend.padEnd(6)} ${modelSummary}`);
+    }
+    out("");
+    out("REAL = confirmed real catches (user acted on the flag).");
+    out("FP   = dismissed as false positive.");
+    out("RATE = REAL / (REAL + FP). — when no resolved evidence yet.");
+
+    // 0.3.0+ (task #157): smoke-pin flake classification.
+    const { readHistory, classifyAll } = await import("./smokeHistory.js");
+    const flakeHist = readHistory(pinnedDir);
+    if (flakeHist.runs.length > 0) {
+      const classified = classifyAll(flakeHist);
+      const brokenOrFlaky = classified.filter((c) => c.classification === "broken" || c.classification === "flaky");
+      if (brokenOrFlaky.length > 0) {
+        out("");
+        out("─".repeat(80));
+        out("Smoke-pin flake status  (Tier 1 pins, last 10 non-skip runs each):");
+        out("");
+        out(`${"PIN".padEnd(48)} ${"STATUS".padEnd(10)} ${"GREEN".padEnd(7)} ${"RED".padEnd(5)} RED-RATE`);
+        out("─".repeat(80));
+        for (const c of brokenOrFlaky) {
+          out(`${c.claimId.padEnd(48)} ${c.classification.toUpperCase().padEnd(10)} ${String(c.greenCount).padEnd(7)} ${String(c.redCount).padEnd(5)} ${Math.round(c.redRate * 100)}%`);
+        }
+        out("");
+        out("Flaky = mix of green and red. Investigate via vitest --reporter=verbose to see what's intermittent.");
+      }
     }
     out("");
     out("─".repeat(80));
@@ -5355,6 +5458,38 @@ program
       }
       out("");
     }
+    // ---------- Tier 0 smoke-test coverage section (0.3.0+) ----------
+    // The selling output: which features have happy/guard/failure
+    // tests, and which are missing one. "AI only tested the happy
+    // path" becomes visible here.
+    const { findSmokeMarkers, rollupCoverage, findCoverageGaps } = await import("./smokeTier0.js");
+    const markers = findSmokeMarkers(process.cwd());
+    const coverage = rollupCoverage(markers);
+    const gaps = findCoverageGaps(coverage);
+    if (coverage.length > 0 || markers.length > 0) {
+      out("─".repeat(80));
+      out("Tier 0 smoke-test coverage  (// @pinned-smoke <feature> happy/guard/failure):");
+      out("");
+      out(`${"FEATURE".padEnd(28)} ${"HAPPY".padEnd(7)} ${"GUARD".padEnd(7)} ${"FAILURE".padEnd(8)} GAPS`);
+      out("─".repeat(80));
+      const tick = (b: boolean) => (b ? "✓" : "✗");
+      for (const c of coverage) {
+        const missing: string[] = [];
+        if (!c.hasHappy) missing.push("happy");
+        if (!c.hasGuard) missing.push("guard");
+        if (!c.hasFailure) missing.push("failure");
+        const gapNote = missing.length === 0 ? "—" : `missing ${missing.join(", ")}`;
+        out(`${c.feature.padEnd(28)} ${tick(c.hasHappy).padEnd(7)} ${tick(c.hasGuard).padEnd(7)} ${tick(c.hasFailure).padEnd(8)} ${gapNote}`);
+      }
+      if (gaps.length > 0) {
+        out("");
+        out(`! ${gaps.length} feature${gaps.length === 1 ? " has" : "s have"} incomplete smoke coverage.`);
+        out("  The failure case is the load-bearing one — it catches \"AI shipped feature that looks done but never works.\"");
+        out("  See tests/pinned/AGENT.md for the spec, or `pinned smoke add` for Pinned-executed Tier 1 pins.");
+      }
+      out("");
+    }
+
     // Current AI-model context.
     const currentModel = detectAiModel();
     out(`Current AI context: ${formatAiModelLabel(currentModel)}  (signal: ${currentModel.signal})`);
@@ -5363,6 +5498,705 @@ program
     out("Paid tier (coming): cross-repo aggregation + provider-mistake analytics across your org.");
     out("");
   });
+
+// ---------- analytics (0.3.0+) ----------
+// Hosted analytics opt-in. Free tier ships full local data
+// (.pinned/repo-stats.json + `pinned report`). Pro+ tier ships the
+// same data PLUS cross-repo + org-wide provider-mistake analytics at
+// app.pinnedai.dev/dashboard. The customer explicitly opts in via
+// `pinned analytics enable` — never auto-uploaded.
+//
+// Privacy posture: no source code, no file contents, no secrets.
+// Just the structured stats (per-detector counts + per-model rollup +
+// sample file paths + line numbers + plain-English summaries already
+// bounded by repoStats.ts). The customer sees exactly what's being
+// uploaded by running `pinned report --json` first.
+//
+// ---------- suggest-context (0.3.0+, task #156) ----------
+// PreToolUse-hook surface. Given the file path the agent is about to
+// edit, return the most relevant lesson(s) from .pinned/lessons.json
+// — the lessons that previously caught bugs in similar files.
+//
+// "Pinned makes your AI stop re-making the same mistake."
+//
+// Output is bounded (default 3 lessons) so PreToolUse output stays
+// readable. Zero network — pure filesystem.
+program
+  .command("suggest-context <file>")
+  .description("Print the most relevant AI-coder lessons for the given file path. Wire into PreToolUse hooks (Edit/Write) so the agent sees them BEFORE editing. Zero network.")
+  .option("--limit <n>", "Max number of lessons to surface (default: 3).", "3")
+  .option("--json", "Emit JSON instead of human-readable.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (file: string, opts: { limit: string; json?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet && !opts.json) printBanner();
+    const { readLessonsJson } = await import("./aiLessons.js");
+    const lessons = readLessonsJson();
+    const limit = Number(opts.limit);
+    // Relevance scoring:
+    //   - exact appliesTo glob match → score 100
+    //   - basename match → score 50
+    //   - directory match → score 25
+    //   - empty/missing appliesTo (universal lesson) → score 10
+    function relevance(l: { appliesTo?: string[] }): number {
+      if (!l.appliesTo || l.appliesTo.length === 0) return 10;
+      let best = 0;
+      const fileLower = file.toLowerCase();
+      for (const pat of l.appliesTo) {
+        const p = pat.toLowerCase();
+        if (fileLower === p) { best = Math.max(best, 100); continue; }
+        // simple glob: trailing /** matches subtree
+        if (p.endsWith("/**") && fileLower.startsWith(p.slice(0, -3))) { best = Math.max(best, 75); continue; }
+        if (p.endsWith("*") && fileLower.startsWith(p.slice(0, -1))) { best = Math.max(best, 75); continue; }
+        // file basename match
+        const fileBase = file.split("/").pop()?.toLowerCase() ?? "";
+        if (fileBase && p.endsWith(fileBase)) { best = Math.max(best, 50); continue; }
+        // dir match
+        if (fileLower.startsWith(p + "/") || fileLower.startsWith(p)) { best = Math.max(best, 25); continue; }
+      }
+      return best;
+    }
+    const scored = lessons
+      .map((l) => ({ lesson: l, score: relevance(l) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+    const top = scored.slice(0, limit).map((x) => x.lesson);
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ file, relevant: top, totalMatched: scored.length }, null, 2) + "\n");
+      return;
+    }
+    if (top.length === 0) {
+      out(`No prior lessons relevant to ${file}.`);
+      return;
+    }
+    out(`Relevant AI-coder lessons for ${file} (${top.length} of ${scored.length}):`);
+    out("");
+    for (const l of top) {
+      out(`◆ ${l.rule}`);
+      if (l.plainEnglish && l.plainEnglish !== l.rule) out(`  ${l.plainEnglish}`);
+      if (l.pastMistakes.length > 0) {
+        out(`  Past catches: ${l.pastMistakes.slice(0, 2).join("; ")}${l.pastMistakes.length > 2 ? ` (+${l.pastMistakes.length - 2} more)` : ""}`);
+      }
+      out("");
+    }
+    if (scored.length > limit) {
+      out(`(${scored.length - limit} more relevant lessons — run \`pinned suggest-context ${file} --limit ${scored.length}\` to see all.)`);
+    }
+  });
+
+// ---------- check-ready (0.3.0+, tasks #147 + #155) ----------
+// Pre-commit / pre-push / CI / AI-loop readiness gate. Returns exit
+// code 0 (pass) / 1 (blocked). Designed to be called from:
+//   - pre-commit hook script
+//   - CI workflow step
+//   - Claude Code PreToolUse hook on Bash commands matching
+//     git-commit / git-push / npm-publish / gh-pr-merge / etc.
+program
+  .command("check-ready")
+  .description("Pinned readiness gate. Pure filesystem — zero network. Exit 0 = ready to ship, exit 1 = blocked (with reasons). Opt-in; wire via `pinned init --enable-readiness-gate`.")
+  .option("--base <ref>", "Git base ref to diff against (default: origin/main if available, else HEAD~1).", "")
+  .option("--strict", "Block on open (unresolved) catch events too. Default: only block on RED smoke pins + stale runs.")
+  .option("--stale-after <hours>", "Smoke-pin run becomes stale after N hours. Default: 24.", "24")
+  .option("--json", "Emit JSON instead of human-readable.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (opts: { base: string; strict?: boolean; staleAfter: string; json?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet && !opts.json) printBanner();
+    const { evaluateReadinessGate } = await import("./readinessGate.js");
+    const cwd = process.cwd();
+    // Compute changed files via git. Best-effort; falls back to empty
+    // list (no files) if git is unavailable, which means no smoke pins
+    // get flagged — gate passes by default.
+    let changedFiles: string[] = [];
+    try {
+      const base = opts.base || (() => {
+        try {
+          execFileSync("git", ["rev-parse", "--verify", "origin/main"], { cwd, stdio: "ignore" });
+          return "origin/main";
+        } catch { return "HEAD~1"; }
+      })();
+      const raw = execFileSync("git", ["diff", "--name-only", base], { cwd, encoding: "utf8" });
+      changedFiles = raw.split("\n").map((s) => s.trim()).filter(Boolean);
+    } catch { /* git unavailable — pass through */ }
+    const result = evaluateReadinessGate({
+      cwd,
+      changedFiles,
+      blockOnOpenCatches: !!opts.strict,
+      staleAfterSeconds: Number(opts.staleAfter) * 60 * 60,
+    });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      process.exit(result.pass ? 0 : 1);
+    }
+    out(result.summary);
+    process.exit(result.pass ? 0 : 1);
+  });
+
+// ---------- blast-radius (0.3.0+, task #154) ----------
+// "You edited authHelper.ts → re-smoked 4 dependents, signup went red."
+// Pure filesystem traversal (no network). Used by PostToolUse hooks
+// and `pinned smoke run --affected-by <file>`.
+program
+  .command("blast-radius <files...>")
+  .description("Print the smoke pin claim-ids whose entrypoint is a dependent of the given file(s). Pure filesystem traversal — zero network. Use for PostToolUse re-smoke targeting.")
+  .option("--max-depth <n>", "Max transitive importer depth (default: 4).", "4")
+  .option("--json", "Emit JSON instead of human-readable.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (files: string[], opts: { maxDepth: string; json?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet && !opts.json) printBanner();
+    const { buildDependencyGraph, buildSmokePinIndex, affectedSmokePins } = await import("./blastRadius.js");
+    const { readRegistry } = await import("./registry.js");
+    const cwd = process.cwd();
+    const graph = buildDependencyGraph(cwd);
+    const reg = readRegistry("tests/pinned");
+    const claims = reg.claims
+      .filter((c) => c.status === "active")
+      .map((c) => ({ claimId: c.claimId, claim: c.claim }));
+    const index = buildSmokePinIndex(claims);
+    const affected = affectedSmokePins(index, files, graph, { maxDepth: Number(opts.maxDepth) });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ affectedClaimIds: affected, files, maxDepth: Number(opts.maxDepth) }, null, 2) + "\n");
+      return;
+    }
+    if (affected.length === 0) {
+      out(`No smoke pins affected by changes to: ${files.join(", ")}`);
+      return;
+    }
+    out(`${affected.length} smoke pin${affected.length === 1 ? "" : "s"} affected by changes to: ${files.join(", ")}`);
+    out("");
+    for (const id of affected) out(`  - ${id}`);
+    out("");
+    out(`To re-run them: vitest run $(${affected.map((id) => `'tests/pinned/${id}.test.ts'`).join(" ")})`);
+  });
+
+// ---------- confirm / dismiss (0.3.0+, task #158) ----------
+// Explicit confirm/dismiss for catch events. Inferred confirm/dismiss
+// also runs at every sweep via inferEventResolutions — these CLI
+// commands are the manual override.
+program
+  .command("confirm <event-id>")
+  .description("Mark a catch event as a real catch (the user acted on it). Updates .pinned/repo-stats.json. Local-only — no network.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (eventId: string, opts: { quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const { readRepoStats, writeRepoStats, resolveEvent } = await import("./repoStats.js");
+    const pinnedDir = ".pinned";
+    const stats = readRepoStats(pinnedDir);
+    const { stats: next, resolved, detector } = resolveEvent(stats, eventId, "confirmed");
+    if (!resolved) {
+      err(`✗ No open event with id "${eventId}". Use \`pinned report\` to see event ids.\n`);
+      process.exit(1);
+    }
+    writeRepoStats(pinnedDir, next);
+    out(`✓ ${eventId} (${detector}) marked CONFIRMED. Counted as a real catch in \`pinned report\`.`);
+  });
+
+program
+  .command("dismiss <event-id>")
+  .description("Mark a catch event as a false positive. Updates .pinned/repo-stats.json. Consider also `pinned suppress add` to prevent future re-fires of the same hit.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (eventId: string, opts: { quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const { readRepoStats, writeRepoStats, resolveEvent } = await import("./repoStats.js");
+    const pinnedDir = ".pinned";
+    const stats = readRepoStats(pinnedDir);
+    const { stats: next, resolved, detector } = resolveEvent(stats, eventId, "dismissed");
+    if (!resolved) {
+      err(`✗ No open event with id "${eventId}". Use \`pinned report\` to see event ids.\n`);
+      process.exit(1);
+    }
+    writeRepoStats(pinnedDir, next);
+    out(`- ${eventId} (${detector}) marked DISMISSED.`);
+    out("  To prevent future re-fires of the same hit, also run:");
+    out(`    pinned suppress add --detector <name> --file <path> --fingerprint <fp> --reason '...'`);
+  });
+
+// ---------- suppress (0.3.0+) ----------
+// FP suppression store. Per [[anything-annoying-must-be-opt-in]] +
+// the build plan's "FP fatigue kills adoption faster than misses"
+// rule. Dismissed flags persist so they never re-fire on subsequent
+// sweeps.
+program
+  .command("suppress <action>")
+  .description(
+    "FP suppression store. Actions: add | list | remove. `add` dismisses a detector hit by its signature so future sweeps skip it. `list` shows all active suppressions. `remove <id>` undoes a suppression."
+  )
+  .option("--detector <name>", "Detector name (required for add: enum-drift / contract-drift / env-required / supabase-column / expected-header / nullable-result / response-shape / mass-mutation).")
+  .option("--file <path>", "File path the suppression applies to (required for add).")
+  .option("--fingerprint <s>", "Stable fingerprint string (required for add). See `pinned report --json` for the per-hit fingerprint.")
+  .option("--reason <text>", "Why this hit is intentional. Required — forces an explicit rationale in the audit trail.")
+  .option("--id <id>", "Suppression id (required for remove).")
+  .option("--json", "JSON output.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (
+    action: string,
+    opts: {
+      detector?: string;
+      file?: string;
+      fingerprint?: string;
+      reason?: string;
+      id?: string;
+      json?: boolean;
+      quiet?: boolean;
+    }
+  ) => {
+    if (!opts.quiet) printBanner();
+    const { readStore, writeStore, addSuppression, removeSuppression } = await import("./suppressions.js");
+    const cwd = process.cwd();
+    let store = readStore(cwd);
+    if (action === "list") {
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(store, null, 2) + "\n");
+        return;
+      }
+      if (store.suppressions.length === 0) {
+        out("No active suppressions.");
+        return;
+      }
+      out(`${store.suppressions.length} active suppression${store.suppressions.length === 1 ? "" : "s"}:`);
+      out("");
+      for (const s of store.suppressions) {
+        out(`  ${s.id}`);
+        out(`    file:        ${s.filePath}`);
+        out(`    fingerprint: ${s.fingerprint}`);
+        out(`    reason:      ${s.reason}`);
+        out(`    dismissed:   ${s.dismissedAt.slice(0, 16).replace("T", " ")}${s.dismissedBy ? ` by ${s.dismissedBy}` : ""}`);
+        out("");
+      }
+      out("To remove one: pinned suppress remove --id <id>");
+      return;
+    }
+    if (action === "add") {
+      if (!opts.detector || !opts.file || !opts.fingerprint || !opts.reason) {
+        err("✗ `pinned suppress add` requires --detector, --file, --fingerprint, and --reason.\n");
+        err("  Example: pinned suppress add --detector enum-drift --file src/poll.ts --fingerprint 'column=status;missing=done' --reason 'legacy compat path, will retire in Q3'\n");
+        process.exit(2);
+      }
+      const { store: nextStore, added, entry } = addSuppression(store, {
+        detector: opts.detector,
+        filePath: opts.file,
+        fingerprint: opts.fingerprint,
+        reason: opts.reason,
+      });
+      writeStore(cwd, nextStore);
+      if (added) {
+        out(`+ ${entry.id}`);
+        out("");
+        out(`  file:        ${entry.filePath}`);
+        out(`  fingerprint: ${entry.fingerprint}`);
+        out(`  reason:      ${entry.reason}`);
+      } else {
+        out(`= ${entry.id} (already suppressed)`);
+      }
+      return;
+    }
+    if (action === "remove") {
+      if (!opts.id) {
+        err("✗ `pinned suppress remove` requires --id <id>. Use `pinned suppress list` to see ids.\n");
+        process.exit(2);
+      }
+      const { store: nextStore, removed } = removeSuppression(store, opts.id);
+      if (!removed) {
+        err(`✗ No suppression found with id "${opts.id}". Use \`pinned suppress list\`.\n`);
+        process.exit(1);
+      }
+      writeStore(cwd, nextStore);
+      out(`- ${opts.id}`);
+      out("");
+      out("Suppression removed. The corresponding detector hit will fire again on the next sweep.");
+      return;
+    }
+    err(`Unknown suppress action "${action}". Use: add | list | remove.\n`);
+    process.exit(2);
+  });
+
+// ---------- smoke (0.3.0+) ----------
+// Tier 1 functional smoke pins. Author declares an endpoint + the
+// invariants it must satisfy; Pinned generates a vitest test that
+// actually runs the endpoint and asserts the result. Catches the
+// "AI shipped but never works" failure class (silent empty return,
+// hung worker, status-string mismatch).
+//
+// Anti-snapshot guard (load-bearing): assertions are invariants the
+// SPEC says the feature must satisfy, NOT snapshots of whatever the
+// AI's implementation returned. See the SmokeAssertion type comment
+// in claimParser.ts for the full rationale.
+//
+// Opt-in: safeToExecute defaults to false (skipped with WARN until
+// the author reviews side-effects and flips it). Cadence defaults to
+// on-demand (skipped under normal `vitest run` unless SMOKE_RUN=1).
+program
+  .command("smoke <action>")
+  .description(
+    "Tier 1 functional smoke pins. Actions: add | list. `add` creates a smoke pin asserting an endpoint produces a real outcome; catches the AI-shipped-but-never-works failure class. Defaults to safeToExecute=false (skipped until you review + opt in)."
+  )
+  .option("--route <path>", "Route to smoke-test, e.g. /api/generate (required for `add`).")
+  .option("--method <verb>", "HTTP method (default: GET).", "GET")
+  .option("--body <json>", "Request body as a JSON string.")
+  .option("--header <kv>", "Add a request header (key:value). Repeatable.", (val: string, prev: string[]) => [...prev, val], [] as string[])
+  .option("--base-url <url>", "Default base URL for local runs (env var PINNED_SMOKE_BASE_URL / PREVIEW_URL always wins at run time).")
+  .option("--assert-status-ok", "Assert HTTP 2xx response.")
+  .option("--assert-nonempty", "Assert response body is non-empty (catches silent-empty-return bugs).")
+  .option("--assert-contains <substr>", "Assert response body contains a spec-derived schema marker (e.g. '<svg', '\"id\":'). NOT a snapshot of your own output — invariant only.", (val: string, prev: string[]) => [...prev, val], [] as string[])
+  .option("--assert-terminal <statesAndPath>", "Assert reaches-terminal-state. Format: 'path|state1,state2|boundMs' (e.g. 'status|completed,failed|200000'). Catches done/completed-style polling bugs.", (val: string, prev: string[]) => [...prev, val], [] as string[])
+  .option("--assert-within <ms>", "Assert response within N ms (orphan-detection, generous bound — NOT tight SLA).")
+  .option("--ui-page <path>", "BETA Tier 2 (0.3.1): UI page to navigate to (e.g. /generate). Creates a ui-button smoke pin instead of http-route. Requires `pinned add-browser` to install Playwright.")
+  .option("--ui-selector <css>", "BETA Tier 2: CSS selector to interact with (e.g. 'button.generate').")
+  .option("--ui-action <kind>", "BETA Tier 2: click | type | select (default: click).", "click")
+  .option("--ui-value <s>", "BETA Tier 2: value for type/select actions.")
+  .option("--ui-wait-for <css>", "BETA Tier 2: selector that must appear AFTER the interaction (catches frontend↔backend handoff bugs).")
+  .option("--cadence <when>", "on-demand | pre-commit | ci-only (default: on-demand).", "on-demand")
+  .option("--pr-id <id>", "PR identifier — namespaces the generated file (default: 'smoke').", "smoke")
+  .option("--out-dir <path>", "Directory to write to (default: tests/pinned).", "tests/pinned")
+  .option("--safe-to-execute", "Flip safeToExecute=true immediately. Default false (the test is SKIPPED until you review side-effects).")
+  .option("--dry-run", "Print the generated test instead of writing.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (
+    action: string,
+    opts: {
+      route?: string;
+      method: string;
+      body?: string;
+      header: string[];
+      baseUrl?: string;
+      assertStatusOk?: boolean;
+      assertNonempty?: boolean;
+      assertContains: string[];
+      assertTerminal: string[];
+      assertWithin?: string;
+      cadence: string;
+      prId: string;
+      outDir: string;
+      safeToExecute?: boolean;
+      dryRun?: boolean;
+      quiet?: boolean;
+    }
+  ) => {
+    if (!opts.quiet) printBanner();
+    const pinnedDir = ".pinned";
+    if (!existsSync(pinnedDir)) mkdirSync(pinnedDir, { recursive: true });
+    if (action === "list") {
+      // Reuse the existing `pinned list` filter once we have a
+      // marker for smoke claims — for now point users at it.
+      out("Run `pinned list` to see all pins; smoke pins are listed inline.");
+      return;
+    }
+    if (action !== "add") {
+      err(`Unknown smoke action "${action}". Use: add | list.\n`);
+      process.exit(2);
+    }
+    if (!opts.route && !(opts as any).uiPage) {
+      err("✗ --route is required for `pinned smoke add` (e.g. --route /api/generate), OR --ui-page + --ui-selector for BETA Tier 2 UI pins.\n");
+      process.exit(2);
+    }
+    const method = opts.method.toUpperCase() as "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+    if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+      err(`✗ --method must be one of GET / POST / PUT / PATCH / DELETE. Got: ${method}.\n`);
+      process.exit(2);
+    }
+    if (!["on-demand", "pre-commit", "ci-only"].includes(opts.cadence)) {
+      err(`✗ --cadence must be one of on-demand / pre-commit / ci-only. Got: ${opts.cadence}.\n`);
+      process.exit(2);
+    }
+    const headers: Record<string, string> = {};
+    for (const h of opts.header) {
+      const ix = h.indexOf(":");
+      if (ix < 0) {
+        err(`✗ --header must be 'key:value'. Got: ${h}.\n`);
+        process.exit(2);
+      }
+      headers[h.slice(0, ix).trim()] = h.slice(ix + 1).trim();
+    }
+    const assertions: import("./claimParser.js").SmokeAssertion[] = [];
+    if (opts.assertStatusOk) assertions.push({ kind: "status-ok" });
+    if (opts.assertNonempty) assertions.push({ kind: "returns-nonempty" });
+    for (const s of opts.assertContains) assertions.push({ kind: "returns-shape", mustContain: s });
+    for (const t of opts.assertTerminal) {
+      const parts = t.split("|");
+      if (parts.length !== 3) {
+        err(`✗ --assert-terminal must be 'path|state1,state2|boundMs'. Got: ${t}.\n`);
+        process.exit(2);
+      }
+      const [statusPath, statesCsv, boundStr] = parts;
+      const boundMs = Number(boundStr);
+      if (!Number.isFinite(boundMs) || boundMs <= 0) {
+        err(`✗ --assert-terminal boundMs must be a positive number. Got: ${boundStr}.\n`);
+        process.exit(2);
+      }
+      const terminalStates = statesCsv.split(",").map(s => s.trim()).filter(Boolean);
+      if (terminalStates.length === 0) {
+        err(`✗ --assert-terminal needs at least one terminal state.\n`);
+        process.exit(2);
+      }
+      assertions.push({ kind: "reaches-terminal-state", statusPath, terminalStates, boundMs });
+    }
+    if (opts.assertWithin) {
+      const ms = Number(opts.assertWithin);
+      if (!Number.isFinite(ms) || ms <= 0) {
+        err(`✗ --assert-within must be a positive number of milliseconds. Got: ${opts.assertWithin}.\n`);
+        process.exit(2);
+      }
+      assertions.push({ kind: "responds-within", ms });
+    }
+    if (assertions.length === 0) {
+      err("✗ At least one assertion is required. Try --assert-nonempty, --assert-status-ok, --assert-contains '<svg', --assert-terminal 'status|completed,failed|200000', or --assert-within 60000.\n");
+      process.exit(2);
+    }
+    // 0.3.1 BETA Tier 2: if --ui-page is given, build a ui-button
+    // entrypoint instead of http-route. Requires `pinned add-browser`
+    // to install Playwright at run time per [[anything-annoying-must-
+    // be-opt-in]]. The generated test SKIPS-with-WARN if Playwright
+    // isn't installed (never RED).
+    const isUiTier2 = !!(opts as any).uiPage;
+    if (isUiTier2 && !(opts as any).uiSelector) {
+      err("✗ --ui-page requires --ui-selector (CSS selector to interact with).\n");
+      process.exit(2);
+    }
+    const uiAction = ((opts as any).uiAction ?? "click") as "click" | "type" | "select";
+    if (isUiTier2 && (uiAction === "type" || uiAction === "select") && !(opts as any).uiValue) {
+      err(`✗ --ui-action=${uiAction} requires --ui-value.\n`);
+      process.exit(2);
+    }
+    const claim: import("./claimParser.js").SmokeFunctionalClaim = {
+      template: "smoke-functional",
+      route: isUiTier2 ? `ui:${(opts as any).uiPage}` : (opts.route as string),
+      entrypoint: isUiTier2
+        ? {
+            kind: "ui-button",
+            page: (opts as any).uiPage,
+            selector: (opts as any).uiSelector,
+            action: uiAction,
+            value: (opts as any).uiValue,
+            waitFor: (opts as any).uiWaitFor,
+            defaultBaseUrl: opts.baseUrl,
+          }
+        : {
+            kind: "http-route",
+            method,
+            body: opts.body,
+            headers: Object.keys(headers).length ? headers : undefined,
+            defaultBaseUrl: opts.baseUrl,
+          },
+      assertions,
+      safeToExecute: !!opts.safeToExecute,
+      cadence: opts.cadence as "on-demand" | "pre-commit" | "ci-only",
+      raw: isUiTier2
+        ? `pinned smoke add --ui-page ${(opts as any).uiPage} --ui-selector ${(opts as any).uiSelector} (Tier 2 BETA)`
+        : `pinned smoke add --route ${opts.route}`,
+    };
+    const gen = generateTest(claim, {
+      prId: opts.prId,
+      pinnedVersion: version,
+    });
+    if (opts.dryRun) {
+      out(`# ${join(opts.outDir, gen.filename)}`);
+      out(gen.content);
+      return;
+    }
+    if (!existsSync(opts.outDir)) mkdirSync(opts.outDir, { recursive: true });
+    const target = join(opts.outDir, gen.filename);
+    try {
+      writeFileSync(target, gen.content, { flag: "wx" });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+        err(`✗ Pin file already exists: ${target}\n  Use a different --route or delete the file to regenerate.\n`);
+        process.exit(1);
+      }
+      throw e;
+    }
+    // Append to the registry so `pinned list` / `show` / `retire` work.
+    // readRegistry takes the directory (not the file path) and returns
+    // an empty {version:1,claims:[]} if no file exists.
+    let registry = readRegistry(opts.outDir);
+    registry = addEntry(registry, {
+      claimId: gen.claimId,
+      prId: opts.prId,
+      claim,
+      filename: gen.filename,
+    });
+    writeRegistry(opts.outDir, registry);
+    out(`+ ${relative(process.cwd(), target)}`);
+    out("");
+    out(`  Endpoint:        ${method} ${claim.route}`);
+    out(`  Assertions:      ${assertions.map(a => a.kind).join(", ")}`);
+    out(`  Cadence:         ${claim.cadence}`);
+    out(`  safeToExecute:   ${claim.safeToExecute}${claim.safeToExecute ? "" : "  ← test is SKIPPED until you flip this"}`);
+    out("");
+    if (!claim.safeToExecute) {
+      out("Next: review the generated file for side-effect surface, then set safeToExecute: true at the top.");
+    } else if (isUiTier2) {
+      out("Next steps for BETA Tier 2 ui-button pin:");
+      out("  1. Install Playwright:    pinned add-browser");
+      out("  2. Start your dev server: e.g. npm run dev");
+      out("  3. Run the pin:           SMOKE_RUN=1 PINNED_SMOKE_BASE_URL=http://localhost:3000 vitest run");
+      out("");
+      out("The pin will SKIP-with-WARN until Playwright is installed (never RED). This is by design — opt-in.");
+    } else {
+      out("Next: set PINNED_SMOKE_BASE_URL=http://localhost:3000 (or PREVIEW_URL) and run `SMOKE_RUN=1 vitest run`.");
+    }
+  });
+
+program
+  .command("analytics <action>")
+  .description(
+    "Hosted analytics opt-in (Pro+). Actions: enable | disable | status | upload. `enable` turns on per-sweep upload to app.pinnedai.dev for cross-repo + provider-mistake dashboards. Free tier ships full local data via `pinned report` — this is purely additive."
+  )
+  .option("--endpoint <url>", "Override the analytics endpoint (default: https://api.pinnedai.dev/v1/repo-stats)")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (action: string, opts: { endpoint?: string; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const pinnedDir = ".pinned";
+    if (!existsSync(pinnedDir)) mkdirSync(pinnedDir, { recursive: true });
+    const configPath = join(pinnedDir, "analytics-config.json");
+    type AnalyticsConfig = {
+      enabled: boolean;
+      endpoint: string;
+      enabledAt?: string;
+      lastUploadAt?: string;
+      lastUploadResult?: { ok: boolean; message: string };
+    };
+    function readConfig(): AnalyticsConfig {
+      if (!existsSync(configPath)) {
+        return { enabled: false, endpoint: opts.endpoint ?? "https://api.pinnedai.dev/v1/repo-stats" };
+      }
+      try {
+        return JSON.parse(readFileSync(configPath, "utf8")) as AnalyticsConfig;
+      } catch {
+        return { enabled: false, endpoint: opts.endpoint ?? "https://api.pinnedai.dev/v1/repo-stats" };
+      }
+    }
+    function writeConfig(cfg: AnalyticsConfig): void {
+      writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+    }
+
+    const cfg = readConfig();
+    if (opts.endpoint) cfg.endpoint = opts.endpoint;
+
+    switch (action) {
+      case "enable": {
+        cfg.enabled = true;
+        cfg.enabledAt = new Date().toISOString();
+        writeConfig(cfg);
+        out("");
+        out("✓ Hosted analytics ENABLED.");
+        out(`  Endpoint: ${cfg.endpoint}`);
+        out("");
+        out("What gets uploaded on every `pinned sweep`:");
+        out("  • Per-detector hit counts + severity ranking");
+        out("  • Per-AI-model breakdown (when known)");
+        out("  • Sample file paths + line numbers + plain-English summaries (bounded to 10/detector)");
+        out("");
+        out("What does NOT get uploaded:");
+        out("  • Source code");
+        out("  • File contents");
+        out("  • Secrets / env values");
+        out("  • Git commit SHAs or branch names");
+        out("");
+        out("Inspect what would be sent: `pinned report --json`");
+        out("Turn off:                   `pinned analytics disable`");
+        out("");
+        out("Dashboard (Pro+ subscription required to view aggregated data):");
+        out("  https://app.pinnedai.dev/dashboard");
+        out("");
+        return;
+      }
+      case "disable": {
+        cfg.enabled = false;
+        delete cfg.enabledAt;
+        writeConfig(cfg);
+        out("");
+        out("✓ Hosted analytics DISABLED. Local data (.pinned/repo-stats.json + `pinned report`) still works.");
+        out("");
+        return;
+      }
+      case "status": {
+        out("");
+        out(`Hosted analytics: ${cfg.enabled ? "✓ ENABLED" : "✗ disabled"}`);
+        out(`Endpoint:         ${cfg.endpoint}`);
+        if (cfg.enabledAt) out(`Enabled at:       ${cfg.enabledAt.slice(0, 16).replace("T", " ")}`);
+        if (cfg.lastUploadAt) {
+          out(`Last upload:      ${cfg.lastUploadAt.slice(0, 16).replace("T", " ")}`);
+          if (cfg.lastUploadResult) {
+            out(`Last result:      ${cfg.lastUploadResult.ok ? "✓" : "✗"} ${cfg.lastUploadResult.message}`);
+          }
+        }
+        out("");
+        return;
+      }
+      case "upload": {
+        if (!cfg.enabled) {
+          err("✗ Hosted analytics is disabled. Run `pinned analytics enable` first.\n");
+          process.exit(1);
+        }
+        const statsPath = join(pinnedDir, "repo-stats.json");
+        if (!existsSync(statsPath)) {
+          err("✗ No local stats yet. Run `pinned sweep` first to populate .pinned/repo-stats.json.\n");
+          process.exit(1);
+        }
+        // OIDC token discovery — works inside a GitHub Action that has
+        // `permissions: id-token: write`. Outside a GHA context, we
+        // can't get a token; fall back to a user-supplied $PINNED_ANALYTICS_TOKEN.
+        const oidcToken =
+          process.env.PINNED_ANALYTICS_TOKEN ??
+          (await fetchGithubActionsOidcToken().catch(() => null));
+        if (!oidcToken) {
+          err("✗ No OIDC token available. Either run inside a GitHub Action with `permissions: id-token: write`, or set $PINNED_ANALYTICS_TOKEN to a valid token.\n");
+          process.exit(1);
+        }
+        const stats = JSON.parse(readFileSync(statsPath, "utf8"));
+        const body = JSON.stringify({ cliVersion: version, stats });
+        const res = await fetch(cfg.endpoint, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${oidcToken}`,
+          },
+          body,
+        });
+        const resultText = await res.text();
+        let resultJson: unknown;
+        try { resultJson = JSON.parse(resultText); } catch { resultJson = { raw: resultText.slice(0, 400) }; }
+        const ok = res.ok;
+        cfg.lastUploadAt = new Date().toISOString();
+        cfg.lastUploadResult = {
+          ok,
+          message: ok ? `accepted (${res.status})` : `${res.status} ${(resultJson as { error?: string }).error ?? "unknown error"}`,
+        };
+        writeConfig(cfg);
+        if (ok) {
+          out("");
+          out(`✓ Upload accepted: ${(resultJson as { received?: unknown }).received ? JSON.stringify((resultJson as { received: unknown }).received) : ""}`);
+          if ((resultJson as { dashboardUrl?: string }).dashboardUrl) {
+            out(`  Dashboard: ${(resultJson as { dashboardUrl: string }).dashboardUrl}`);
+          }
+          out("");
+        } else {
+          err(`✗ Upload failed (${res.status}): ${JSON.stringify(resultJson)}\n`);
+          process.exit(1);
+        }
+        return;
+      }
+      default:
+        err(`✗ Unknown action "${action}". Use: enable | disable | status | upload\n`);
+        process.exit(1);
+    }
+  });
+
+// Helper — fetch a GitHub Actions OIDC token. Only works inside a GHA
+// runner with `permissions: id-token: write` set on the job. Outside
+// GHA returns null; the caller falls back to $PINNED_ANALYTICS_TOKEN.
+async function fetchGithubActionsOidcToken(): Promise<string | null> {
+  const url = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const token = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!url || !token) return null;
+  const audience = "pinnedai-analytics";
+  const sep = url.includes("?") ? "&" : "?";
+  const fullUrl = `${url}${sep}audience=${encodeURIComponent(audience)}`;
+  const res = await fetch(fullUrl, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return null;
+  const body = (await res.json().catch(() => null)) as { value?: string } | null;
+  return body?.value ?? null;
+}
 
 // ---------- catches ----------
 // Lifetime catch history — every regression Pinned has caught.
@@ -11445,6 +12279,10 @@ function describeClaim(c: Claim): string {
       return `response-shape ${c.route}  consumer=${c.consumerFile}  keys=${c.consumerReads.join(",")}`;
     case "mass-mutation":
       return `mass-mutation  ${c.filePath}:${c.line}  ${c.operation.toUpperCase()} ${c.table}`;
+    case "smoke-functional": {
+      const ep = c.entrypoint.kind === "http-route" ? `${c.entrypoint.method} ${c.route}` : c.route;
+      return `smoke          ${ep}  (${c.assertions.length} assertions, ${c.cadence})`;
+    }
   }
 }
 

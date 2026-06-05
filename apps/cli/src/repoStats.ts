@@ -57,16 +57,57 @@ export type ModelStats = {
   byConfidence: Partial<Record<"known" | "heuristic" | "unspecified", number>>;
 };
 
+// 0.3.0+ (task #158): per-detector event log for confirmed-real vs
+// dismissed-FP capture. Each event represents one detector fire +
+// its subsequent fate (open / confirmed / dismissed).
+//
+// Status transitions:
+//   - Born `open` when the detector fires.
+//   - `confirmed` when the flagged code changes in a subsequent commit
+//     (inferred — user acted on it = real catch) OR via explicit
+//     `pinned confirm <ev_id>`.
+//   - `dismissed` when the flagged code is added to .pinned/
+//     suppressions.json (FP/intended) OR via explicit `pinned dismiss
+//     <ev_id>`.
+//   - Stays `open` if neither happens within N commits.
+//
+// Hard rule per the spec: zero network on the recording/inference/
+// report path. All data lives in .pinned/repo-stats.json on the
+// customer's filesystem.
+export type CatchEvent = {
+  id: string;             // ev_<timestamp>_<hash6>
+  at: string;             // ISO timestamp of fire
+  commit?: string;        // git HEAD at fire time (best-effort)
+  file: string;           // file:line summary the hit pointed at
+  fingerprint: string;    // stable suppression key (so we can correlate to suppressions)
+  status: "open" | "confirmed" | "dismissed";
+  // When status transitions to confirmed/dismissed, capture the basis.
+  resolvedAt?: string;
+  resolvedBy?: "inferred-code-changed" | "inferred-suppressed" | "explicit-confirm" | "explicit-dismiss";
+};
+
 export type DetectorStats = {
   totalHits: number;
+  // 0.3.0+ catch-confirmed-rate inputs. Updated alongside `events`
+  // by the inference pass that runs at sweep time + at explicit
+  // confirm/dismiss commands.
+  confirmedReal: number;
+  dismissedFP: number;
   // Severity ranking: how seriously to treat catches from this
   // detector. Used in `pinned report` ordering and notification
   // thresholds for paid tier.
   severity: "critical" | "high" | "medium" | "low";
   byModel: Record<string, ModelStats>;
   sampleHits: HitSample[]; // bounded to last 10
+  // 0.3.0+ event log. Bounded to last 200 per detector — older events
+  // are dropped as the count grows. The aggregate counts above survive
+  // truncation.
+  events: CatchEvent[];
   firstSeen: string;
   lastSeen: string;
+  // 0.3.0+ tracking — the commit that last fired this detector.
+  // Used by the inference pass to detect "code changed since fire".
+  lastFiredCommit?: string;
 };
 
 export type RepoStatsSnapshot = {
@@ -158,6 +199,12 @@ export type HitInput = {
   filePath: string;
   line?: number;
   summary: string;
+  // 0.3.0+ (task #158) — caller can pass a stable fingerprint string
+  // so the catch-event correlates with suppressions. Caller can pass
+  // the current git HEAD so the inference pass knows "code changed
+  // since fire" later.
+  fingerprint?: string;
+  commit?: string;
 };
 
 // Merge a batch of detected hits into the stats. Returns the updated
@@ -181,14 +228,29 @@ export function mergeHits(
     if (!h.detector || !h.summary) continue;
     const existing = stats.byDetector[h.detector] ?? {
       totalHits: 0,
+      confirmedReal: 0,
+      dismissedFP: 0,
       severity: severityFor(h.detector),
       byModel: {},
       sampleHits: [],
+      events: [],
       firstSeen: now,
       lastSeen: now,
     };
     existing.totalHits += 1;
     existing.lastSeen = now;
+    // 0.3.0+ (task #158) — record event. Stable ID = ev_<epochms>_<rand>.
+    const evId = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const ev: CatchEvent = {
+      id: evId,
+      at: now,
+      file: h.line ? `${h.filePath}:${h.line}` : h.filePath,
+      fingerprint: h.fingerprint ?? h.summary, // caller can pass a stable fp; fallback to summary
+      status: "open",
+      commit: h.commit,
+    };
+    existing.events = [ev, ...(existing.events ?? [])].slice(0, 200); // bound to last 200
+    if (h.commit) existing.lastFiredCommit = h.commit;
     const modelKey = aiModel.model;
     const modelEntry = existing.byModel[modelKey] ?? {
       hits: 0,
@@ -241,4 +303,110 @@ export function trendDelta(
   if (!basis) basis = stats.snapshots[0];
   const past = basis.totalByDetector[detector] ?? 0;
   return { delta: current - past, basis: "compared" };
+}
+
+// 0.3.0+ (task #158): inference pass — walks events with status=open
+// and updates their status based on local-only evidence:
+//   - If the file has been touched (mtime changed) since the event's
+//     `at` timestamp → confirmed (user acted on it = real catch).
+//   - If a matching suppression exists in .pinned/suppressions.json →
+//     dismissed (FP/intended).
+//
+// Hard rule: zero network. Pure filesystem reads.
+//
+// Caller passes a `fileChanged(filePath, sinceISO) => boolean` so this
+// module doesn't have to know about git internals; the CLI wires it
+// to `git log -1 --format=%ad -- <file>` or equivalent.
+export function inferEventResolutions(
+  stats: RepoStats,
+  opts: {
+    fileChangedSince: (filePath: string, sinceISO: string) => boolean;
+    isSuppressed: (detector: string, filePath: string, fingerprint: string) => boolean;
+    now?: Date;
+  }
+): RepoStats {
+  const now = (opts.now ?? new Date()).toISOString();
+  const out: RepoStats = {
+    ...stats,
+    byDetector: { ...stats.byDetector },
+    lastUpdated: now,
+  };
+  for (const [detector, ds] of Object.entries(out.byDetector)) {
+    let confirmedDelta = 0;
+    let dismissedDelta = 0;
+    const events = (ds.events ?? []).map((ev) => {
+      if (ev.status !== "open") return ev;
+      // file may be "path:line" — strip the line for the filesystem check.
+      const filePath = ev.file.split(":")[0];
+      if (opts.isSuppressed(detector, filePath, ev.fingerprint)) {
+        dismissedDelta++;
+        return { ...ev, status: "dismissed" as const, resolvedAt: now, resolvedBy: "inferred-suppressed" as const };
+      }
+      if (opts.fileChangedSince(filePath, ev.at)) {
+        confirmedDelta++;
+        return { ...ev, status: "confirmed" as const, resolvedAt: now, resolvedBy: "inferred-code-changed" as const };
+      }
+      return ev;
+    });
+    out.byDetector[detector] = {
+      ...ds,
+      events,
+      confirmedReal: (ds.confirmedReal ?? 0) + confirmedDelta,
+      dismissedFP: (ds.dismissedFP ?? 0) + dismissedDelta,
+    };
+  }
+  return out;
+}
+
+// Explicit confirm/dismiss — for `pinned confirm <ev_id>` /
+// `pinned dismiss <ev_id>` CLI commands. Looks up the event by id
+// across all detectors, transitions it, updates counts.
+export function resolveEvent(
+  stats: RepoStats,
+  eventId: string,
+  resolution: "confirmed" | "dismissed",
+  opts: { now?: Date } = {}
+): { stats: RepoStats; resolved: boolean; detector?: string } {
+  const now = (opts.now ?? new Date()).toISOString();
+  for (const [detector, ds] of Object.entries(stats.byDetector)) {
+    const events = ds.events ?? [];
+    const ix = events.findIndex((e) => e.id === eventId);
+    if (ix < 0) continue;
+    const ev = events[ix];
+    if (ev.status !== "open") {
+      // Already resolved — return without re-incrementing counts.
+      return { stats, resolved: false, detector };
+    }
+    const updatedEv: CatchEvent = {
+      ...ev,
+      status: resolution,
+      resolvedAt: now,
+      resolvedBy: resolution === "confirmed" ? "explicit-confirm" : "explicit-dismiss",
+    };
+    const nextEvents = [...events];
+    nextEvents[ix] = updatedEv;
+    const nextDs: DetectorStats = {
+      ...ds,
+      events: nextEvents,
+      confirmedReal: (ds.confirmedReal ?? 0) + (resolution === "confirmed" ? 1 : 0),
+      dismissedFP: (ds.dismissedFP ?? 0) + (resolution === "dismissed" ? 1 : 0),
+    };
+    const nextStats: RepoStats = {
+      ...stats,
+      byDetector: { ...stats.byDetector, [detector]: nextDs },
+      lastUpdated: now,
+    };
+    return { stats: nextStats, resolved: true, detector };
+  }
+  return { stats, resolved: false };
+}
+
+// Catch-confirmed rate for a detector — `confirmedReal / (confirmedReal + dismissedFP)`
+// reported as a 0–1 fraction. Returns null when there's no resolved
+// evidence yet (avoids dividing by zero and reporting a meaningless 0%).
+export function catchConfirmedRate(ds: DetectorStats): number | null {
+  const c = ds.confirmedReal ?? 0;
+  const d = ds.dismissedFP ?? 0;
+  if (c + d === 0) return null;
+  return c / (c + d);
 }

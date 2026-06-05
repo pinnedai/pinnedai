@@ -255,6 +255,19 @@ npx pinned regenerate --all          # re-emit all pin .test.ts files using the 
 npx pinned retire <claim-id> --reason="..."   # legitimate retirement (writes audit entry)
 ```
 
+### Reporting + analytics (local-first)
+
+```bash
+npx pinned report                              # per-detector dashboard, severity-sorted + 7-day trend + per-AI-model breakdown
+npx pinned report --json                       # full schema for piping into your own tooling
+npx pinned analytics status                    # show whether hosted analytics is opt-in
+npx pinned analytics enable                    # opt-in to cross-repo + per-model dashboards at app.pinnedai.dev (Pro+)
+npx pinned analytics disable                   # flip off; local stats keep working
+npx pinned analytics upload                    # manual one-shot upload (or auto-fires on every `pinned sweep` when enabled)
+```
+
+Local data lives in `.pinned/repo-stats.json` (per-detector hit counts, severity ranking, per-AI-model rollup, bounded samples, 7-day snapshots). Free tier gets the full local dashboard. Hosted analytics is opt-in only — never auto-uploads. Uploaded data is structured to exclude source code, file contents, and secrets; only counts + sample file-paths + line-numbers + plain-English summaries get sent. See [tier-model-final-2026-05-23](#) for the free/paid split.
+
 ### Paid-API call pins (silent model swap / token-cap defense)
 
 Pin every paid API call in your backend — not just the ones in Next.js Server Actions. Captures the call expression + model literal + `max_tokens` cap so AI silently swapping `claude-opus` → `claude-haiku` (quality regression) or removing the token cap (unbounded spend) is caught immediately.

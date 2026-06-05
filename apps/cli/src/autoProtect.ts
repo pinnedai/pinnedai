@@ -15,7 +15,9 @@ import type { Claim } from "./claimParser.js";
 import { claimKey } from "./claimParser.js";
 import type { RegistryEntry } from "./registry.js";
 import type { ChangedFile } from "./scanDiff.js";
-import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, detectNewPagesInDiff, detectNewValidationSchemasInDiff, detectHostConditionalInDiff, detectJourneyPairsInDiff, type DiffByFile } from "./scanDiff.js";
+import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, detectNewPagesInDiff, detectNewValidationSchemasInDiff, detectHostConditionalInDiff, detectJourneyPairsInDiff, detectEnumDrift, detectEnvRequired, detectSupabaseColumnExists, detectExpectedHeaders, detectNullableResults, detectResponseShape, detectMassMutation, type DiffByFile } from "./scanDiff.js";
+import { readFileSync as fsReadFileSync } from "node:fs";
+import { isAbsolute as pathIsAbsolute, join as pathJoin } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -251,6 +253,43 @@ export function classifyDiff(input: ClassifyInput): ClassifyResult {
         triggeredBy: h.filePath,
         decision: "ask",
       });
+
+      // 0.3.0+ (task #153): also propose a Tier 1 smoke pin for the
+      // same endpoint. Per the build plan's "Auto-propose smoke pins"
+      // headline — when a new feature/endpoint/job is added, Pinned
+      // analyzes it and PROPOSES the smoke pin itself. User accepts
+      // or rejects; always defaults to safeToExecute:false so the
+      // test is SKIPPED until reviewed (no silent auto-runs).
+      //
+      // Inferred invariants for a POST endpoint:
+      //   - status-ok (2xx)
+      //   - returns-nonempty (non-trivial body)
+      //
+      // We DO NOT auto-infer `returns-shape: { mustContain: ... }`
+      // here — that would be a snapshot of whatever the AI's code
+      // happens to return, violating the anti-snapshot rule per
+      // [[positive-and-negative-tests-required]]. The customer
+      // adds spec-derived schema markers manually if they want.
+      tryEmit({
+        claim: {
+          template: "smoke-functional",
+          route: h.route,
+          entrypoint: {
+            kind: "http-route",
+            method: h.method as "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+          },
+          assertions: [
+            { kind: "status-ok" },
+            { kind: "returns-nonempty" },
+          ],
+          safeToExecute: false, // opt-in per [[anything-annoying-must-be-opt-in]]
+          cadence: "on-demand",
+          raw: `auto-proposed smoke pin for ${h.method} ${h.route}`,
+        },
+        reason: `Auto-proposed: smoke pin for the new ${h.method} ${h.route} endpoint. Defaults to safeToExecute:false (SKIPPED until you review side-effects + flip it). Add spec-derived assertions (e.g. \`--assert-contains '<svg'\` or \`--assert-terminal\`) via \`pinned smoke add\` if the auto-inferred invariants are insufficient.`,
+        triggeredBy: h.filePath,
+        decision: "ask",
+      });
     }
     // page-renders — fires when a new server-rendered page lands.
     // Catches React/Next/Vite render errors that would otherwise hit
@@ -350,6 +389,163 @@ export function classifyDiff(input: ClassifyInput): ClassifyResult {
     }
   } catch {
     /* detector errors must not block pin emission */
+  }
+
+  // 0.3.0+: also run the 7 first-time-bug detectors that were shipped
+  // in 0.2.22–0.2.25 but never wired into the agent loop. Per
+  // [[agent-loop-activation-wedge]], detectors that only fire at
+  // `pinned sweep` cadence miss the first-value moment when the AI
+  // agent is actively editing. Wiring them into autoProtect closes
+  // that gap.
+  //
+  // Each detector takes a Map<path, content>. We build it from the
+  // current on-disk state of `input.changedFiles` so the detector
+  // sees the post-edit code (same shape sweep uses).
+  try {
+    const tree = new Map<string, string>();
+    for (const f of input.changedFiles) {
+      if (f.status === "deleted") continue;
+      try {
+        const abs = pathIsAbsolute(f.path) ? f.path : pathJoin(input.repoRoot, f.path);
+        tree.set(f.path, fsReadFileSync(abs, "utf8"));
+      } catch { /* file may have been moved/deleted between hook events */ }
+    }
+
+    // enum-drift — in-repo producer/consumer drift (cross-repo
+    // contracts handled in sweep via .pinned/contracts/, not here).
+    for (const h of detectEnumDrift(tree)) {
+      // Only confirmed-tier enum-drift fires in the hook path — review
+      // tier is too FP-prone for real-time interception. Customer can
+      // see review-tier hits at sweep time.
+      if (h.confidence !== "confirmed") continue;
+      tryEmit({
+        claim: {
+          template: "enum-drift",
+          consumerFile: h.consumerFile,
+          column: h.column,
+          expectedValues: h.expectedValues,
+          observedValues: h.observedValues,
+          missingFromProducer: h.missingFromProducer,
+          producerSamples: h.producerSamples,
+          confidence: h.confidence,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.consumerFile,
+        decision: "ask",
+      });
+    }
+
+    // env-required — process.env reads without a matching declaration.
+    // Returns a single hit (or null), not an array.
+    const envHit = detectEnvRequired(tree);
+    if (envHit && envHit.missingKeys.length > 0) {
+      tryEmit({
+        claim: {
+          template: "env-required",
+          declarationSources: envHit.declarationSources,
+          // requiredKeys = the union of declared keys; the test checks
+          // each is still declared at run time. The missing-keys data
+          // is captured in suggestedPin's text and the autoProtect
+          // reason field for now.
+          requiredKeys: envHit.declaredKeys,
+          raw: envHit.suggestedPin,
+        },
+        reason: envHit.suggestedPin,
+        triggeredBy: envHit.missingKeys[0]?.sites[0]?.filePath ?? "(env)",
+        decision: "ask",
+      });
+    }
+
+    // supabase-column — code queries a column not declared in any
+    // database.types.ts / supabase/migrations/*.sql.
+    for (const h of detectSupabaseColumnExists(tree)) {
+      tryEmit({
+        claim: {
+          template: "supabase-column",
+          table: h.table,
+          referencedColumns: h.referencedColumns,
+          schemaSources: h.schemaSources,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.schemaSources[0] ?? "(schema)",
+        decision: "ask",
+      });
+    }
+
+    // expected-header — webhook handler reading a non-canonical header.
+    for (const h of detectExpectedHeaders(tree)) {
+      tryEmit({
+        claim: {
+          template: "expected-header",
+          filePath: h.filePath,
+          provider: h.provider,
+          expectedHeader: h.expectedHeader,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.filePath,
+        decision: "ask",
+      });
+    }
+
+    // nullable-result — code uses a returns-null source without a
+    // null guard. First-edge-case crash.
+    for (const h of detectNullableResults(tree)) {
+      tryEmit({
+        claim: {
+          template: "nullable-result",
+          filePath: h.filePath,
+          line: h.line,
+          source: h.source,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.filePath,
+        decision: "ask",
+      });
+    }
+
+    // response-shape — producer response no longer emits a key the
+    // consumer reads.
+    for (const h of detectResponseShape(tree)) {
+      tryEmit({
+        claim: {
+          template: "response-shape",
+          route: h.route,
+          producerFile: h.producerFile,
+          consumerFile: h.consumerFile,
+          consumerReads: h.consumerReads,
+          producerEmits: h.producerEmits,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.consumerFile,
+        decision: "ask",
+      });
+    }
+
+    // mass-mutation — .update()/.delete() without a filter chain.
+    // CRITICAL severity per [[strategic-pivot-guard-integrity]] —
+    // accidental data loss / cross-tenant wipe.
+    for (const h of detectMassMutation(tree)) {
+      tryEmit({
+        claim: {
+          template: "mass-mutation",
+          filePath: h.filePath,
+          line: h.line,
+          table: h.table,
+          operation: h.operation,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.filePath,
+        decision: "ask", // critical risk — always confirm
+      });
+    }
+  } catch {
+    /* first-time-bug detectors must not block agent loop */
   }
 
   // Emit the middleware pin FIRST (before per-route loop). Its

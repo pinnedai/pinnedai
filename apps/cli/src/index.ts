@@ -103,6 +103,7 @@ import { generateExpectedHeaderTest } from "./templates/expectedHeader.js";
 import { generateNullableResultTest } from "./templates/nullableResult.js";
 import { generateResponseShapeTest } from "./templates/responseShape.js";
 import { generateMassMutationTest } from "./templates/massMutation.js";
+import { generateSmokeFunctionalTest } from "./templates/smokeFunctional.js";
 
 // Convenience dispatcher — given any Claim, pick the right generator.
 // Keeps callers (CLI, landing demo, hosted Worker) DRY.
@@ -231,6 +232,8 @@ function dispatchToTemplate(claim: Claim, opts: GenerateOpts): GeneratedTest {
       return generateResponseShapeTest(claim, opts);
     case "mass-mutation":
       return generateMassMutationTest(claim, opts);
+    case "smoke-functional":
+      return generateSmokeFunctionalTest(claim, opts);
   }
   // Exhaustiveness guard — if a new Claim variant is added without a
   // case here, TS will fail to compile this assignment with a clear

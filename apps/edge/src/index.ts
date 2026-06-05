@@ -67,6 +67,15 @@ export default {
       return handleSummarize(request, env);
     }
 
+    // 0.3.0+ — hosted analytics upload. Pro+ only. Customer opts in
+    // via `pinned analytics enable`. Schema docs in schema.sql; handler
+    // logic in repoStatsUpload.ts. Per [[strategic-moat-independent-
+    // guardrail]] this is the durable paid-tier moat lever.
+    if (request.method === "POST" && url.pathname === "/v1/repo-stats") {
+      const { handleRepoStatsUpload } = await import("./repoStatsUpload.js");
+      return handleRepoStatsUpload(request, env);
+    }
+
     return json({ error: "not found" }, 404);
   },
 } satisfies ExportedHandler<Env>;
