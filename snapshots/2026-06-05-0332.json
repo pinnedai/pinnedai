@@ -1,0 +1,26 @@
+{
+  "timestamp": "2026-06-05 03:32 UTC",
+  "npm": {
+    "pinnedai": { "version": "0.2.21", "weekly": 2558, "monthly": 2681 },
+    "pinnedai-mcp": { "version": "0.1.4", "weekly": 499, "monthly": 499 }
+  },
+  "github": {
+    "stars": 2,
+    "forks": 0,
+    "watchers": 1,
+    "open_issues": 0,
+    "repo_size_kb": 4365,
+    "views_14d": "0",
+    "uniques_14d": "0"
+  },
+  "open_vsx": {
+    "version": "0.1.2",
+    "downloads": 226,
+    "verified_namespace": "True"
+  },
+  "vs_code_marketplace": {
+    "status": "not-indexed",
+    "installs": 0,
+    "downloads": 0
+  }
+}
