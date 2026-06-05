@@ -3320,6 +3320,8 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `Nullable-result guard: \`${claim.filePath}:${claim.line}\` keeps \`${claim.source}\` either removed OR null-guarded. Catches AI dropping a guard on a route handler that would crash on first edge-case input.`;
     case "response-shape":
       return `Response-shape: producer at \`${claim.route}\` keeps emitting ${claim.consumerReads.length} key${claim.consumerReads.length === 1 ? "" : "s"} the consumer reads. Catches AI silently renaming a producer field while consumer code reads the old name.`;
+    case "mass-mutation":
+      return `Mass-mutation safety: ${claim.operation.toUpperCase()} on \`${claim.table}\` in \`${claim.filePath}:${claim.line}\` keeps at least one filter clause. Catches AI dropping the .eq() filter that would mass-mutate every row.`;
   }
 }
 
@@ -3666,6 +3668,7 @@ program
       detectExpectedHeaders,
       detectNullableResults,
       detectResponseShape,
+      detectMassMutation,
       buildImportGraph,
       findFamilyMembers,
       deriveRouteFromPath: drfp,
@@ -3675,7 +3678,7 @@ program
 
     // 3. Detectors.
     type Proposal = {
-      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility" | "enum-drift" | "env-required" | "supabase-column" | "expected-header" | "nullable-result" | "response-shape";
+      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility" | "enum-drift" | "env-required" | "supabase-column" | "expected-header" | "nullable-result" | "response-shape" | "mass-mutation";
       route: string;
       method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
       filePath: string;
@@ -3950,6 +3953,22 @@ program
           producerFile: h.producerFile,
           consumerReads: h.consumerReads,
           producerEmits: h.producerEmits,
+          raw: h.suggestedPin,
+        },
+      });
+    }
+    for (const h of detectMassMutation(tree)) {
+      proposals.push({
+        kind: "mass-mutation",
+        route: `${h.filePath}:${h.line}`,
+        filePath: h.filePath,
+        reason: h.suggestedPin,
+        claim: {
+          template: "mass-mutation",
+          filePath: h.filePath,
+          table: h.table,
+          operation: h.operation,
+          line: h.line,
           raw: h.suggestedPin,
         },
       });
@@ -11218,6 +11237,8 @@ function describeClaim(c: Claim): string {
       return `nullable-res   ${c.filePath}:${c.line}  ${c.source}`;
     case "response-shape":
       return `response-shape ${c.route}  consumer=${c.consumerFile}  keys=${c.consumerReads.join(",")}`;
+    case "mass-mutation":
+      return `mass-mutation  ${c.filePath}:${c.line}  ${c.operation.toUpperCase()} ${c.table}`;
   }
 }
 

@@ -316,7 +316,8 @@ export function classifyPinStrength(
     case "expected-header":
     case "nullable-result":
     case "response-shape":
-      // 0.2.23+ static cross-file scans — always behavioral, no preconditions.
+    case "mass-mutation":
+      // 0.2.23/0.2.24+ static cross-file scans — always behavioral, no preconditions.
       return "behavioral";
   }
 }
@@ -821,7 +822,20 @@ export type Claim =
   | SupabaseColumnClaim
   | ExpectedHeaderClaim
   | NullableResultClaim
-  | ResponseShapeClaim;
+  | ResponseShapeClaim
+  | MassMutationClaim;
+
+// 0.2.24+: Mass-mutation pin — catches `.from("X").update({...})` /
+// `.from("X").delete()` calls that no longer have a filter clause.
+// The "AI dropped the .eq() filter and wiped the whole table" defense.
+export type MassMutationClaim = {
+  template: "mass-mutation";
+  filePath: string;
+  table: string;
+  operation: "update" | "delete";
+  line: number;
+  raw: string;
+};
 
 // 0.2.23+: Expected-header pin — webhook handler header-name typos.
 export type ExpectedHeaderClaim = {
@@ -2546,6 +2560,12 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         promise: `Producer ${c.producerFile} still emits ${c.consumerReads.map((k) => `\`${k}\``).join(", ")} in its Response.json(...) literal.`,
         check: `Asserts each consumer-read key still appears in any Response.json literal in the producer file. Catches AI silently renaming a producer-side field while consumer keeps reading the old name.`,
       };
+    case "mass-mutation":
+      return {
+        title: `mass-mutation safety: ${c.operation.toUpperCase()} on "${c.table}" keeps a filter`,
+        promise: `\`.from("${c.table}").${c.operation}(...)\` at \`${c.filePath}:${c.line}\` still has at least one filter clause (.eq/.match/.in/etc) — OR the call is removed entirely.`,
+        check: `Catches AI dropping the .eq() filter clause from an update/delete chain, which would otherwise mutate every row in the table.`,
+      };
   }
 }
 
@@ -2703,6 +2723,8 @@ export function badCaseForClaim(claim: Claim): string {
       return `nullable-result: ${claim.filePath}:${claim.line} still uses \`${claim.source}\` without a null guard — first edge-case input crashes the route.`;
     case "response-shape":
       return `response-shape: producer at \`${claim.route}\` no longer emits one or more keys (${claim.consumerReads.slice(0, 3).map((k) => `\`${k}\``).join(", ")}${claim.consumerReads.length > 3 ? `, +${claim.consumerReads.length - 3} more` : ""}) that \`${claim.consumerFile}\` reads.`;
+    case "mass-mutation":
+      return `mass-mutation safety: ${claim.operation.toUpperCase()} on "${claim.table}" in \`${claim.filePath}:${claim.line}\` lost its filter clause — would mutate every row in the table.`;
   }
 }
 
@@ -2824,6 +2846,8 @@ export function claimRoute(c: Claim): string | null {
       return c.filePath;
     case "response-shape":
       return c.route;
+    case "mass-mutation":
+      return c.filePath;
   }
 }
 
@@ -2893,7 +2917,9 @@ export function claimSlug(claim: Claim): string {
                                                         ? `nullable-${claim.filePath}-${claim.line}`
                                                         : claim.template === "response-shape"
                                                           ? `response-shape-${claim.route}-${claim.consumerFile}`
-                                                          : claim.route;
+                                                          : claim.template === "mass-mutation"
+                                                            ? `mass-mut-${claim.operation}-${claim.table}-${claim.filePath}-${claim.line}`
+                                                            : claim.route;
   const route = routeSource
     .replace(/^\//, "")
     .replace(/[^a-z0-9]+/gi, "-")
@@ -3024,6 +3050,8 @@ export function claimKey(c: Claim): string {
       return `nullable-result:${c.filePath}:${c.line}`;
     case "response-shape":
       return `response-shape:${c.route}:${c.consumerFile}`;
+    case "mass-mutation":
+      return `mass-mutation:${c.filePath}:${c.line}:${c.operation}:${c.table}`;
   }
 }
 

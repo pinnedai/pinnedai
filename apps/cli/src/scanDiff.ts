@@ -4668,6 +4668,125 @@ export function detectResponseShape(filesByPath: Map<string, string>): ResponseS
 }
 
 // ────────────────────────────────────────────────────────────
+// Mass-mutation detector (0.2.24+) — FIRST-TIME bug catching
+// ────────────────────────────────────────────────────────────
+//
+// Catches `.from("X").update({...})` or `.from("X").delete()` calls
+// NOT followed by a filter clause (`.eq`, `.match`, `.in`, `.neq`,
+// `.gt`, `.gte`, `.lt`, `.lte`, `.like`, `.ilike`, `.contains`,
+// `.containedBy`, `.rangeGt`, `.rangeLt`, `.rangeGte`, `.rangeLte`,
+// `.rangeAdjacent`, `.overlaps`, `.textSearch`, `.filter`, `.or`,
+// `.not`).
+//
+// Result of a missed filter: mass mutation of the entire table —
+// catastrophic data loss / unwanted state change. AI commonly drops
+// `.eq(...)` filters during refactors. First-time bug, pure static,
+// tight signal (specific Supabase chain shape), low FP risk.
+
+export type MassMutationHit = {
+  template: "mass-mutation";
+  filePath: string;
+  table: string;
+  operation: "update" | "delete";
+  line: number;
+  callExpression: string;  // The captured call source for the assertion
+  suggestedPin: string;
+};
+
+const SUPABASE_FILTER_METHODS = [
+  "eq", "neq", "in", "match", "gt", "gte", "lt", "lte",
+  "like", "ilike", "is", "contains", "containedBy",
+  "rangeGt", "rangeLt", "rangeGte", "rangeLte", "rangeAdjacent",
+  "overlaps", "textSearch", "filter", "or", "not",
+  // Single-row variants — operate on .single() returns. Acceptable.
+  "maybeSingle", "single",
+  // Limit clauses count as filters for safety purposes (a .update().limit(1)
+  // is still scoped, even if dangerous).
+  "limit", "range",
+];
+
+const SUPABASE_FILTER_RE = new RegExp(`\\.\\s*(?:${SUPABASE_FILTER_METHODS.join("|")})\\s*\\(`);
+
+export function detectMassMutation(filesByPath: Map<string, string>): MassMutationHit[] {
+  const out: MassMutationHit[] = [];
+  for (const [filePath, content] of filesByPath.entries()) {
+    if (isTestPath(filePath)) continue;
+    if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
+    // Skip migrations — those are intentional schema changes, not
+    // operational queries.
+    if (/(?:^|\/)(?:scripts|migrations|seeds|seed|fixtures)\//.test(filePath)) continue;
+
+    const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    // Match `<client>.from("<table>").update({...})` / `.delete()`
+    // where <client> is any of the recognized Supabase client names
+    // (same widened vocab as the rest of the codebase).
+    const chainRe = /\b(?:supabase|supabaseAdmin|admin|adminClient|db|sb|supa|client|userClient|serviceClient|sbAdmin|supabaseClient)\s*\.\s*from\s*\(\s*['"](\w+)['"]\s*\)\s*\.\s*(update|delete)\s*\(/g;
+    let m: RegExpExecArray | null;
+    while ((m = chainRe.exec(stripped)) !== null) {
+      const table = m[1];
+      const operation = m[2] as "update" | "delete";
+      // Find the matching `)` for this call, then look at the chain
+      // continuation. For .update we walk past the `{...}` object arg;
+      // for .delete the args are typically empty.
+      let depth = 1;
+      let j = m.index + m[0].length;
+      while (j < stripped.length && depth > 0) {
+        const c = stripped[j];
+        if (c === '"' || c === "'" || c === "`") {
+          const q = c;
+          j += 1;
+          while (j < stripped.length && stripped[j] !== q) {
+            if (stripped[j] === "\\") j += 1;
+            j += 1;
+          }
+        } else if (c === "(") depth += 1;
+        else if (c === ")") depth -= 1;
+        j += 1;
+      }
+      if (depth !== 0) continue;
+      // Now `j` is just past the closing `)` of update/delete. Look at
+      // the chain continuation. Allow whitespace + optional `.<method>`.
+      // We need to find AT LEAST ONE filter method in the chain before
+      // the chain terminates (`;`, line break + non-`.` start, etc).
+      // Conservative: scan the next ~600 chars for any filter method.
+      const after = stripped.slice(j, j + 600);
+      // Terminate at `;` at top-level or at a return statement.
+      const semiIdx = (() => {
+        let pd = 0;
+        for (let i = 0; i < after.length; i++) {
+          const c = after[i];
+          if (c === "(" || c === "[" || c === "{") pd += 1;
+          else if (c === ")" || c === "]" || c === "}") pd -= 1;
+          else if (c === ";" && pd === 0) return i;
+        }
+        return after.length;
+      })();
+      const chainTail = after.slice(0, semiIdx);
+      // Must have at least one filter method.
+      if (SUPABASE_FILTER_RE.test(chainTail)) continue;
+      // Special case: chain ends in `await` form like:
+      //   const { error } = await admin.from("X").update({...});
+      // The chain might be assigned to a variable that's then filtered
+      // — but in practice that's unusual. We treat this as unfiltered.
+      const line = (stripped.slice(0, m.index).match(/\n/g) || []).length + 1;
+      // Sample the full call expression (up to ~120 chars) for the
+      // pin's assertion target.
+      const callExpr = stripped.slice(m.index, Math.min(m.index + j - m.index + 100, m.index + 240)).replace(/\s+/g, " ").trim();
+      out.push({
+        template: "mass-mutation",
+        filePath,
+        table,
+        operation,
+        line,
+        callExpression: callExpr,
+        suggestedPin: `${operation.toUpperCase()} on table "${table}" in ${filePath}:${line} has NO filter clause (.eq / .match / .in / etc). Will mutate every row in the table. AI dropping a filter is the load-bearing cause of accidental mass-mutation bugs.`,
+      });
+    }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
 // Stripe webhook event-type dispatch detector (0.2.19+)
 // ────────────────────────────────────────────────────────────
 //

@@ -1028,6 +1028,7 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
       return null;
     case "expected-header":
     case "nullable-result":
+    case "mass-mutation":
       // File-bound — only touches to this file change the verdict.
       return [claim.filePath];
   }

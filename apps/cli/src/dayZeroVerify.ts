@@ -329,7 +329,8 @@ function preflight(claim: Claim, cwd: string): string | null {
       // cases itself with a clear assertion.
       return null;
     case "expected-header":
-    case "nullable-result": {
+    case "nullable-result":
+    case "mass-mutation": {
       const full = join(cwd, claim.filePath);
       if (!existsSync(full)) {
         return `file ${claim.filePath} doesn't exist — pin is saved, will verify once it lands`;

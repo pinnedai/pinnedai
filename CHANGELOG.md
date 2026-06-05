@@ -2,6 +2,22 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.2.24] — 2026-06-05
+
+### Added — `mass-mutation` detector (the "AI dropped the `.eq()` filter" defense)
+
+Catches `.from("X").update({...})` / `.from("X").delete()` calls that no longer have a filter clause (`.eq` / `.match` / `.in` / `.neq` / `.gt` / `.gte` / `.lt` / `.lte` / `.like` / `.ilike` / `.is` / `.contains` / `.containedBy` / `.range*` / `.overlaps` / `.textSearch` / `.filter` / `.or` / `.not` / `.maybeSingle` / `.single` / `.limit` / `.range`).
+
+The bug class: AI drops the `.eq("id", userId)` filter during refactor, leaving `.from("users").update({banned: true})` — which mutates **every row in the table** on first execution. Catastrophic data loss / unwanted state change. First-time bug class, pure static, tight signal, zero FPs across 10 dyad-app sweep.
+
+Pin asserts the captured call site STILL has a filter at test time OR the call is removed entirely (clean refactor). Fails when AI keeps the update/delete but drops every filter clause.
+
+Tests:
+- Detector matrix: 4/4 (positive update-no-filter / positive delete-no-filter / negative update-with-eq-filter / negative delete-with-in-filter)
+- Template matrix via real vitest: 3/3 (filter-present green / filter-removed red / call-removed-entirely green)
+- Dyad FP sweep: 0 hits across 10 repos — every existing update/delete in those repos has at least one filter
+- Regression: 327/327 vitest
+
 ## [0.2.23] — 2026-06-05
 
 Five new **first-time-bug** detectors per the audit agent's top-5 list. Every other Pinned detector assumes a green baseline to regress from — these five catch bugs at the *moment they're written*, before any baseline exists. All static (no creds, no runtime probes), all precision-gated (10-repo FP sweep), all wire into the existing real-time catching paths (PostToolUse hook + pre-commit + sweep + CI).

@@ -336,6 +336,8 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       return { files: [claim.filePath] };
     case "response-shape":
       return { files: [claim.producerFile, claim.consumerFile], routes: [claim.route] };
+    case "mass-mutation":
+      return { files: [claim.filePath] };
   }
 }
 
@@ -528,6 +530,8 @@ function claimLabel(c: Claim): string {
       return `\`nullable-result ${escapeMarkdownCell(c.filePath)}:${c.line}\``;
     case "response-shape":
       return `\`response-shape ${escapeMarkdownCell(c.route)}\` (${c.consumerReads.length} keys)`;
+    case "mass-mutation":
+      return `\`mass-mutation ${escapeMarkdownCell(c.filePath)}:${c.line}\` (${c.operation.toUpperCase()} ${escapeMarkdownCell(c.table)})`;
   }
 }
 
