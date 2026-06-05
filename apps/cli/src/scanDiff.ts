@@ -1695,6 +1695,39 @@ export function detectAuthChecksInDiff(diffByFile: DiffByFile): DiffAuthCheckHit
     if (firstHit.isWeak) {
       const hasConfirmer = AUTH_CONFIRMER_PATTERNS.some((re) => re.test(added));
       if (!hasConfirmer) continue;
+      // 0.3.1 FIX (bug #2 — FP on pass-through routing skip-list):
+      // even when the file contains a confirmer elsewhere, the WEAK
+      // match itself can be in a routing pass-through that EXPLICITLY
+      // does not gate the path. Classic shape:
+      //
+      //   if (pathname.startsWith("/admin")) return NextResponse.next();
+      //   if (pathname.startsWith("/_next")) return NextResponse.next();
+      //
+      // Here the .startsWith("/admin") is the OPPOSITE of an auth
+      // check — it's an allow-through. The confirmer elsewhere in the
+      // file (e.g., a real auth gate further down) is unrelated. The
+      // socialideagen middleware.ts case Cipherwake-Claude reported.
+      //
+      // Detection: look at the ~3 lines following the WEAK match. If
+      // they contain `return next()` / `return NextResponse.next()`
+      // (or other pass-through return shapes) BEFORE any confirmer-
+      // shaped expression, treat the match as not-a-gate.
+      const matchIdx = firstHit.signature ? added.indexOf(firstHit.signature) : -1;
+      if (matchIdx >= 0) {
+        // Take everything from the match forward until the next blank-
+        // line / closing brace / next top-level statement (~3 lines is
+        // a safe cap for the typical Next.js middleware shape).
+        const tail = added.slice(matchIdx, matchIdx + 400);
+        const PASS_THROUGH_RETURN = /\breturn\s+(?:NextResponse\.)?next\s*\(\s*\)/;
+        const CONFIRMER_BEFORE_PASS = /\b(?:status|code)\s*\(\s*40[13]\b|throw\s+new\s+\w*(?:Unauthorized|Forbidden)|NextResponse\.redirect|return\s+new\s+Response/;
+        const passIdx = tail.search(PASS_THROUGH_RETURN);
+        const confirmerIdx = tail.search(CONFIRMER_BEFORE_PASS);
+        if (passIdx >= 0 && (confirmerIdx < 0 || confirmerIdx > passIdx)) {
+          // The first thing after the WEAK match is a pass-through.
+          // Skip — this isn't gating, it's the opposite.
+          continue;
+        }
+      }
     }
 
     const key = route;

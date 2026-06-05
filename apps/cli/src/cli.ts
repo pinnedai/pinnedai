@@ -15,8 +15,8 @@ import {
   mkdirSync,
   existsSync,
   readdirSync,
-  renameSync,
   lstatSync,
+  unlinkSync,
 } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
@@ -6013,6 +6013,9 @@ program
       filename: gen.filename,
     });
     writeRegistry(opts.outDir, registry);
+    // 0.3.1 CLI-edit marker so the pre-commit guard recognizes this
+    // as a sanctioned change.
+    try { writeCliEditMarker(opts.outDir); } catch { /* non-fatal */ }
     out(`+ ${relative(process.cwd(), target)}`);
     out("");
     out(`  Endpoint:        ${method} ${claim.route}`);
@@ -9909,7 +9912,21 @@ program
           addedLines: added || undefined,
         });
       }
-      const extraViolations = detectGuardIntegrityViolations({ changedFiles: extraFiles });
+      // 0.3.1+ CLI-edit marker: if the CLI just touched the registry,
+      // its stamp matches the current registry's sha256 → guard knows
+      // not to flag the registry-modified-directly warning.
+      let cliEditMarkerSha: string | undefined;
+      let currentRegistrySha: string | undefined;
+      try {
+        const markerPath = ".pinned/.last-cli-edit";
+        const registryPath = "tests/pinned/.registry.json";
+        if (existsSync(markerPath) && existsSync(registryPath)) {
+          const marker = JSON.parse(readFileSync(markerPath, "utf8")) as { registrySha256?: string };
+          if (typeof marker.registrySha256 === "string") cliEditMarkerSha = marker.registrySha256;
+          currentRegistrySha = createHash("sha256").update(readFileSync(registryPath, "utf8")).digest("hex");
+        }
+      } catch { /* non-fatal */ }
+      const extraViolations = detectGuardIntegrityViolations({ changedFiles: extraFiles, cliEditMarkerSha, currentRegistrySha });
 
       // Commit-time mistake detection — fires on the same staged
       // diff. Picks up SECRET/ENV/HARDCODED/ERR_DROP/AUTH_DROP
@@ -11792,7 +11809,331 @@ program
     } catch { /* */ }
   });
 
+// ---------- verify (0.3.1+, server-side enforcement layer) ----------
+// The CI check that turns the bypassable local pre-commit guard into
+// real enforcement. Local guard = DX layer; this command = enforcement
+// layer. Cannot be skipped via --no-verify because it runs server-side
+// in the customer's GitHub Action workflow.
+//
+// Per the spec: pure git + filesystem, zero network. Exit 0 = clean,
+// exit 1 = a protected pin was removed/weakened without an audit trail.
+program
+  .command("verify")
+  .description(
+    "CI enforcement layer. Diffs HEAD against --base and FAILS on: deleted pin files without retired/+audit, deleted registry entries without audit, weakened pins (assertion stripped, .skip added), retires without audit JSON, or registry/file drift. Required-status-check material. Local pre-commit guard is bypassable (--no-verify); this is not."
+  )
+  .option("--base <ref>", "Git base ref to diff against (default: origin/main if available, else HEAD~1).", "")
+  .option("--dir <path>", "Pinned tests directory (default: tests/pinned).", "tests/pinned")
+  .option("--json", "Emit JSON instead of human-readable.")
+  .option("--quiet", "Suppress the pinned banner header.")
+  .action(async (opts: { base: string; dir: string; json?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet && !opts.json) printBanner();
+    const cwd = process.cwd();
+    // Resolve base ref.
+    const baseRef = opts.base || (() => {
+      try {
+        execFileSync("git", ["rev-parse", "--verify", "origin/main"], { cwd, stdio: "ignore" });
+        return "origin/main";
+      } catch {
+        try {
+          execFileSync("git", ["rev-parse", "--verify", "HEAD~1"], { cwd, stdio: "ignore" });
+          return "HEAD~1";
+        } catch {
+          return "";
+        }
+      }
+    })();
+    if (!baseRef) {
+      err("✗ pinned verify: no base ref resolvable (no origin/main, no HEAD~1). Pass --base <ref> explicitly.\n");
+      process.exit(1);
+    }
+    // Build a ChangedFile[] from the git diff.
+    let diffOutput: string;
+    try {
+      diffOutput = execFileSync("git", ["diff", "--name-status", `${baseRef}...HEAD`], { cwd, encoding: "utf8" });
+    } catch (e) {
+      err(`✗ pinned verify: git diff failed against base "${baseRef}": ${(e as Error).message}\n`);
+      process.exit(1);
+    }
+    type ChangedFile = { path: string; status: "added" | "modified" | "deleted"; addedLines?: string };
+    const changedFiles: ChangedFile[] = [];
+    for (const line of diffOutput.split("\n")) {
+      if (!line.trim()) continue;
+      const [st, ...pathParts] = line.split("\t");
+      const path = pathParts.join("\t");
+      if (!path) continue;
+      const status: ChangedFile["status"] = st.startsWith("A") ? "added" : st.startsWith("D") ? "deleted" : "modified";
+      // Collect added lines for "added" or "modified" — guard checks
+      // for skip/weakening patterns need them.
+      let addedLines: string | undefined;
+      if (status !== "deleted") {
+        try {
+          const diffText = execFileSync("git", ["diff", `${baseRef}...HEAD`, "--", path], { cwd, encoding: "utf8" });
+          addedLines = diffText
+            .split("\n")
+            .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+            .map((l) => l.slice(1))
+            .join("\n");
+        } catch { /* non-fatal */ }
+      }
+      changedFiles.push({ path, status, addedLines });
+    }
+    // 0.3.1 verify fix: filter out pin-deleted violations when the
+    // same diff also adds a matching retired/<id>.test.ts + audit
+    // JSON. Otherwise a proper `pinned retire` would falsely flag in
+    // CI because the test file IS deleted at its original location —
+    // even though the audit trail is intact.
+    const filteredChangedFiles: ChangedFile[] = changedFiles.map((f) => {
+      if (f.status !== "deleted") return f;
+      if (!f.path.startsWith(`${opts.dir}/`) || !f.path.endsWith(".test.ts")) return f;
+      // Skip top-level pin under retired/ already (no nested retire).
+      if (f.path.startsWith(`${opts.dir}/retired/`)) return f;
+      const claimId = f.path.replace(new RegExp(`^${opts.dir}/`), "").replace(/\.test\.ts$/, "");
+      const retiredPath = `${opts.dir}/retired/${claimId}.test.ts`;
+      const auditPath = `${opts.dir}/retired/${claimId}.audit.json`;
+      const retiredAdded = changedFiles.some((cf) => cf.path === retiredPath && cf.status === "added");
+      const auditAdded = changedFiles.some((cf) => cf.path === auditPath && cf.status === "added");
+      if (retiredAdded && auditAdded) {
+        // Proper retire — don't surface this as a violation. Mark the
+        // file with a sentinel status so the guard's pin-deletion
+        // detector doesn't fire on it.
+        return { ...f, status: "modified" as const, addedLines: "// (proper retire — file moved to retired/ with audit)" };
+      }
+      return f;
+    });
+    // Same for the registry's modified status — if it changed AND
+    // a retire happened in this diff, the registry change is part of
+    // the retire and shouldn't flag.
+    const retireInDiff = filteredChangedFiles.some((f) =>
+      f.path.startsWith(`${opts.dir}/retired/`) && f.path.endsWith(".audit.json") && f.status === "added"
+    );
+    const finalChangedFiles: ChangedFile[] = retireInDiff
+      ? filteredChangedFiles.map((f) =>
+          f.path === `${opts.dir}/.registry.json` && f.status === "modified"
+            ? { ...f, status: "added" as const } // bypass the registry-modified detector
+            : f
+        )
+      : filteredChangedFiles;
+    // Run the guard.
+    const { detectGuardIntegrityViolations } = await import("./guardIntegrity.js");
+    const violations = detectGuardIntegrityViolations({ changedFiles: finalChangedFiles });
+    // Additional verify-only check: every retire must have an audit
+    // JSON committed alongside the moved test file.
+    const auditViolations: { type: string; severity: string; file: string; evidence: string }[] = [];
+    for (const f of changedFiles) {
+      if (f.status !== "added") continue;
+      if (!f.path.startsWith(`${opts.dir}/retired/`)) continue;
+      if (!f.path.endsWith(".test.ts")) continue;
+      const claimId = f.path.replace(new RegExp(`^${opts.dir}/retired/`), "").replace(/\.test\.ts$/, "");
+      const auditPath = `${opts.dir}/retired/${claimId}.audit.json`;
+      const auditInDiff = changedFiles.some((cf) => cf.path === auditPath && cf.status === "added");
+      if (!auditInDiff) {
+        auditViolations.push({
+          type: "retire-without-audit",
+          severity: "block",
+          file: f.path,
+          evidence: `Pin retired (file moved to retired/) but no matching audit JSON at ${auditPath}. Every retirement must commit the audit log alongside the move. Use \`pinned retire <id> --reason="…"\` to retire properly.`,
+        });
+      }
+    }
+    // Registry/file drift check: every registry entry should have a
+    // file (active OR retired/). Done by reading the FINAL registry
+    // (HEAD state) + checking each filename exists.
+    const driftViolations: { type: string; severity: string; file: string; evidence: string }[] = [];
+    try {
+      const registry = readRegistry(opts.dir);
+      for (const c of registry.claims) {
+        if (c.status === "retired") continue;
+        const expected = join(opts.dir, c.filename);
+        if (!existsSync(expected)) {
+          driftViolations.push({
+            type: "registry-file-drift",
+            severity: "block",
+            file: expected,
+            evidence: `Registry entry "${c.claimId}" references ${c.filename} but the file is missing. Either restore it from git history or remove the entry with \`pinned rm ${c.claimId} --force\`.`,
+          });
+        }
+      }
+    } catch { /* registry missing or unreadable — no drift to detect */ }
+    const allViolations = [...violations, ...auditViolations, ...driftViolations];
+    const blocking = allViolations.filter((v) => v.severity === "block");
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ baseRef, violations: allViolations, pass: blocking.length === 0 }, null, 2) + "\n");
+      process.exit(blocking.length === 0 ? 0 : 1);
+    }
+    if (allViolations.length === 0) {
+      out(`✓ pinned verify: PASS (base: ${baseRef})`);
+      process.exit(0);
+    }
+    out(`pinned verify: ${allViolations.length} violation${allViolations.length === 1 ? "" : "s"} (base: ${baseRef})`);
+    out("");
+    for (const v of allViolations) {
+      const tag = v.severity === "block" ? "✗" : "!";
+      out(`  ${tag} [${v.type}] ${v.file}`);
+      out(`      ${v.evidence}`);
+      out("");
+    }
+    if (blocking.length > 0) {
+      out(`✗ ${blocking.length} blocking violation${blocking.length === 1 ? "" : "s"}. CI must fail.`);
+      out("Fix: use \`pinned retire\` or \`pinned rm\` for sanctioned changes; restore files from git for accidental deletions.");
+      process.exit(1);
+    }
+    process.exit(0);
+  });
+
+// ---------- rm (0.3.1+, Cipherwake-reported dead-end fix) ----------
+// Clean removal of experimental / throwaway pins. Drops the test
+// file + registry entry + PINS.md row in one sanctioned step, no
+// retire-style audit trail. For pins the user wants to UN-CREATE,
+// not retire — e.g., a smoke pin added 30 seconds ago to test the
+// shape of the command. Sanctioned = the CLI-edit marker gets
+// stamped so the pre-commit guard recognizes this as a CLI-driven
+// change, not a hand-edit.
+program
+  .command("rm <claim-id>")
+  .alias("remove")
+  .description(
+    "Delete a pin entirely — file, registry entry, and PINS.md row. For experimental/throwaway pins. Use `pinned retire` instead when you want an audit trail."
+  )
+  .option("--dir <path>", "Pinned tests directory (default: tests/pinned)", "tests/pinned")
+  .option("--force", "Skip the confirmation prompt.")
+  .option("--quiet", "Suppress the pinned banner header.")
+  .action((claimId: string, opts: { dir: string; force?: boolean; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    assertSafeId("claim id", claimId);
+    assertInsideDir(opts.dir, process.cwd());
+    const src = join(opts.dir, `${claimId}.test.ts`);
+    assertInsideDir(src, opts.dir);
+    const registry = readRegistry(opts.dir);
+    const claimEntry = registry.claims.find((c) => c.claimId === claimId);
+    const fileExists = existsSync(src);
+    if (!claimEntry && !fileExists) {
+      err(`✗ No pinned claim "${claimId}" — not in registry, no file at ${src}.\n`);
+      process.exit(1);
+    }
+    if (!opts.force) {
+      out(`This will permanently delete:`);
+      if (fileExists) out(`  - ${relative(process.cwd(), src)}`);
+      if (claimEntry) out(`  - registry entry "${claimId}"`);
+      out("");
+      out("Use `pinned retire` instead if you want an audit trail.");
+      out("Re-run with --force to confirm.");
+      process.exit(0);
+    }
+    // Delete the file if it exists.
+    if (fileExists) {
+      try { unlinkSync(src); } catch (e) {
+        err(`✗ Could not delete ${src}: ${(e as Error).message}\n`);
+        process.exit(1);
+      }
+    }
+    // Drop the registry entry.
+    if (claimEntry) {
+      const nextRegistry = {
+        ...registry,
+        claims: registry.claims.filter((c) => c.claimId !== claimId),
+      };
+      writeRegistry(opts.dir, nextRegistry);
+      // Stamp the CLI-edit marker so the pre-commit guard recognizes
+      // this as a sanctioned change (fix #4 in the spec).
+      try { writeCliEditMarker(opts.dir); } catch { /* non-fatal */ }
+    }
+    out(`- removed: ${claimId}`);
+    if (fileExists) out(`  · deleted ${relative(process.cwd(), src)}`);
+    if (claimEntry) out(`  · dropped registry entry`);
+    out("");
+    out("Commit the change to keep the registry in sync with what's on disk:");
+    out(`  git add ${opts.dir} && git commit -m \"rm: drop experimental pin ${claimId}\"`);
+  });
+
+// 0.3.1+ — CLI-edit marker so the pre-commit guard can distinguish
+// CLI-driven registry changes (sanctioned) from hand-edits (still
+// flagged). Marker file: .pinned/.last-cli-edit, contains sha256 of
+// the current registry. Guard reads it and if the hash matches, the
+// registry edit was made by us.
+function writeCliEditMarker(pinnedTestsDir: string): void {
+  const registryPath = join(pinnedTestsDir, ".registry.json");
+  if (!existsSync(registryPath)) return;
+  const content = readFileSync(registryPath, "utf8");
+  const hash = createHash("sha256").update(content).digest("hex");
+  const markerDir = ".pinned";
+  if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+  writeFileSync(
+    join(markerDir, ".last-cli-edit"),
+    JSON.stringify({ registrySha256: hash, at: new Date().toISOString() }, null, 2) + "\n"
+  );
+}
+
 // ---------- retire ----------
+program
+  .command("heal-retired")
+  .description(
+    "One-shot migration for 0.3.0 → 0.3.1: scans tests/pinned/retired/ and rewrites any non-stub .test.ts files to the self-skip stub. Fixes the 0.3.0 bug where retired pins still executed because they kept their .test.ts extension under the default vitest glob."
+  )
+  .option("--dir <path>", "Pinned tests directory (default: tests/pinned)", "tests/pinned")
+  .option("--quiet", "Suppress the pinned banner header.")
+  .action((opts: { dir: string; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const retiredDir = join(opts.dir, "retired");
+    if (!existsSync(retiredDir)) {
+      out("No tests/pinned/retired/ directory found. Nothing to heal.");
+      return;
+    }
+    let healed = 0;
+    let alreadyOk = 0;
+    for (const file of readdirSync(retiredDir)) {
+      if (!file.endsWith(".test.ts")) continue;
+      const filePath = join(retiredDir, file);
+      const content = readFileSync(filePath, "utf8");
+      // A self-skip stub already has this marker.
+      if (content.includes("RETIRED pinned claim — kept for audit trail")) {
+        alreadyOk++;
+        continue;
+      }
+      // Find the matching audit JSON for the retire reason + date.
+      const claimId = file.replace(/\.test\.ts$/, "");
+      const auditPath = join(retiredDir, `${claimId}.audit.json`);
+      let reason = "(reason unknown — original retire pre-0.3.1)";
+      let retiredAt = "(date unknown)";
+      try {
+        const audit = JSON.parse(readFileSync(auditPath, "utf8"));
+        if (typeof audit.reason === "string") reason = audit.reason;
+        if (typeof audit.retiredAt === "string") retiredAt = audit.retiredAt;
+      } catch { /* keep defaults */ }
+      const stub = `// ═══════════════════════════════════════════════════════════════
+// ◆ RETIRED pinned claim — kept for audit trail; auto-skips.
+// ═══════════════════════════════════════════════════════════════
+// claim:   ${claimId}
+// retired: ${retiredAt}
+// reason:  ${reason.replace(/\*\//g, "*\\/")}
+//
+// See ${join(retiredDir, claimId)}.audit.json for full retirement metadata.
+// (Healed by \`pinned heal-retired\` — was executable before 0.3.1.)
+// ═══════════════════════════════════════════════════════════════
+
+import { describe, it } from "vitest";
+
+describe(${JSON.stringify("retired: " + claimId)}, () => {
+  it.skip(${JSON.stringify(`retired on ${retiredAt.slice(0, 10)}: ${reason}`)}, () => {});
+});
+`;
+      writeFileSync(filePath, stub);
+      healed++;
+      out(`+ healed: ${relative(process.cwd(), filePath)}`);
+    }
+    out("");
+    if (healed === 0 && alreadyOk === 0) {
+      out("No retired test files found.");
+    } else {
+      out(`${healed} healed, ${alreadyOk} already in stub form.`);
+      if (healed > 0) {
+        out("");
+        out("Commit the rewritten files so the audit trail is preserved + the suite passes:");
+        out(`  git add ${opts.dir}/retired && git commit -m \"heal: rewrite retired pins as self-skip stubs (0.3.1 fix)\"`);
+      }
+    }
+  });
+
 program
   .command("retire")
   .description(
@@ -11818,15 +12159,70 @@ program
     assertInsideDir(opts.dir, process.cwd());
     const src = join(opts.dir, `${claimId}.test.ts`);
     assertInsideDir(src, opts.dir);
-    if (!existsSync(src)) {
-      err(`✗ No pinned claim found at ${src}\n`);
+    const fileMissing = !existsSync(src);
+    // 0.3.1 FIX (Cipherwake-reported dead-end): retire by claim-id must
+    // work even when the file is already gone. Before this fix, deleting
+    // a test file then running `pinned retire <id>` returned "✗ No
+    // pinned claim found at <src>" — leaving the user with a dangling
+    // registry entry that couldn't be retired (file gone) AND couldn't
+    // be removed (no rm command) AND couldn't be hand-fixed (guard
+    // blocks registry edits). The only escape was PINNEDAI_ALLOW_PIN_
+    // EDIT=1 — a trap normal users would not find. Now: if the file is
+    // missing but the claim IS in the registry, we still reconcile the
+    // registry + write the audit entry (skipping the file move). If
+    // the file is missing AND the claim isn't registered, that's a real
+    // user error and we keep the failure.
+    const registryAtRetire = readRegistry(opts.dir);
+    const claimInRegistry = registryAtRetire.claims.some((c) => c.claimId === claimId);
+    if (fileMissing && !claimInRegistry) {
+      err(`✗ No pinned claim "${claimId}" — neither at ${src} nor in the registry.\n`);
       process.exit(1);
     }
     const retiredDir = join(opts.dir, "retired");
     mkdirSync(retiredDir, { recursive: true });
     const dest = join(retiredDir, `${claimId}.test.ts`);
     assertInsideDir(dest, retiredDir);
-    renameSync(src, dest);
+    // 0.3.1 FIX (bug #1 — "retirement doesn't retire"): the rename
+    // alone left an executable .test.ts inside the vitest glob
+    // (tests/pinned/**/*.test.ts), so retired pins kept failing the
+    // suite forever — the worst kind of adoption-killer when paired
+    // with a false-positive pin that can't be cleared.
+    //
+    // Fix: rewrite the file content to a self-skipping stub when we
+    // move it. The file still exists at the same path for the audit
+    // trail; the glob still matches; but the test always SKIPS with
+    // the retire reason. Belt-and-suspenders for customers who use
+    // their own vitest config (we can't assume our generated one).
+    const stubContent = `// ═══════════════════════════════════════════════════════════════
+// ◆ RETIRED pinned claim — kept for audit trail; auto-skips.
+// ═══════════════════════════════════════════════════════════════
+// claim:   ${claimId}
+// retired: ${new Date().toISOString()}
+// reason:  ${opts.reason.split("*/").join("*\\/")}
+//
+// See ${join(retiredDir, claimId)}.audit.json for full retirement metadata.
+// To un-retire: restore the original test from git history and
+// remove this stub. Or run \`pinned generate --pr-id <id>\` to
+// re-create the pin from the registered claim.
+// ═══════════════════════════════════════════════════════════════
+
+import { describe, it } from "vitest";
+
+describe("retired: ${claimId.replace(/"/g, '\\"')}", () => {
+  it.skip(${JSON.stringify(`retired on ${new Date().toISOString().slice(0, 10)}: ${opts.reason}`)}, () => {});
+});
+`;
+    // Skip writing the stub if the file is already gone — there's
+    // nothing to keep an audit trail of (the original content is in
+    // git history if the user had committed it). The registry +
+    // audit JSON still get written below, which is the whole point
+    // of the reconcile path.
+    if (!fileMissing) {
+      writeFileSync(dest, stubContent);
+      // The original .test.ts is no longer needed — its content is
+      // now in git history, and the destination has the self-skip stub.
+      try { unlinkSync(src); } catch { /* may already be gone if rename was partial */ }
+    }
 
     const retiredBy =
       process.env.GITHUB_ACTOR ?? process.env.USER ?? "unknown";
@@ -11850,6 +12246,9 @@ program
       retiredBy
     );
     writeRegistry(opts.dir, registry);
+    // 0.3.1 CLI-edit marker so the pre-commit guard recognizes this
+    // as a sanctioned change.
+    try { writeCliEditMarker(opts.dir); } catch { /* non-fatal */ }
 
     // M3 (0.2.12+): refresh the status cache so hooks/statusline
     // immediately reflect the retire. Pre-0.2.12, the cached

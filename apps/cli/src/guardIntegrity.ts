@@ -41,6 +41,18 @@ export type GuardIntegrityViolation = {
 
 export type GuardIntegrityInput = {
   changedFiles: ChangedFile[];
+  // 0.3.1+: optional reader for the CLI-edit marker. When the
+  // pre-commit guard runs, it can pass a callback that returns the
+  // sha256 the CLI stamped into .pinned/.last-cli-edit on its last
+  // registry write. If that hash matches the CURRENT registry
+  // content's sha256, the registry edit was CLI-driven and should
+  // NOT trigger the "registry modified directly" warning. Without
+  // this hook, every `pinned smoke add` / `pinned rm` / `pinned
+  // retire` lit up the guard on commit — the false-tampering trap
+  // Cipherwake reported.
+  cliEditMarkerSha?: string;
+  // The current registry file content (for marker comparison).
+  currentRegistrySha?: string;
 };
 
 // Paths Guard Integrity considers "protected" — modifications to
@@ -363,6 +375,12 @@ export function detectGuardIntegrityViolations(input: GuardIntegrityInput): Guar
   out.push(...detectRegistryEntryRemoved(input.changedFiles));
   out.push(...detectAssertionCommented(input.changedFiles));
   out.push(...detectAiLessonsTampered(input.changedFiles));
+  // 0.3.1+ filter: if the CLI-edit marker matches the current
+  // registry content, the registry-modified-directly warning was
+  // raised by a CLI-driven change. Strip it.
+  if (input.cliEditMarkerSha && input.currentRegistrySha && input.cliEditMarkerSha === input.currentRegistrySha) {
+    return out.filter((v) => v.type !== "registry-entry-removed" || v.severity !== "warn");
+  }
   return out;
 }
 

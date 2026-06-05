@@ -2,6 +2,55 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.3.1] — 2026-06-05
+
+Bug-pack release. Six Cipherwake-dogfood-reported issues that compounded into "FP auth pin you can't silence" — the exact adoption-killer the wedge release shouldn't have shipped with.
+
+### Fixed — Retired pins kept executing (the adoption-killer)
+
+`pinned retire` moved the test to `tests/pinned/retired/<id>.test.ts` but the default vitest glob (`tests/pinned/**/*.test.ts`) still picked it up. So a retired pin failed the suite forever. Now: the moved file content is rewritten to a self-skipping stub at retire time — file still exists for the audit trail, glob still matches, but the test is a harmless `it.skip()` with the retire reason. `pinned heal-retired` rewrites existing 0.3.0-retired pins to the same stub form.
+
+### Fixed — Retire dead-end when test file was already deleted
+
+`pinned retire <id>` previously required the test file to exist on disk. If a user manually deleted the file (the natural throwaway flow) then ran retire, it errored with `✗ No pinned claim found at ...` — leaving a dangling registry entry that couldn't be retired (file gone), couldn't be removed (no command), and couldn't be hand-fixed (guard blocks registry edits). The only escape was `PINNEDAI_ALLOW_PIN_EDIT=1`. Now: retire reconciles by claim-id; if the file is missing but the registry has the claim, it still updates the registry + writes the audit JSON.
+
+### Added — `pinned rm <id>` (clean experimental-pin removal)
+
+Drops the test file + registry entry + PINS.md row in one sanctioned step, with `--force` confirmation. For pins you want to UN-CREATE (not retire — no audit trail needed). Stamps the CLI-edit marker so the pre-commit guard recognizes it as sanctioned.
+
+### Fixed — False-positive auth pin on pass-through routing skip-lists
+
+The auth-check detector matched `pathname.startsWith("/admin")` as a gate even when the line was in a routing skip-list (`if (pathname.startsWith("/admin")) return NextResponse.next();`) — i.e. the OPPOSITE of an auth check. The detector now looks at the surrounding block: if the WEAK match is followed by `return next()` / `return NextResponse.next()` BEFORE any confirmer-shaped expression, treat it as not-a-gate. The bug Cipherwake reported on socialideagen `middleware.ts`.
+
+### Fixed — Enum-drift contract column-name collision
+
+A `job-status` contract with `column: "status"` previously matched EVERY `status` column across the repo — including unrelated `status` fields (idea draft/live, comment status, etc.) — flagging legitimate values as drift. Added `appliesTo: string[]` to the contract schema: contracts only fire on files matching the declared globs (`lib/jobs/**`, exact paths, prefix patterns). Absence = repo-wide (back-compat with 0.3.0).
+
+### Added — CLI-edit marker (sanctions CLI-driven registry changes)
+
+`pinned smoke add` / `pinned rm` / `pinned retire` now stamp `.pinned/.last-cli-edit` with the sha256 of the registry after writing. The pre-commit guard reads it: if the marker hash matches the current registry's hash, the change was CLI-driven and the "registry modified directly" warning is suppressed. Hand-edits still fire the warning (hash mismatch).
+
+### Added — `pinned verify` (server-side enforcement layer)
+
+The CI check that turns the bypassable local guard into real enforcement. Local pre-commit guard = DX layer (defeatable via `--no-verify`, `PINNEDAI_ALLOW_PIN_EDIT=1`, or `pinned uninstall`); `pinned verify` runs server-side in the GitHub Action and CANNOT be `--no-verify`'d.
+
+Diffs HEAD against `--base` and FAILS on: deleted pin files without matching `retired/<id>.test.ts` + audit JSON, deleted registry entries without audit, weakened pins, retires without a valid audit entry, and registry/file drift. Exit 0 = clean, exit 1 = blocking violation.
+
+Acceptance test (passes): `rm tests/pinned/<id>.test.ts && git commit --no-verify && pinned verify` exits 1 with the removed claim-id; `pinned retire <id> --reason="..."` (sanctioned retire) → `pinned verify` exits 0.
+
+### Verified end-to-end
+
+- 392/392 vitest (was 389; +3 new tests for contract `appliesTo`)
+- 16/16 acceptance matrix: dead-end fix, `pinned rm`, retire-stub, CLI-edit marker, verify-catches-silent-removal, verify-passes-proper-retire, bug 2 regression
+- 54/54 dyad-apps FP sweep across 6 repos × 9 new commands
+- `pinned verify` runs clean against real dyad repos
+
+### Positioning fix
+
+Stopped calling pins "permanent / unbreakable contracts" in docs — a sharp user disproves it with one `--no-verify`. Reframed as: "weakening a pin is loud, deliberate, and auditable locally; with `pinned verify` as a required CI check, a silent pin removal can't be merged." Local hook = DX layer; `pinned verify` = enforcement layer.
+
+---
+
 ## [0.3.0] — 2026-06-05
 
 **The wedge feature.** Tier 1 functional smoke pins — Pinned actually executes your feature once at pin-eval and asserts a real outcome. Catches the dominant AI failure mode: "the agent confidently ships a feature that LOOKS done but never actually works" (silent empty return, hung worker, status-string mismatch). Combined with task #146 (Tier 0 agent prompt) shipping the same release, this is the capability that turns Pinned from "protects what works" into "tells you whether it works at all."

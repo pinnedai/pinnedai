@@ -38,6 +38,18 @@ export type EnumContract = {
   column?: string;
   // The agreed enum vocabulary. Order is not load-bearing.
   values: string[];
+  // 0.3.1+ (Cipherwake-reported FP fix): file/glob scope. When set,
+  // the contract only applies to files matching one of these
+  // patterns. Avoids the column-name collision case — e.g. a
+  // job-status contract with column "status" was previously matching
+  // EVERY `status` column across the repo (idea status, comment
+  // status, anything). With `appliesTo: ["lib/claudeDroplet.ts",
+  // "lib/jobs/**"]` it only applies where it's meant to.
+  //
+  // Glob shape: simple prefix matching for now — "lib/jobs/**" means
+  // "files under lib/jobs/". Exact-match also supported. No regex.
+  // Absence = repo-wide (back-compat with 0.3.0 contracts).
+  appliesTo?: string[];
   // The contract file path (repo-relative) — used in diagnostics so
   // users know which file to edit when a drift fires.
   sourcePath: string;
@@ -97,7 +109,10 @@ export function loadContracts(cwd: string): EnumContract[] {
       : null;
     if (!name || !values || values.length === 0) continue;
     const column = typeof obj.column === "string" ? obj.column : undefined;
-    contracts.push({ name, column, values, sourcePath });
+    const appliesTo = Array.isArray(obj.appliesTo)
+      ? (obj.appliesTo as unknown[]).filter((v): v is string => typeof v === "string")
+      : undefined;
+    contracts.push({ name, column, values, appliesTo, sourcePath });
   }
   return contracts;
 }
@@ -127,6 +142,22 @@ function isCodeFile(p: string): boolean {
   return /\.(?:tsx?|jsx?|mjs|cjs)$/.test(p);
 }
 
+// 0.3.1 helper: does this file match the contract's `appliesTo`
+// scope? Empty/undefined `appliesTo` = repo-wide (back-compat).
+// Glob: trailing `/**` matches subtree; trailing `*` matches prefix.
+// Anything else is treated as an exact path match.
+function contractMatchesFile(c: EnumContract, filePath: string): boolean {
+  if (!c.appliesTo || c.appliesTo.length === 0) return true;
+  const fp = filePath.toLowerCase();
+  for (const pat of c.appliesTo) {
+    const p = pat.toLowerCase();
+    if (fp === p) return true;
+    if (p.endsWith("/**") && fp.startsWith(p.slice(0, -3))) return true;
+    if (p.endsWith("*") && fp.startsWith(p.slice(0, -1))) return true;
+  }
+  return false;
+}
+
 export function detectContractDrift(
   filesByPath: Map<string, string>,
   contracts: EnumContract[]
@@ -142,6 +173,9 @@ export function detectContractDrift(
   for (const [filePath, content] of filesByPath.entries()) {
     if (!isCodeFile(filePath)) continue;
     if (isLikelyTestOrMigrationPath(filePath)) continue;
+    // 0.3.1: filter contracts to those applicable to this file.
+    const applicableContracts = contracts.filter((c) => contractMatchesFile(c, filePath));
+    if (applicableContracts.length === 0) continue;
     const lines = content.split("\n");
     for (let li = 0; li < lines.length; li++) {
       const line = lines[li];
@@ -151,7 +185,7 @@ export function detectContractDrift(
       CONSUMER_REGEX.lastIndex = 0;
       while ((cm = CONSUMER_REGEX.exec(line)) !== null) {
         const [, column, value] = cm;
-        for (const c of contracts) {
+        for (const c of applicableContracts) {
           const bindColumn = c.column ?? c.name;
           if (column !== bindColumn) continue;
           if (c.values.includes(value)) continue;
@@ -173,7 +207,7 @@ export function detectContractDrift(
         re.lastIndex = 0;
         while ((pm = re.exec(line)) !== null) {
           const [, column, value] = pm;
-          for (const c of contracts) {
+          for (const c of applicableContracts) {
             const bindColumn = c.column ?? c.name;
             if (column !== bindColumn) continue;
             if (c.values.includes(value)) continue;

@@ -1,6 +1,6 @@
 {
   "name": "pinnedai",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Smoke-test AI-built features so they actually work — not just parse. `pinned smoke add` runs your endpoint and asserts real invariants (non-empty, terminal state within bound, rejects bad input, errors on faults). Catches the AI-shipped-but-never-works bug class. Plus regression net for Server Actions / paid-API calls / Edge Functions / cron / webhooks / journeys, cross-repo enum-drift contracts, FP suppression store, readiness gate, AI-lesson injection at PreToolUse. Free beta · Founder Pro waitlist open.",
   "type": "module",
   "license": "Apache-2.0",

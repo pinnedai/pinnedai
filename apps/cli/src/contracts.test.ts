@@ -197,3 +197,57 @@ describe("describeContractHit", () => {
     expect(out).toContain("producer-in-different-repo");
   });
 });
+
+describe("contract appliesTo — column-name collision fix", () => {
+  it("contract WITHOUT appliesTo applies repo-wide (back-compat with 0.3.0)", () => {
+    const contracts = [
+      { name: "status", column: "status", values: ["completed", "failed"], sourcePath: ".pinned/contracts/status.json" },
+    ];
+    const files = new Map<string, string>([
+      ["lib/jobs/run.ts", `if (job.status === "stuck") {}`],
+      ["lib/ideas.ts", `if (idea.status === "live") {}`],
+    ]);
+    // Without appliesTo, BOTH files match (the 0.3.0 collision bug)
+    const hits = detectContractDrift(files, contracts);
+    expect(hits.length).toBe(2);
+  });
+
+  it("contract WITH appliesTo scopes to declared files only", () => {
+    const contracts = [
+      {
+        name: "job-status",
+        column: "status",
+        values: ["pending", "processing", "completed", "failed"],
+        appliesTo: ["lib/jobs/**", "lib/claudeDroplet.ts"],
+        sourcePath: ".pinned/contracts/job-status.json",
+      },
+    ];
+    const files = new Map<string, string>([
+      // Should fire: matches lib/jobs/**
+      ["lib/jobs/poll.ts", `if (job.status === "done") {}`],
+      // Should fire: matches exact path
+      ["lib/claudeDroplet.ts", `if (job.status === "done") {}`],
+      // Should NOT fire: unrelated file using a different `status` enum
+      ["lib/ideas.ts", `if (idea.status === "live") {}`],
+      ["lib/comments.ts", `if (c.status === "pending-review") {}`],
+    ]);
+    const hits = detectContractDrift(files, contracts);
+    const paths = hits.map((h) => h.filePath).sort();
+    expect(paths).toEqual(["lib/claudeDroplet.ts", "lib/jobs/poll.ts"]);
+    // Unrelated files are NOT flagged
+    expect(paths).not.toContain("lib/ideas.ts");
+    expect(paths).not.toContain("lib/comments.ts");
+  });
+
+  it("appliesTo: prefix glob with trailing /*", () => {
+    const contracts = [
+      { name: "ok", values: ["yes", "no"], appliesTo: ["src/api/*"], sourcePath: ".pinned/contracts/ok.json" },
+    ];
+    const files = new Map<string, string>([
+      ["src/api/users.ts", `r.ok === "maybe"`],
+      ["src/components/button.tsx", `props.ok === "sure"`],
+    ]);
+    const paths = detectContractDrift(files, contracts).map((h) => h.filePath);
+    expect(paths).toEqual(["src/api/users.ts"]);
+  });
+});
