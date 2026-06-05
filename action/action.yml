@@ -38,7 +38,7 @@
 #         - uses: pinnedai/pinnedai@v0.2.21
 
 name: "pinnedai"
-description: "Permanent guardrails for AI-coded apps — pin Server Actions, paid-API calls, Edge Functions, cron, Stripe webhooks, journeys + block AI weakening attempts."
+description: "Permanent guardrails for AI-coded apps. Pin Server Actions, paid-API calls, Edge Functions, cron, Stripe webhooks, journeys + catch first-time bugs (enum drift, undeclared env vars, missing DB columns, webhook header typos, unguarded .find() results, response-shape mismatches) + block AI weakening attempts."
 author: "Michael Zon"
 branding:
   icon: "lock"

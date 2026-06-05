@@ -294,6 +294,19 @@ npx pinnedai audit --learned`}</pre>
               </ul>
               <p className="protect-why">If AI drops the auth gate on <code>saveIdea</code> / <code>uploadMockup</code> / <code>aiFill</code>, you get data abuse, public file uploads, or a $1k Anthropic bill.</p>
             </div>
+            <div className="protect-card protect-card-new">
+              <div className="protect-icon" aria-hidden>🆕</div>
+              <h3>First-time bugs (no baseline needed)</h3>
+              <ul>
+                <li>Enum drift — consumer reads <code>status === "done"</code> but producer emits <code>"completed"</code></li>
+                <li>Undeclared env vars — code reads <code>process.env.X</code> but <code>.env.example</code> doesn't list it</li>
+                <li>Missing Supabase columns — <code>.select("col_a")</code> not in migrations</li>
+                <li>Webhook header typos — handler reads <code>x-stripe-signature</code> instead of canonical</li>
+                <li>Unguarded <code>.find()</code> in route handlers → 500 on first edge case</li>
+                <li>Response-shape mismatches — consumer reads key producer never emits</li>
+              </ul>
+              <p className="protect-why">Bugs at the moment they're written — no green baseline to regress from. The class regression detectors structurally miss.</p>
+            </div>
           </div>
         </div>
       </section>
