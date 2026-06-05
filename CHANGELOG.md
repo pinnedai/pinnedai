@@ -2,6 +2,36 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.3.3] — 2026-06-05
+
+Closes the schema-detector gap Cipherwake flagged in 0.3.2 — the static-analysis blind spot that let "POST → 500 on missing relation" bugs slip past the detector.
+
+### Fixed — `detectSupabaseColumnExists` now catches missing tables, not just missing columns
+
+The 0.3.2 detector checked that every column referenced via `.from("X").select / .eq / .update / .insert` existed in the declared schema — but if the TABLE itself wasn't declared, the detector silently skipped (`if (!declared) continue;`). Code that did `.from("feedback").insert({...})` with no `CREATE TABLE feedback` in any migration produced zero hits, so the runtime 500 on first POST went uncaught.
+
+Now: when code performs a WRITE against an undeclared table (insert / update / upsert / delete), the detector emits a hit with `declaredColumns: []` and a clear "Runtime 500 — the relation does not exist" message.
+
+### Precision gates (high-confidence only)
+
+- **Writes only.** SELECT against an undeclared table is too ambiguous — could be a Postgres view, an RPC call, an `auth.*` / `storage.*` schema alias, or a foreign schema. INSERT / UPDATE / UPSERT / DELETE on an undeclared table is "definitely intended to hit this table" → fires.
+- **Skip Supabase built-ins.** `auth.users`, `storage.objects`, `realtime.messages`, etc. — when code does `.from("users").update(...)` and `public.users` isn't declared, that's usually `auth.users`, not a missing table. Skipped via a known-builtin list.
+- **Requires at least one schema source.** A repo with NO `supabase/migrations/*.sql` AND NO `database.types.ts` provides no ground truth — the detector returns empty. No schema = no signal.
+
+### Closes the wedge thesis
+
+Per the build plan's positioning, the static-detector layer catches "definitely-broken code at the moment it's written" without execution. The smoke-pin layer (0.3.0) catches "feature can't actually work" bugs by executing the endpoint. The table-missing case sits in between — static detection IS sufficient (we have ground truth from migrations) but was structurally skipped. This release closes that gap, leaving smoke pins to handle the genuinely-needs-execution cases.
+
+### Tested
+
+- 399/399 vitest (was 392; +7 new schema-gap tests)
+- 7/7 schema-gap matrix: positive INSERT, positive DELETE, plus 4 negative cases (declared table, SELECT-only, Supabase built-in, no schema sources), plus multi-write aggregation
+- 16/16 prior 0.3.1 bug-pack matrix still passes
+- 14/14 prior 0.3.2 A+B+D matrix still passes
+- 54/54 dyad-apps FP sweep clean
+
+---
+
 ## [0.3.2] — 2026-06-05
 
 Four more Cipherwake-dogfood findings. Three sharpenings + one architectural decouple.

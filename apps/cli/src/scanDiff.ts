@@ -4310,6 +4310,49 @@ function extractSupabaseColumnReads(
   return out;
 }
 
+// 0.3.3 — Supabase TABLE-missing extractor (sibling to the column
+// reader). Captures every `.from("X").(insert|update|upsert|delete)`
+// call so the detector can fire on tables that aren't declared in any
+// schema source. Cipherwake-reported case: code does
+// `.from("feedback").insert({...})` but there's no CREATE TABLE
+// feedback in any migration → runtime 500 on first POST. Static
+// detectors saw the write surface but skipped the hit because the
+// table didn't exist in the schema map.
+//
+// Why writes-only (the precision gate): SELECT on an undeclared table
+// can be many things — a Postgres view, an auth.* / storage.* schema
+// alias, an RPC call. INSERT/UPDATE/UPSERT/DELETE on an undeclared
+// table is "definitely intended to hit this table." High confidence.
+function extractSupabaseTableWrites(
+  content: string
+): Array<{ table: string; op: "insert" | "update" | "upsert" | "delete"; line: number }> {
+  const stripped = content.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  function lineAt(idx: number) { return (stripped.slice(0, idx).match(/\n/g) || []).length + 1; }
+  const out: Array<{ table: string; op: "insert" | "update" | "upsert" | "delete"; line: number }> = [];
+  // .from("<table>").<op>(...)
+  const re = /\.\s*from\s*\(\s*['"](\w+)['"]\s*\)\s*\.\s*(insert|update|upsert|delete)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stripped)) !== null) {
+    out.push({ table: m[1], op: m[2] as "insert" | "update" | "upsert" | "delete", line: lineAt(m.index) });
+  }
+  return out;
+}
+
+// 0.3.3 — known Supabase / Postgres built-in tables that shouldn't
+// trigger the missing-table detector even though they're not in the
+// customer's migrations. These live in non-`public` Postgres schemas
+// and won't ever appear in CREATE TABLE statements under public.
+const SUPABASE_BUILTIN_TABLES = new Set([
+  "users",          // auth.users — frequently aliased via .from("users") in older code; skip
+  "sessions",       // auth.sessions
+  "identities",     // auth.identities
+  "buckets",        // storage.buckets
+  "objects",        // storage.objects
+  "messages",       // realtime.messages
+  "schema_migrations",
+  "supabase_migrations",
+]);
+
 export function detectSupabaseColumnExists(
   filesByPath: Map<string, string>
 ): SupabaseColumnHit[] {
@@ -4342,9 +4385,11 @@ export function detectSupabaseColumnExists(
   // No schema source = no signal.
   if (tables.size === 0) return [];
 
-  // 2. Scan source files for column references.
-  // referencedByTable: table → column → list of sites.
+  // 2. Scan source files for column references AND write operations.
   const referencedByTable = new Map<string, Map<string, Array<{ filePath: string; line: number }>>>();
+  // 0.3.3: track which tables are write-touched (insert/update/upsert/
+  // delete) so we can fire the missing-table case with high confidence.
+  const writesByTable = new Map<string, Array<{ filePath: string; op: string; line: number }>>();
   for (const [filePath, content] of filesByPath.entries()) {
     if (isTestPath(filePath)) continue;
     if (!/\.(?:tsx?|jsx?|mjs|cjs)$/.test(filePath)) continue;
@@ -4356,13 +4401,51 @@ export function detectSupabaseColumnExists(
       if (!byCol.has(column)) byCol.set(column, []);
       byCol.get(column)!.push({ filePath, line });
     }
+    for (const { table, op, line } of extractSupabaseTableWrites(content)) {
+      if (!writesByTable.has(table)) writesByTable.set(table, []);
+      writesByTable.get(table)!.push({ filePath, op, line });
+    }
   }
 
-  // 3. Per table, find missing columns.
+  // 3. Per table, find missing columns OR missing table.
   const out: SupabaseColumnHit[] = [];
+  // 0.3.3: emit table-missing hits FIRST (high-precision case).
+  // Walk write-touched tables; if not declared anywhere AND not a
+  // known built-in, emit a hit with declaredColumns=[] and
+  // missingColumns=referencedColumns (or just the table name if no
+  // columns were captured via select/eq/etc).
+  for (const [table, writes] of writesByTable) {
+    if (tables.has(table)) continue;                  // declared somewhere — handled by column-drift path below
+    if (SUPABASE_BUILTIN_TABLES.has(table)) continue; // auth.users / storage.objects etc.
+    // Aggregate the column references for this missing table (if any).
+    const byCol = referencedByTable.get(table);
+    const referenced = byCol ? Array.from(byCol.keys()).sort() : [];
+    // Group write sites by file.
+    const sitesByFile = new Map<string, Set<string>>();
+    for (const w of writes) {
+      if (!sitesByFile.has(w.filePath)) sitesByFile.set(w.filePath, new Set());
+      sitesByFile.get(w.filePath)!.add(w.op);
+    }
+    const consumerSites = Array.from(sitesByFile.entries()).map(([filePath, ops]) => ({
+      filePath,
+      missingColumns: Array.from(ops).map((o) => `[${o}]`),
+    }));
+    const opList = Array.from(new Set(writes.map((w) => w.op))).sort();
+    out.push({
+      template: "supabase-column",
+      table,
+      referencedColumns: referenced,
+      declaredColumns: [], // empty signals "table doesn't exist in any schema source"
+      missingColumns: referenced,
+      consumerSites,
+      schemaSources,
+      suggestedPin: `Supabase table "${table}" referenced by ${opList.join("/")} in code but NOT declared in any schema source (${schemaSources.join(", ")}). Runtime 500 on first request — the relation does not exist. Add a migration that CREATEs the table, or fix the table name to match an existing one.`,
+    });
+  }
+
   for (const [table, byCol] of referencedByTable) {
     const declared = tables.get(table);
-    if (!declared) continue; // Code references a table the schema doesn't declare — could be a different schema. Skip.
+    if (!declared) continue; // 0.3.3: missing-table case already handled above for write-touched tables; SELECTs on unknown tables remain skipped (could be views, RPCs, foreign schemas).
     const referencedColumns = Array.from(byCol.keys());
     const missingColumns = referencedColumns.filter((c) => !declared.has(c));
     if (missingColumns.length === 0) continue;
