@@ -1,6 +1,6 @@
 # PinnedAI
 
-> **One command finds every high-stakes write surface in your AI-built app — Server Actions, paid-API calls, Supabase Edge Functions, cron handlers, Stripe webhooks, multi-step journeys, host-conditional families — and pins them as permanent regression tests. Plus first-time bug catching: enum drift, missing env declarations, undeclared Supabase columns, webhook header typos, unguarded `.find()` results, response-shape mismatches — all caught at the moment they're written, before any baseline exists. They run on every commit and every agent edit.**
+> **Pinned actually runs your AI-built features and asserts they produce real outcomes — not just that the code parses.** Smoke pins execute endpoints. Render-collection pins cover every route in a multi-tenant app (a new row gets covered automatically — no pin edit). Visibility-invariant pins assert the negative — drafts MUST 404, not 200. `pinned dev` runs them locally with zero config. The generated CI workflow auto-detects Vercel/Netlify preview URLs AND verifies pins actually executed (zero-pins-ran fails the step). Plus the full first-time-bug detector net: enum drift, missing env declarations, undeclared Supabase columns/tables, webhook header typos, unguarded results, response-shape, mass-mutation.
 >
 > *Free beta · Founder Pro waitlist open at [pinnedai.dev](https://pinnedai.dev).*
 
@@ -8,9 +8,14 @@
 
 1. **`npx pinnedai audit`** — read-only inventory of your write surfaces. Zero install footprint. Tells you what Pinned would protect before you commit to anything.
 2. **`pinned sweep`** — one command auto-detects every high-stakes surface across your tree (not just the current diff): Server Actions, paid-API calls, Edge Functions, cron schedules, Stripe webhook event dispatch, multi-step journeys, host-conditional families. Each becomes a `tests/pinned/*.test.ts` file.
-3. **`pinned init`** — wires hooks: pre-commit + pre-push Guard Integrity blocks AI-weakening attempts (`.skip()` / weakened assertions / deleted tests / `--no-verify` bypass). Claude Code PostToolUse hook auto-verifies pins against your running dev server after every agent edit — *while the agent is still in the loop, not after the PR*. AI-coder rules seeded into `CLAUDE.md` / `.cursorrules` / `AGENTS.md` so Cursor / Claude / Copilot read them before editing.
-4. **Every commit + every agent edit** runs the pin suite. Bug fixes captured as `pinned record-server-action` / `record-interaction` fixtures land in your repo permanently.
-5. **AI Lessons** (`.pinned/ai-lessons.md`) capture repo-specific rules from real blocked events. `pinned audit --learned` finds sibling code paths with the same mistake pattern.
+3. **`pinned smoke add` / `pinned render add` / `pinned visibility add`** — pins that actually RUN your features and assert real outcomes, not just code shape:
+   - **`smoke`** asserts spec-derived invariants on a single endpoint (non-empty body, terminal state within bound, rejects bad input, errors on faults).
+   - **`render`** covers every route in a collection — Next.js `generateStaticParams`, a custom getter, or `/sitemap.xml`. Adding a new row gets covered automatically. Per-row failure naming.
+   - **`visibility`** asserts the negative half render pins cannot provide — items marked draft/private/archived MUST return 404 / 307 / 308, never 200.
+4. **`pinned dev`** — boots your dev server (Next/Vite/Astro/SvelteKit/Remix/Nuxt auto-detected), runs the pin suite locally with zero env vars, verifies pins actually executed (auto-opt-in that silently still skips is the same trap), tears down. The recommended pre-commit / pre-push loop.
+5. **`pinned init`** — wires hooks + generates a CI workflow that auto-detects Vercel/Netlify/Cloudflare Pages/Render preview URLs AND verifies pins executed (zero-pins-ran fails the step). Pre-commit + pre-push Guard Integrity blocks AI-weakening attempts (`.skip()` / weakened assertions / deleted tests / `--no-verify` bypass). Claude Code PostToolUse hook auto-verifies pins against your running dev server after every agent edit. AI-coder rules seeded into `CLAUDE.md` / `.cursorrules` / `AGENTS.md`.
+6. **Every commit + every agent edit** runs the pin suite. Bug fixes captured as `pinned record-server-action` / `record-interaction` fixtures land in your repo permanently.
+7. **AI Lessons** (`.pinned/ai-lessons.md`) capture repo-specific rules from real blocked events. **`pinned sync-rules`** inlines the top-N lessons directly into every agent-rules file (CLAUDE.md, AGENTS.md, .cursorrules) — *inline the lesson, never redirect*. `pinned audit --learned` finds sibling code paths with the same mistake pattern.
 
 The output of every finding is an **executable test**, not a review comment. Cancel Pinned tomorrow and the pins stay.
 

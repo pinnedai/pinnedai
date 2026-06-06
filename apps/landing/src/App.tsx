@@ -52,29 +52,30 @@ export function App() {
       <header className="hero">
         <div className="container hero-grid">
           <div className="hero-copy">
-            <div className="status-pill">v0.3.0 · Smoke pins shipped · Free beta</div>
+            <div className="status-pill">v0.4.0 · Multi-tenant coverage · Free beta</div>
             <h1>Catch the AI features that look done but never work.</h1>
             <p className="hero-sub">
               The dominant AI failure mode isn't a crash — it's a feature
               the agent confidently ships that <em>silently never works</em>.
-              Empty returns. Hung workers. Status strings that don't match
-              the spec. Validation that was never wired up.
+              Empty returns. Hung workers. A malformed row that crashes
+              one tenant while every other tenant looks fine. A draft item
+              that should be hidden but renders 200 to the public.
             </p>
             <p className="hero-sub hero-sub-2">
-              Pinned <strong>actually runs your endpoint</strong> and asserts
-              real outcomes — non-empty body, terminal status within bound,
-              rejects bad input, errors cleanly on faults. The assertions are
-              spec-derived invariants (not snapshots of whatever the AI
-              produced), so they catch <em>first-time bugs</em> on day one —
-              no regression baseline needed. Plus the full regression net:
-              Server Actions, paid-API calls, Edge Functions, cron, webhooks,
-              journeys, cross-repo enum-drift contracts.
+              Pinned <strong>actually runs your features</strong> and asserts
+              spec-derived invariants — never snapshots of whatever the AI
+              produced. <code>pinned render add</code> covers every route
+              in a collection (a new row gets covered automatically — no
+              pin edit). <code>pinned visibility add</code> asserts the
+              negative — drafts MUST return 404, not 200 (the half render
+              pins cannot provide). <code>pinned dev</code> boots your
+              dev server + runs pins locally with zero config.
             </p>
             <p className="loop">
               <span className="loop-dot">●</span> Feature shipped
               <span className="loop-arrow">→</span> Pinned runs it
               <span className="loop-arrow">→</span> asserts the spec, not the output
-              <span className="loop-arrow">→</span> RED on broken, GREEN on fixed
+              <span className="loop-arrow">→</span> per-row failure naming
               <span className="loop-arrow">→</span> guards every future edit
             </p>
             <div className="hero-cta-row">

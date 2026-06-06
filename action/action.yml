@@ -38,7 +38,7 @@
 #         - uses: pinnedai/pinnedai@v0.2.21
 
 name: "pinnedai"
-description: "Smoke-test AI-built features so they actually work — not just parse. Pinned runs your endpoints, asserts real outcomes (non-empty, terminal state within bound, rejects bad input, errors on faults), and catches the AI-shipped-but-never-works bug class. Plus regression net: Server Actions, paid-API calls, Edge Functions, cron, webhooks, journeys; first-time-bug detectors (enum drift incl. cross-repo contracts, undeclared env vars, missing DB columns, webhook header typos, unguarded results, response-shape, mass-mutation); FP suppression + readiness gate + AI-lesson injection + Guard Integrity."
+description: "Smoke-test AI-built features so they actually work — not just parse. `pinned render add` covers every route in a multi-tenant collection (catches the prerender/resolver divergence bug — adding a row covers it automatically). `pinned visibility add` asserts drafts MUST 404 (the negative half render pins cannot provide). Generated workflow sets SMOKE_RUN=1 + auto-detects Vercel/Netlify preview URLs + VERIFIES pins actually executed (zero-pins-ran fails the step). Plus: Server Actions, paid-API calls, Edge Functions, cron, webhooks, journeys; enum-drift contracts; FP suppression; readiness gate; Guard Integrity."
 author: "Michael Zon"
 branding:
   icon: "lock"
