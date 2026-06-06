@@ -114,8 +114,33 @@ function env(name: string): string | undefined {
   return (globalThis as any).process?.env?.[name];
 }
 
+// 0.4.0 (Cipherwake Gap 3b): zero-config base URL resolution.
+// Same chain as apps/cli/src/baseUrl.ts but inlined for the runtime —
+// vitest can't reach back into the pinnedai package, so we duplicate.
+// Chain: explicit env > CI auto-detect (Vercel/Netlify/CF/Render) >
+// claim default > null (caller emits loud skip).
+function __pinnedNormUrl(s: string | undefined): string | null {
+  if (!s) return null;
+  const t = /^https?:\\/\\//i.test(s) ? s : "https://" + s;
+  return t.replace(/\\/+$/, "");
+}
 function resolveBaseUrl(): string | null {
-  return env("PINNED_SMOKE_BASE_URL") ?? env("PREVIEW_URL") ?? env("PINNED_CI_BASE_URL") ?? ENTRYPOINT.defaultBaseUrl ?? null;
+  return __pinnedNormUrl(env("PINNED_SMOKE_BASE_URL"))
+      || __pinnedNormUrl(env("PINNED_BASE_URL"))
+      || __pinnedNormUrl(env("PREVIEW_URL"))
+      || __pinnedNormUrl(env("PINNED_CI_BASE_URL"))
+      || __pinnedNormUrl(env("VERCEL_BRANCH_URL"))
+      || __pinnedNormUrl(env("VERCEL_URL"))
+      || __pinnedNormUrl(env("VERCEL_PROJECT_PRODUCTION_URL"))
+      || __pinnedNormUrl(env("DEPLOY_PRIME_URL"))
+      || (env("NETLIFY") === "true" ? __pinnedNormUrl(env("URL")) : null)
+      || __pinnedNormUrl(env("CF_PAGES_URL"))
+      || __pinnedNormUrl(env("RENDER_EXTERNAL_URL"))
+      || __pinnedNormUrl(ENTRYPOINT.defaultBaseUrl)
+      || null;
+}
+function __pinnedLoudSkipMsg(): string {
+  return "pinned: no base URL (not on a known CI provider, no local server). Run \\\`pinned dev\\\` or set PINNED_BASE_URL.";
 }
 
 function shouldSkipCadence(): { skip: boolean; reason: string } {
@@ -149,6 +174,20 @@ async function runHttpRoute(overrideBody?: any, faultBaseUrl?: string): Promise<
     method: ENTRYPOINT.method,
     headers: { ...(ENTRYPOINT.headers ?? {}) },
   };
+  // 0.4.0 (Gap 2): attach auth cookie if the claim declares one.
+  // Value comes from env at run time — never stored in the pin file.
+  if (ENTRYPOINT.auth && ENTRYPOINT.auth.cookie && ENTRYPOINT.auth.valueFromEnv) {
+    const cookieVal = env(ENTRYPOINT.auth.valueFromEnv);
+    if (cookieVal) {
+      const existingCookie = (init.headers as Record<string, string>)["cookie"] ?? "";
+      const newCookie = ENTRYPOINT.auth.cookie + "=" + cookieVal;
+      (init.headers as Record<string, string>)["cookie"] = existingCookie ? existingCookie + "; " + newCookie : newCookie;
+    } else {
+      // Missing env var → return a special marker. Caller treats as
+      // WARN-skip (the auth pin can't authenticate, but that's not RED).
+      return { ok: false, bodyText: "", elapsedMs: 0, threw: new Error(\`WARN: auth cookie env \${ENTRYPOINT.auth.valueFromEnv} not set; skipping authed render\`) };
+    }
+  }
   const body = overrideBody !== undefined ? (typeof overrideBody === "string" ? overrideBody : JSON.stringify(overrideBody)) : ENTRYPOINT.body;
   if (body !== undefined && ENTRYPOINT.method !== "GET") {
     init.body = body;
@@ -490,7 +529,10 @@ describe(\`smoke (\${ENTRYPOINT.kind} \${ROUTE})\`, () => {
   // For http-route, also gate on baseUrl resolvability. For fn/cli/job
   // the entrypoint config already declares everything needed.
   if (ENTRYPOINT.kind === "http-route" && !resolveBaseUrl()) {
-    it.skip("WARN: no base URL resolvable. Set PINNED_SMOKE_BASE_URL / PREVIEW_URL / PINNED_CI_BASE_URL to enable.", () => {});
+    // Cipherwake Gap 3b — loud skip (not silent). The message reads
+    // like a single actionable line in any test report.
+    if (typeof console !== "undefined") console.warn(__pinnedLoudSkipMsg());
+    it.skip(__pinnedLoudSkipMsg(), () => {});
     return;
   }
 

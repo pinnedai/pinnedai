@@ -337,6 +337,11 @@ function preflight(claim: Claim, cwd: string): string | null {
       }
       return null;
     }
+    case "render-collection":
+    case "visibility-invariant":
+      // 0.4.0+ Cipherwake Gap 1/4: enumerate at run time, day-zero
+      // can't verify; the test self-skips on missing base URL.
+      return null;
     case "smoke-functional":
       // Smoke pins assert against a live endpoint, not a source file.
       // The day-zero verifier's check is "is the underlying artifact

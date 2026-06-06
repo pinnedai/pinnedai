@@ -3322,6 +3322,12 @@ function summarizeClaimForBanner(claim: Claim): string {
       return `Response-shape: producer at \`${claim.route}\` keeps emitting ${claim.consumerReads.length} key${claim.consumerReads.length === 1 ? "" : "s"} the consumer reads. Catches AI silently renaming a producer field while consumer code reads the old name.`;
     case "mass-mutation":
       return `Mass-mutation safety: ${claim.operation.toUpperCase()} on \`${claim.table}\` in \`${claim.filePath}:${claim.line}\` keeps at least one filter clause. Catches AI dropping the .eq() filter that would mass-mutate every row.`;
+    case "render-collection": {
+      return `Render-collection pin: \`${claim.pathTemplate}\` renders every route in the collection (from ${claim.routes.from}) and asserts each returns 2xx with no error-boundary markers. Catches "malformed row crashes only its own route" failure mode that single-slug pins miss.`;
+    }
+    case "visibility-invariant": {
+      return `Visibility-invariant pin: \`${claim.publicRoute}\` respects the ${claim.rule.field} discriminant — items in [${claim.rule.publicValues.join(", ")}] render publicly; items NOT matching MUST return 404/307/308 (the negative half render pins cannot provide). Catches "draft/private leaked publicly" bugs.`;
+    }
     case "smoke-functional": {
       const epDesc = claim.entrypoint.kind === "http-route"
         ? `${claim.entrypoint.method} ${claim.route}`
@@ -5898,6 +5904,348 @@ program
 // the author reviews side-effects and flips it). Cadence defaults to
 // on-demand (skipped under normal `vitest run` unless SMOKE_RUN=1).
 program
+  .command("dev")
+  .description(
+    "Boot the customer's dev server + run smoke pins locally + verify they actually executed. Cipherwake Gap 3 — zero env vars needed. Sets SMOKE_RUN=1, PINNED_SMOKE_BASE_URL=http://localhost:PORT, runs vitest, tears down. Fails non-zero if 0 pins executed (auto-opt-in that silently still skips is the same trap)."
+  )
+  .option("--port <n>", "Preferred port (auto-detected per framework if omitted).")
+  .option("--ready-timeout <s>", "Seconds to wait for server to become ready. Default 60.", "60")
+  .option("--no-tear-down", "Leave the dev server running after vitest exits (debug aid).")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (opts: { port?: string; readyTimeout: string; tearDown: boolean; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const { detectFramework, pickPort, waitForReady, bootDevServer, parseVitestExecutionStats } = await import("./pinnedDev.js");
+    const { cacheBaseUrl } = await import("./baseUrl.js");
+    const cwd = process.cwd();
+    const detected = detectFramework(cwd);
+    if (!detected.devScript) {
+      err("✗ pinned dev: no dev server detected. Looked at package.json `scripts.dev` and the dependency list (next / vite / astro / sveltekit / remix / nuxt).\n");
+      err("  Add a `dev` script to package.json, or use PINNED_SMOKE_BASE_URL to point at a server you're running manually.\n");
+      process.exit(1);
+    }
+    out(`Detected framework: ${detected.framework}`);
+    out(`Dev script:         ${detected.devScript}`);
+    const preferredPort = opts.port ? Number(opts.port) : detected.defaultPort;
+    const port = await pickPort(preferredPort);
+    if (port !== preferredPort) {
+      out(`Preferred port ${preferredPort} in use — using ${port} instead.`);
+    }
+    const booted = await bootDevServer({ cwd, devScript: detected.devScript, port });
+    out(`Booting ${detected.framework} on ${booted.baseUrl} ...`);
+    const readyTimeoutMs = Number(opts.readyTimeout) * 1000;
+    const ready = await waitForReady(booted.baseUrl, readyTimeoutMs);
+    if (!ready) {
+      err(`✗ pinned dev: server didn't respond within ${opts.readyTimeout}s. Tearing down.\n`);
+      await booted.tearDown();
+      process.exit(1);
+    }
+    out(`✓ ready: ${booted.baseUrl}`);
+    // Cache the URL so subsequent `pinned test` runs reuse it (the
+    // last-known-good cache from Gap 3b).
+    try { cacheBaseUrl(cwd, booted.baseUrl, "pinned-dev"); } catch { /* non-fatal */ }
+    // Find vitest binary.
+    const vitestPath = join(cwd, "node_modules", ".bin", "vitest");
+    const vitestArgs = ["run", "tests/pinned/", "--exclude", "**/retired/**", "--reporter=verbose", "--no-coverage"];
+    let vitestBin: string;
+    let vitestArgsActual: string[];
+    if (existsSync(vitestPath)) {
+      vitestBin = vitestPath;
+      vitestArgsActual = vitestArgs;
+    } else {
+      vitestBin = "npx";
+      vitestArgsActual = ["-y", "-p", "vitest@^2", "vitest", ...vitestArgs];
+    }
+    out("");
+    out("Running smoke pins with SMOKE_RUN=1, PINNED_SMOKE=1, PINNED_SMOKE_BASE_URL=" + booted.baseUrl);
+    out("");
+    const { spawnSync } = await import("node:child_process");
+    const result = spawnSync(vitestBin, vitestArgsActual, {
+      cwd,
+      env: {
+        ...process.env,
+        SMOKE_RUN: "1",
+        PINNED_SMOKE: "1",
+        PINNED_SMOKE_BASE_URL: booted.baseUrl,
+      },
+      encoding: "utf8",
+      stdio: ["inherit", "pipe", "pipe"],
+    });
+    // Forward output to user.
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    // Parse + verify pins actually executed.
+    const combined = (result.stdout ?? "") + "\n" + (result.stderr ?? "");
+    const stats = parseVitestExecutionStats(combined);
+    out("");
+    out("─".repeat(60));
+    out(`pinned dev: ${stats.executed} of ${stats.total} pins executed (${stats.skipped} skipped, ${stats.failed} failed)`);
+    let exitCode = result.status ?? 1;
+    if (stats.total > 0 && stats.executed === 0) {
+      err("");
+      err("✗ pinned: 0 pins executed — auto-opt-in is configured but no pin actually ran.");
+      err("  Common causes:");
+      err("    1. All pins have safeToExecute: false (flip it after reviewing side-effects)");
+      err("    2. Pin cadence is on-demand AND SMOKE_RUN env wasn't passed through (this command sets it, but pin file may filter early)");
+      err("    3. The pin's entrypoint module path is wrong / module doesn't export the expected symbol");
+      err("");
+      if (exitCode === 0) exitCode = 1;
+    }
+    if (opts.tearDown !== false) {
+      out("Tearing down dev server...");
+      await booted.tearDown();
+    } else {
+      out(`Dev server LEFT RUNNING (--no-tear-down) on ${booted.baseUrl} (pid ${booted.process.pid}).`);
+    }
+    process.exit(exitCode);
+  });
+
+program
+  .command("sync-rules")
+  .description(
+    "Inline top-N Pinned lessons into every agent-rules file (CLAUDE.md, .cursorrules, AGENTS.md, etc.). Per Gap 5: 'inline the lesson, never redirect' — a pointer to .pinned/ai-lessons.md gets skipped. Idempotent — re-running replaces just the lessons sub-block."
+  )
+  .option("--limit <n>", "Max lessons to inline (default: 5).", "5")
+  .option("--max-lines <n>", "Total line budget for the injected block (default: 25).", "25")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (opts: { limit: string; maxLines: string; quiet?: boolean }) => {
+    if (!opts.quiet) printBanner();
+    const { syncLessonsIntoAgentRules } = await import("./syncLessons.js");
+    const result = syncLessonsIntoAgentRules({
+      cwd: process.cwd(),
+      limit: Number(opts.limit),
+      maxLines: Number(opts.maxLines),
+    });
+    if (result.updated.length === 0 && result.unchanged.length === 0 && result.missingAgentBlock.length === 0) {
+      out("No agent-rules files found. Run `pinned ai-rules install` first to set one up.");
+      return;
+    }
+    for (const f of result.updated) out(`+ ${f}  (lessons block refreshed)`);
+    for (const f of result.unchanged) out(`= ${f}  (already current)`);
+    for (const f of result.missingAgentBlock) {
+      out(`! ${f}  (no pinnedai marker block — run \`pinned ai-rules install\` first)`);
+    }
+  });
+
+program
+  .command("visibility <action>")
+  .description(
+    "Visibility-invariant pins. Actions: add. Reads an UNFILTERED collection + asserts items matching the rule render publicly AND items NOT matching return 404/307/308. The negative assertion render pins structurally cannot provide. Catches 'draft leaked publicly' bugs."
+  )
+  .option("--public-route <template>", "Path template with [param], e.g. /preview/[slug] (required).")
+  .option("--module <path>", "Module containing the unfiltered collection getter (required).")
+  .option("--export <name>", "Named export — should return ALL items including non-public (required).")
+  .option("--field <name>", "Discriminant field on each item, e.g. status (required).")
+  .option("--public-values <csv>", "Comma-separated values that grant public access, e.g. 'live' (required).")
+  .option("--slug-field <name>", "Field on each item used as the route param (default: slug).", "slug")
+  .option("--public-statuses <csv>", "HTTP statuses allowed for public items (default: 200).", "200")
+  .option("--private-statuses <csv>", "HTTP statuses allowed for private items (default: 404,307,308).", "404,307,308")
+  .option("--max-routes <n>", "Cap on items rendered (deterministic sample). Default 30.", "30")
+  .option("--pr-id <id>", "PR identifier (default: visibility).", "visibility")
+  .option("--out-dir <path>", "Directory to write to (default: tests/pinned).", "tests/pinned")
+  .option("--dry-run", "Print generated test instead of writing.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (action: string, opts: {
+    publicRoute?: string;
+    module?: string;
+    export?: string;
+    field?: string;
+    publicValues?: string;
+    slugField: string;
+    publicStatuses: string;
+    privateStatuses: string;
+    maxRoutes: string;
+    prId: string;
+    outDir: string;
+    dryRun?: boolean;
+    quiet?: boolean;
+  }) => {
+    if (!opts.quiet) printBanner();
+    if (action !== "add") {
+      err(`Unknown visibility action "${action}". Use: add.\n`);
+      process.exit(2);
+    }
+    if (!opts.publicRoute || !opts.module || !opts.export || !opts.field || !opts.publicValues) {
+      err("✗ Required: --public-route, --module, --export, --field, --public-values.\n");
+      err("  Example: pinned visibility add --public-route '/preview/[slug]' --module lib/ideas.ts --export getAllIdeasAdmin --field status --public-values live\n");
+      process.exit(2);
+    }
+    const claim: import("./claimParser.js").VisibilityInvariantClaim = {
+      template: "visibility-invariant",
+      publicRoute: opts.publicRoute,
+      route: opts.publicRoute,
+      collection: {
+        from: "collection-getter",
+        modulePath: opts.module,
+        exportName: opts.export,
+        slugField: opts.slugField,
+      },
+      rule: {
+        field: opts.field,
+        publicValues: opts.publicValues.split(",").map((s) => s.trim()).filter(Boolean),
+        publicStatusAllowed: opts.publicStatuses.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n)),
+        privateStatusAllowed: opts.privateStatuses.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n)),
+      },
+      cap: { maxRoutes: Number(opts.maxRoutes), sample: "deterministic" },
+      raw: `pinned visibility add --public-route ${opts.publicRoute}`,
+    };
+    const gen = generateTest(claim, { prId: opts.prId, pinnedVersion: version });
+    if (opts.dryRun) {
+      out(`# ${join(opts.outDir, gen.filename)}`);
+      out(gen.content);
+      return;
+    }
+    if (!existsSync(opts.outDir)) mkdirSync(opts.outDir, { recursive: true });
+    const target = join(opts.outDir, gen.filename);
+    try {
+      writeFileSync(target, gen.content, { flag: "wx" });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+        err(`✗ Pin file already exists: ${target}\n`);
+        process.exit(1);
+      }
+      throw e;
+    }
+    let registry = readRegistry(opts.outDir);
+    registry = addEntry(registry, {
+      claimId: gen.claimId,
+      prId: opts.prId,
+      claim,
+      filename: gen.filename,
+    });
+    writeRegistry(opts.outDir, registry);
+    try { writeCliEditMarker(opts.outDir); } catch { /* */ }
+    out(`+ ${relative(process.cwd(), target)}`);
+    out("");
+    out(`  Public route:   ${claim.publicRoute}`);
+    out(`  Collection:     ${claim.collection.modulePath}#${claim.collection.exportName}`);
+    out(`  Discriminant:   ${claim.rule.field} ∈ [${claim.rule.publicValues.join(", ")}]`);
+    out(`  Public OK:      ${claim.rule.publicStatusAllowed!.join(", ")}`);
+    out(`  Private OK:     ${claim.rule.privateStatusAllowed!.join(", ")}`);
+    out("");
+    out("Next: set PINNED_BASE_URL (or run `pinned dev`) and run `SMOKE_RUN=1 vitest run`.");
+  });
+
+program
+  .command("render <action>")
+  .description(
+    "Render-collection pins. Actions: add. Enumerates routes at run time from generateStaticParams / a collection getter / sitemap and asserts EACH renders healthily. Catches the 'malformed row crashes only its own route' failure mode that single-slug pins miss."
+  )
+  .option("--path <template>", "Path template with [param] placeholder, e.g. /preview/[slug] (required).")
+  .option("--from <source>", "Route source: 'generate-static-params' | 'collection-getter' | 'sitemap' (required).")
+  .option("--module <path>", "Module path for generate-static-params or collection-getter, e.g. app/preview/[slug]/page.tsx")
+  .option("--export <name>", "Named export for collection-getter, e.g. getAllIdeas")
+  .option("--slug-field <field>", "Field name on each item to use as the param value (default: slug).", "slug")
+  .option("--sitemap-prefix <prefix>", "For source=sitemap: URL path prefix to match, e.g. /preview/")
+  .option("--max-routes <n>", "Cap on routes rendered (deterministic sample). Default 20.", "20")
+  .option("--min-body-bytes <n>", "Minimum body length to consider a render healthy. Default 500.", "500")
+  .option("--allow-error-boundary", "Don't fail on React/Next error boundary markers in HTML (rare — usually keep this off).")
+  .option("--pr-id <id>", "PR identifier — namespaces the generated file (default: render-coll).", "render-coll")
+  .option("--out-dir <path>", "Directory to write to (default: tests/pinned).", "tests/pinned")
+  .option("--dry-run", "Print the generated test instead of writing.")
+  .option("--quiet", "Suppress the banner header.")
+  .action(async (action: string, opts: {
+    path?: string;
+    from?: string;
+    module?: string;
+    export?: string;
+    slugField: string;
+    sitemapPrefix?: string;
+    maxRoutes: string;
+    minBodyBytes: string;
+    allowErrorBoundary?: boolean;
+    prId: string;
+    outDir: string;
+    dryRun?: boolean;
+    quiet?: boolean;
+  }) => {
+    if (!opts.quiet) printBanner();
+    if (action !== "add") {
+      err(`Unknown render action "${action}". Use: add.\n`);
+      process.exit(2);
+    }
+    if (!opts.path) {
+      err("✗ --path is required (e.g. --path /preview/[slug]).\n");
+      process.exit(2);
+    }
+    if (!opts.from) {
+      err("✗ --from is required: generate-static-params | collection-getter | sitemap.\n");
+      process.exit(2);
+    }
+    if (!["generate-static-params", "collection-getter", "sitemap"].includes(opts.from)) {
+      err(`✗ --from must be generate-static-params | collection-getter | sitemap. Got: ${opts.from}.\n`);
+      process.exit(2);
+    }
+    let routes: import("./claimParser.js").RenderCollectionClaim["routes"];
+    if (opts.from === "generate-static-params") {
+      if (!opts.module) {
+        err("✗ --from=generate-static-params requires --module <path-to-page-file>.\n");
+        process.exit(2);
+      }
+      routes = { from: "generate-static-params", modulePath: opts.module };
+    } else if (opts.from === "collection-getter") {
+      if (!opts.module || !opts.export) {
+        err("✗ --from=collection-getter requires --module and --export.\n");
+        process.exit(2);
+      }
+      routes = { from: "collection-getter", modulePath: opts.module, exportName: opts.export, slugField: opts.slugField };
+    } else {
+      if (!opts.sitemapPrefix) {
+        err("✗ --from=sitemap requires --sitemap-prefix (e.g. --sitemap-prefix /preview/).\n");
+        process.exit(2);
+      }
+      routes = { from: "sitemap", prefix: opts.sitemapPrefix };
+    }
+    const claim: import("./claimParser.js").RenderCollectionClaim = {
+      template: "render-collection",
+      pathTemplate: opts.path,
+      route: opts.path,
+      routes,
+      expect: {
+        status: 200,
+        noErrorBoundary: !opts.allowErrorBoundary,
+        minBodyBytes: Number(opts.minBodyBytes),
+      },
+      cap: { maxRoutes: Number(opts.maxRoutes), sample: "deterministic" },
+      raw: `pinned render add --path ${opts.path} --from ${opts.from}`,
+    };
+    const gen = generateTest(claim, { prId: opts.prId, pinnedVersion: version });
+    if (opts.dryRun) {
+      out(`# ${join(opts.outDir, gen.filename)}`);
+      out(gen.content);
+      return;
+    }
+    if (!existsSync(opts.outDir)) mkdirSync(opts.outDir, { recursive: true });
+    const target = join(opts.outDir, gen.filename);
+    try {
+      writeFileSync(target, gen.content, { flag: "wx" });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+        err(`✗ Pin file already exists: ${target}\n  Use a different --path or delete the file to regenerate.\n`);
+        process.exit(1);
+      }
+      throw e;
+    }
+    let registry = readRegistry(opts.outDir);
+    registry = addEntry(registry, {
+      claimId: gen.claimId,
+      prId: opts.prId,
+      claim,
+      filename: gen.filename,
+    });
+    writeRegistry(opts.outDir, registry);
+    try { writeCliEditMarker(opts.outDir); } catch { /* non-fatal */ }
+    out(`+ ${relative(process.cwd(), target)}`);
+    out("");
+    out(`  Path template: ${claim.pathTemplate}`);
+    out(`  Routes from:   ${claim.routes.from}${"modulePath" in claim.routes ? ` (${claim.routes.modulePath})` : ""}`);
+    out(`  Cap:           ${claim.cap?.maxRoutes ?? 20} routes (${claim.cap?.sample ?? "deterministic"} sample)`);
+    out("");
+    out("Next: set PINNED_BASE_URL=http://localhost:3000 (or run `pinned dev`) and run `SMOKE_RUN=1 vitest run`.");
+    out("");
+    out("Adding a new item to the collection covers it AUTOMATICALLY — no pin edit.");
+  });
+
+program
   .command("smoke <action>")
   .description(
     "Tier 1 functional smoke pins. Actions: add | list. `add` creates a smoke pin asserting an endpoint produces a real outcome; catches the AI-shipped-but-never-works failure class. Defaults to safeToExecute=false (skipped until you review + opt in)."
@@ -5917,6 +6265,8 @@ program
   .option("--ui-action <kind>", "BETA Tier 2: click | type | select (default: click).", "click")
   .option("--ui-value <s>", "BETA Tier 2: value for type/select actions.")
   .option("--ui-wait-for <css>", "BETA Tier 2: selector that must appear AFTER the interaction (catches frontend↔backend handoff bugs).")
+  .option("--auth-cookie <name>", "Cipherwake Gap 2 — cookie name for authed render (e.g. 'admin'). Pair with --auth-env. Value comes from env at run time, never stored in the pin. Missing env → SKIP-with-WARN, never RED.")
+  .option("--auth-env <var>", "Env var that holds the auth cookie value (e.g. PINNED_ADMIN_COOKIE). Required if --auth-cookie is set.")
   .option("--cadence <when>", "on-demand | pre-commit | ci-only (default: on-demand).", "on-demand")
   .option("--pr-id <id>", "PR identifier — namespaces the generated file (default: 'smoke').", "smoke")
   .option("--out-dir <path>", "Directory to write to (default: tests/pinned).", "tests/pinned")
@@ -5959,6 +6309,13 @@ program
     }
     if (!opts.route && !(opts as any).uiPage) {
       err("✗ --route is required for `pinned smoke add` (e.g. --route /api/generate), OR --ui-page + --ui-selector for BETA Tier 2 UI pins.\n");
+      process.exit(2);
+    }
+    // Gap 2: --auth-cookie + --auth-env must be specified together.
+    const hasAuthCookie = !!(opts as any).authCookie;
+    const hasAuthEnv = !!(opts as any).authEnv;
+    if (hasAuthCookie !== hasAuthEnv) {
+      err("✗ --auth-cookie requires --auth-env (and vice versa). Cookie value comes from the env var at run time, never stored in the pin.\n");
       process.exit(2);
     }
     const method = opts.method.toUpperCase() as "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -6048,6 +6405,11 @@ program
             body: opts.body,
             headers: Object.keys(headers).length ? headers : undefined,
             defaultBaseUrl: opts.baseUrl,
+            // Gap 2: optional auth cookie. Pin file carries name+env-ref,
+            // never the value.
+            auth: ((opts as any).authCookie && (opts as any).authEnv)
+              ? { cookie: (opts as any).authCookie, valueFromEnv: (opts as any).authEnv }
+              : undefined,
           },
       assertions,
       safeToExecute: !!opts.safeToExecute,
@@ -12756,6 +13118,10 @@ function describeClaim(c: Claim): string {
       const ep = c.entrypoint.kind === "http-route" ? `${c.entrypoint.method} ${c.route}` : c.route;
       return `smoke          ${ep}  (${c.assertions.length} assertions, ${c.cadence})`;
     }
+    case "render-collection":
+      return `render-coll    ${c.pathTemplate}  (routes from ${c.routes.from})`;
+    case "visibility-invariant":
+      return `visibility     ${c.publicRoute}  (by ${c.rule.field})`;
   }
 }
 
@@ -12854,23 +13220,65 @@ jobs:
       - name: Guard Integrity — block bypassed/.skip'd/weakened pins
         run: npx -y pinnedai@${version} check-guard-removal --base "origin/\${{ github.event.pull_request.base.ref }}"
 
-      # Run the pinned test suite. Pins with no PREVIEW_URL self-skip
-      # via it.skipIf — they don't fail-fast. Add a vitest install
-      # fallback in case the customer repo doesn't have it locally.
+      # Run the pinned test suite.
+      #
+      # Cipherwake Gap 3 (auto-opt-in MUST execute, not just be configured):
+      #
+      # 1. SMOKE_RUN=1 / PINNED_SMOKE=1 opt the on-demand smoke pins into
+      #    actually running. Without these, smoke pins skip and the suite
+      #    reports green even though zero behavior was checked.
+      #
+      # 2. PINNED_SMOKE_BASE_URL is resolved automatically from the
+      #    platform's preview URL — Vercel injects VERCEL_BRANCH_URL on
+      #    every PR, Netlify injects DEPLOY_PRIME_URL. Pinned reads these
+      #    via its built-in resolver, but we also set PINNED_SMOKE_BASE_URL
+      #    explicitly here as belt-and-suspenders.
+      #
+      # 3. PINNED_ALLOW_PRODUCTION_URL=1 lets the pin's baked-in
+      #    defaultBaseUrl (the production URL the pin was created against)
+      #    work as a fallback if no preview URL is available — necessary
+      #    because the runner runs BEFORE Vercel finishes building, so
+      #    VERCEL_BRANCH_URL may not be set yet on the first run.
       - name: Run pinned tests (block on broken guards)
+        env:
+          SMOKE_RUN: "1"
+          PINNED_SMOKE: "1"
+          PINNED_ALLOW_PRODUCTION_URL: "1"
+          # Preview-URL passthrough. Vercel + Netlify auto-detected.
+          PINNED_SMOKE_BASE_URL: \${{ env.VERCEL_BRANCH_URL || env.VERCEL_URL || env.DEPLOY_PRIME_URL || '' }}
         run: |
           # Exclude tests/pinned/retired/** — retired pins have audit
           # entries and intentionally preserve their original assertion
           # so git history is honest; running them would make every
           # "pinned retire" a guaranteed CI break.
           if [ -d tests/pinned ] && ls tests/pinned/*.test.ts >/dev/null 2>&1; then
+            VITEST_OUT=$(mktemp)
             if [ -f node_modules/.bin/vitest ]; then
-              ./node_modules/.bin/vitest run tests/pinned/ --exclude '**/retired/**' --reporter=verbose --no-coverage
+              ./node_modules/.bin/vitest run tests/pinned/ --exclude '**/retired/**' --reporter=verbose --no-coverage 2>&1 | tee "$VITEST_OUT"
+              VITEST_EXIT=\${PIPESTATUS[0]}
             else
-              # Last-resort: vitest not installed in the repo. Fall back
-              # to npx with no-install so this step doesn't silently pass.
-              npx -y -p vitest@^2 vitest run tests/pinned/ --exclude '**/retired/**' --reporter=verbose --no-coverage
+              npx -y -p vitest@^2 vitest run tests/pinned/ --exclude '**/retired/**' --reporter=verbose --no-coverage 2>&1 | tee "$VITEST_OUT"
+              VITEST_EXIT=\${PIPESTATUS[0]}
             fi
+            # Gap 3 verification: an auto-opt-in that silently still skips
+            # is the same trap as not opting in. Parse the vitest output;
+            # if 0 pins actually executed (all-skip), fail the step with a
+            # loud line so it can't read as green coverage.
+            PASSED=$(grep -oE "Tests +[0-9]+ passed" "$VITEST_OUT" | head -1 | grep -oE "[0-9]+" || echo "0")
+            FAILED=$(grep -oE "Tests +.*[0-9]+ failed" "$VITEST_OUT" | head -1 | grep -oE "[0-9]+" || echo "0")
+            EXECUTED=$((\${PASSED:-0} + \${FAILED:-0}))
+            SKIPPED=$(grep -oE "[0-9]+ skipped" "$VITEST_OUT" | head -1 | grep -oE "[0-9]+" || echo "0")
+            TOTAL=$((EXECUTED + \${SKIPPED:-0}))
+            echo ""
+            echo "::group::Pinned execution verification"
+            echo "Pinned: \$EXECUTED of \$TOTAL pins actually executed (\$SKIPPED skipped)"
+            if [ "\$EXECUTED" = "0" ] && [ "\$TOTAL" -gt "0" ]; then
+              echo "::error title=Pinned auto-opt-in not working::pinned: 0/\$TOTAL pins executed — auto-opt-in is configured but no pin actually ran. Check that PINNED_SMOKE_BASE_URL resolved a real URL and that pin cadence allows execution."
+              echo "::endgroup::"
+              exit 1
+            fi
+            echo "::endgroup::"
+            exit \$VITEST_EXIT
           else
             echo "No pinned tests to run yet — first PR will create them."
           fi

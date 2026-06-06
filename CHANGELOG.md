@@ -2,6 +2,91 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.4.0] — 2026-06-06
+
+The Cipherwake-dogfood release. Five gaps caught during a real socialideagen session where Pinned ran zero tests locally AND in CI, and the one real regression (stub-404 / prerender divergence) was caught by manual review, not a pin. Each gap below is closed with the exact acceptance test from the field report.
+
+### Gap 3b — Zero-config base URL resolution
+
+`apps/cli/src/baseUrl.ts` + inlined into every smoke / render-collection / visibility-invariant template. Resolution chain:
+
+1. Explicit overrides: `PINNED_SMOKE_BASE_URL` / `PINNED_BASE_URL` / `PREVIEW_URL` / `PINNED_CI_BASE_URL`
+2. CI auto-detect (zero config): Vercel (`VERCEL_BRANCH_URL` > `VERCEL_URL` > `VERCEL_PROJECT_PRODUCTION_URL`), Netlify (`DEPLOY_PRIME_URL` > `URL` when `NETLIFY=true`), Cloudflare Pages (`CF_PAGES_URL`), Render (`RENDER_EXTERNAL_URL`)
+3. Last-known-good cache `.pinned/base-url.json` (written by `pinned dev`)
+4. Author-declared `defaultBaseUrl`
+
+When nothing resolves: ONE loud single-line message (`pinned: no base URL (not on a known CI provider, no local server). Run \`pinned dev\` or set PINNED_BASE_URL.`). Never silent `20 skipped` — that's the actual trap. 18 new tests.
+
+### Gap 1 — `render-collection` pin (the highest-value asked-for feature)
+
+Pin shape that enumerates routes at run time and renders each. Single-slug pins gave ~zero coverage on multi-tenant / template-per-row apps; this pin's coverage scales with the collection automatically.
+
+Three enumeration sources:
+- `generate-static-params` — dynamic import + call `generateStaticParams()`. This alone catches the prerender/resolver divergence (prerendered set vs resolvable set must match).
+- `collection-getter` — dynamic import a module + named export returning `[{ slug, ... }]`.
+- `sitemap` — GET `/sitemap.xml`, extract `<loc>`s under a path prefix.
+
+Per-slug failure reporting (names which specific slug failed, not "preview broke"). Deterministic hash-sort + cap at N (default 20) with a "covered N/M, sampled" line — no silent truncation.
+
+CLI: `pinned render add --path '/preview/[slug]' --from collection-getter --module lib/ideas.ts --export getAllIdeas`. Adding a new item to the collection covers it automatically — no pin edit. That's the whole point.
+
+Acceptance test passes: bug-shape (generateStaticParams returns drafts) fails naming the draft slugs; fixed-shape (filters drafts) passes.
+
+### Gap 3 — `pinned dev` (the local-loop closer)
+
+Three-part fix to the real problem: pins skip because cadence=on-demand needs `SMOKE_RUN=1`, AND the generated workflow doesn't set it.
+
+(A) **Generated `pinned.yml` now sets `SMOKE_RUN=1`, `PINNED_SMOKE=1`, `PINNED_ALLOW_PRODUCTION_URL=1`, and `PINNED_SMOKE_BASE_URL` from `${{ env.VERCEL_BRANCH_URL || env.VERCEL_URL || env.DEPLOY_PRIME_URL || '' }}`.** Plus verifies execution after vitest exits: if 0 pins executed despite the env being set, the workflow step FAILS with a loud GitHub Actions error annotation. Auto-opt-in that silently still skips is the same trap as not opting in.
+
+(B) **New `pinned dev` command.** Detects framework (Next/Vite/Astro/SvelteKit/Remix/Nuxt), reads `package.json#scripts.dev`, picks an unused port (prefers framework default), spawns the dev server, polls until ready (60s default), writes the URL to `.pinned/base-url.json`, runs vitest with `SMOKE_RUN=1` + `PINNED_SMOKE_BASE_URL=http://localhost:PORT`, tears down (SIGTERM→SIGKILL). After vitest exits, parses output and exits non-zero if 0 pins executed. Zero env vars needed by the user.
+
+(C) Loud-skip messaging already shipped in Gap 3b.
+
+### Gap 2 — Authed cookie support on smoke pins
+
+Optional `auth: { cookie, valueFromEnv }` on `http-route` smoke entrypoints. The cookie VALUE comes from an env var at run time, never stored in the pin file. CLI: `pinned smoke add ... --auth-cookie admin --auth-env PINNED_ADMIN_COOKIE`.
+
+Three runtime cases verified:
+- Env var unset → SKIP-with-WARN (never RED, doesn't break unauthed CI)
+- Right cookie → actually renders the authed page + asserts content
+- Wrong cookie → FAIL (caught the bad auth)
+
+### Gap 4 — `visibility-invariant` pin (the negative assertion render pins cannot provide)
+
+The dual of Gap 1. Render pins prove "items that should work, work." They cannot prove "items that should be hidden, are hidden." The real shipped leak that motivated this: 9 draft idea slugs stayed publicly resolvable (200 + valid HTML) because `getAllIdeas()` filtered DB rows but not seed merge.
+
+Pin reads the UNFILTERED collection (admin getter), splits items by a discriminant field, asserts:
+- items where `field ∈ publicValues` → must render with one of `publicStatusAllowed` (default `[200]`)
+- items NOT matching → must return one of `privateStatusAllowed` (default `[404, 307, 308]`)
+
+CLI: `pinned visibility add --public-route '/preview/[slug]' --module lib/ideas.ts --export getAllIdeasAdmin --field status --public-values live`.
+
+Acceptance: bug stub (serves all slugs at 200) FAILS naming each leaked draft. Fixed stub (drafts → 404) PASSES.
+
+### Gap 5 — `pinned sync-rules` (inline lessons, never redirect)
+
+The existing agent-rules block points at `tests/pinned/AGENT.md` and `.pinned/ai-lessons.md` — but a pointer is one hop, and one hop is what got skipped during the field session. Per Gap 5: "three lines of plainEnglish in the always-loaded file beats a pointer to a 50-line file."
+
+`pinned sync-rules` reads `.pinned/lessons.json`, ranks by severity + past-mistakes count, and inlines the top-N (default 5) into a marker-bounded sub-block (`<!-- pinnedai:lessons:start -->`) within every agent-rules file that already has the pinnedai marker block. Files without it are listed (`run \`pinned ai-rules install\` first`) — never auto-created.
+
+Idempotent: re-running replaces just the lessons sub-block, never duplicates. Line-budget capped at 25 (default) so the block stays cheap to ingest on every agent edit.
+
+### Tested
+
+- 417/417 vitest (was 392; +25 new tests across baseUrl, render-collection, visibility-invariant)
+- Gap 1 acceptance test passes: render-collection on socialideagen-shape draft-404 repro fails on bug shape, passes on fix
+- Gap 4 acceptance test passes: visibility-invariant fails naming each leaked slug on the leak stub, passes on the fix
+- Gap 2 acceptance: 3/3 (no-env skips, right cookie passes + asserts content, wrong cookie fails)
+- Gap 3 acceptance: `pinned dev` on a synthetic Next-shape repo: boots server, runs pin, verifies 1/1 executed, exits 0. All-skip case exits 1 with loud message.
+- Gap 5 acceptance: lessons inlined into CLAUDE.md, AGENTS.md skipped (no marker), re-run is idempotent (no duplication)
+- Prior matrices: 16/16 (0.3.1 bug-pack) + 14/14 (0.3.2 A+B+D) + 54/54 (dyad sweep) all intact
+
+### Honest framing (preserved from the field report)
+
+In the original socialideagen session that motivated this release, Pinned ran zero tests locally AND in CI, and the one real regression was caught by manual code review, not a pin. The render-collection pin (Gap 1) is the single change that turns that miss into a catch. As of 0.4.0, the auto-opt-in in `pinned init --auto` AND the generated workflow set `SMOKE_RUN=1` + a base URL by default AND verify execution — so the silent-skip trap is closed at every layer.
+
+---
+
 ## [0.3.3] — 2026-06-05
 
 Closes the schema-detector gap Cipherwake flagged in 0.3.2 — the static-analysis blind spot that let "POST → 500 on missing relation" bugs slip past the detector.

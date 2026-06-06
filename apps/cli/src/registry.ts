@@ -342,6 +342,10 @@ export function coverageFromClaim(claim: Claim): PinCoverage {
       // Smoke pins assert against a runtime endpoint, not a source
       // file. Track the route so cross-cutting reports can locate it.
       return { routes: [claim.route] };
+    case "render-collection":
+      return { routes: [claim.pathTemplate] };
+    case "visibility-invariant":
+      return { routes: [claim.publicRoute] };
   }
 }
 
@@ -540,6 +544,10 @@ function claimLabel(c: Claim): string {
       return c.entrypoint.kind === "http-route"
         ? `\`smoke ${c.entrypoint.method} ${escapeMarkdownCell(c.route)}\` (${c.assertions.length} assertions, ${c.cadence})`
         : `\`smoke ${escapeMarkdownCell(c.route)}\` (${c.assertions.length} assertions, ${c.cadence})`;
+    case "render-collection":
+      return `\`render-collection ${escapeMarkdownCell(c.pathTemplate)}\` (routes from ${c.routes.from})`;
+    case "visibility-invariant":
+      return `\`visibility-invariant ${escapeMarkdownCell(c.publicRoute)}\` (by ${c.rule.field})`;
   }
 }
 

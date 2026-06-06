@@ -1032,8 +1032,10 @@ function relevantPathsForClaim(claim: Claim): string[] | null {
       // File-bound — only touches to this file change the verdict.
       return [claim.filePath];
     case "smoke-functional":
-      // Smoke pins assert against a runtime endpoint. There's no
-      // single source file we can scope replay to. Full-window replay.
+    case "render-collection":
+    case "visibility-invariant":
+      // Runtime-endpoint pins — no single source file we can scope
+      // replay to. Full-window replay.
       return null;
   }
 }

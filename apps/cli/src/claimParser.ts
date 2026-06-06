@@ -325,6 +325,11 @@ export function classifyPinStrength(
       // actually executes the endpoint. Unverified otherwise — same
       // gating as HTTP templates.
       return httpVerifiable ? "behavioral" : "unverified";
+    case "render-collection":
+    case "visibility-invariant":
+      // 0.4.0+ — same base-URL gating as smoke. Behavioral when
+      // resolvable; otherwise unverified (will loud-skip at run time).
+      return httpVerifiable ? "behavioral" : "unverified";
   }
 }
 
@@ -830,7 +835,155 @@ export type Claim =
   | NullableResultClaim
   | ResponseShapeClaim
   | MassMutationClaim
-  | SmokeFunctionalClaim;
+  | SmokeFunctionalClaim
+  | RenderCollectionClaim
+  | VisibilityInvariantClaim;
+
+// 0.4.0+ (Cipherwake Gap 4): visibility-invariant pin.
+//
+// Render pins (Gap 1) prove "items that should work, work." They CANNOT
+// prove "items that should be hidden, are hidden." Drafts/private/
+// archived items rendering at 200 are a bug; render pins mark them green
+// because 200 + valid HTML matches the success criteria.
+//
+// Real shipped leak that motivated this:
+//   getAllIdeas() filtered DB rows by status === "live" but NOT the seed
+//   merge, so 9 draft seeds stayed publicly resolvable. /preview/seatcheck
+//   (draft) served the full landing page 200. Render pin = GREEN. Bug = shipped.
+//
+// The pin reads the UNFILTERED collection (admin getter), splits items
+// by a discriminant field, then asserts:
+//   - items matching publicValues → must render 200 (positive)
+//   - items NOT matching → must return 404/307/308 (negative — the
+//     missing half of any visibility gate)
+//
+// Pairs naturally with the enum-drift lesson — when a consumer reads
+// "live" exists, sweep should auto-propose this shape.
+export type VisibilityInvariantClaim = {
+  template: "visibility-invariant";
+  // The path template — same shape as render-collection.
+  // e.g. "/preview/[slug]"
+  publicRoute: string;
+  // Where to read the UNFILTERED collection from. Must include items
+  // that should NOT be public — otherwise the negative assertion has
+  // nothing to test.
+  collection: {
+    from: "collection-getter";
+    modulePath: string;
+    exportName: string;
+    slugField?: string;             // default "slug"
+  };
+  // The discriminant rule.
+  rule: {
+    // Field on each item that decides public/private.
+    field: string;                  // e.g. "status"
+    // Values that grant public access.
+    publicValues: string[];         // e.g. ["live"]
+    // Allowed HTTP statuses for the public assertion (default [200]).
+    publicStatusAllowed?: number[];
+    // Allowed HTTP statuses for the private (hidden) assertion
+    // (default [404, 307, 308]).
+    privateStatusAllowed?: number[];
+  };
+  // Cost cap. Default { maxRoutes: 30, sample: "deterministic" }.
+  // Higher than render-collection's because we render BOTH halves.
+  cap?: {
+    maxRoutes?: number;
+    sample?: "deterministic" | "all";
+  };
+  route: string;
+  raw: string;
+};
+
+// 0.4.0+ (Cipherwake Gap 1): render-collection pin.
+//
+// Single-slug render pins give ~zero coverage on multi-tenant /
+// template-per-row apps. socialideagen is one preview page × N idea
+// rows — a malformed row crashes only its own route. /preview/benchmob
+// can be green while /preview/campus-pulse 500s, and adding a 19th
+// idea silently has zero coverage.
+//
+// This pin enumerates routes AT RUN TIME via one of three sources +
+// renders each, asserting a healthy response per slug. Adding a 19th
+// row covers it automatically with zero pin edits.
+//
+// Repro that motivated this (real, the socialideagen session):
+//   generateStaticParams() returned ALL 33 idea slugs to prerender.
+//   resolveIdea() 404'd anything with status: "draft" (9 of them).
+//   Result: 9 prerendered routes notFound() on first request. The
+//   single-slug benchmob pin reported all-clear. Bug found by manual
+//   code review, not by Pinned. This pin closes the gap.
+//
+// Enumeration sources (priority order):
+//   - generate-static-params: dynamic import the file, call the
+//     exported `generateStaticParams` function, get { slug } array.
+//     This alone catches the prerender/resolver divergence — the
+//     prerendered set must match the resolvable set.
+//   - collection-getter: dynamic import a module + named export
+//     that returns { slug } items. Author declares the import.
+//   - sitemap: GET /sitemap.xml, extract <loc>s under a path prefix.
+//     Fallback for apps without an exported param fn.
+//
+// Cost cap (deterministic — no silent truncation):
+//   - default maxRoutes = 20
+//   - if N > maxRoutes, take a hash-sorted deterministic sample
+//   - print "covered 20/200, sampled" line so the user knows
+export type RenderCollectionClaim = {
+  template: "render-collection";
+  // The path template (with [param] placeholders) the pin renders.
+  // Example: "/preview/[slug]".
+  pathTemplate: string;
+  // Where to find the param values at run time.
+  routes:
+    | {
+        // Reads exports.generateStaticParams() from a TS/JS module.
+        // Returns Array<{ [param]: string }>.
+        from: "generate-static-params";
+        // Module path relative to repo root.
+        // e.g. "app/preview/[slug]/page.tsx" or "app/preview/[slug]/page.ts"
+        modulePath: string;
+      }
+    | {
+        // Calls a named export that returns the collection.
+        from: "collection-getter";
+        modulePath: string;
+        exportName: string;
+        // Field on each item to use as the param value.
+        // Default: "slug".
+        slugField?: string;
+      }
+    | {
+        // GET /sitemap.xml, extract <loc> entries that start with
+        // the given prefix, then strip the prefix to derive the param.
+        // e.g. prefix "/preview/" matches `/preview/benchmob`.
+        from: "sitemap";
+        prefix: string;
+      };
+  // Expectations applied per slug.
+  expect: {
+    // HTTP status. Default: 200.
+    status?: number;
+    // Fail if the response body contains React/Next.js error boundary
+    // markers (`__next_error__`, hydration mismatch text, etc.).
+    // Default: true.
+    noErrorBoundary?: boolean;
+    // Minimum body byte length — catches stub-200 / empty body bugs.
+    // Default: 500.
+    minBodyBytes?: number;
+    // Fail if the response is a Next.js notFound() (typically 404).
+    // notFound returns 404 but the pin already asserts 200, so this
+    // is largely redundant; included for clarity.
+    notFoundOk?: boolean;
+  };
+  // Cost cap. Default { maxRoutes: 20, sample: "deterministic" }.
+  cap?: {
+    maxRoutes?: number;
+    sample?: "deterministic" | "all";
+  };
+  // The unique identifier for the pin — used by claimKey/claimSlug.
+  route: string;
+  raw: string;
+};
 
 // 0.3.0+: Smoke / golden-path pin (Tier 1 — functional smoke).
 //
@@ -960,6 +1113,18 @@ export type SmokeFunctionalClaim = {
         body?: string;
         // Optional request headers (e.g. content-type, auth).
         headers?: Record<string, string>;
+        // 0.4.0+ (Cipherwake Gap 2): optional cookie auth for rendering
+        // authed pages. The actual cookie value comes from an env var
+        // at run time — never stored in the pin file. Without the env
+        // var, the test SKIPS-with-WARN (never RED) so unauthed CI
+        // runs don't break.
+        auth?: {
+          // Cookie name to set, e.g. "admin" or "session".
+          cookie: string;
+          // Env var the runtime reads the cookie value from.
+          // E.g. "PINNED_ADMIN_COOKIE" → process.env.PINNED_ADMIN_COOKIE.
+          valueFromEnv: string;
+        };
       }
     | {
         // 0.3.0+ exported-function entrypoint. Pinned imports the
@@ -2812,6 +2977,20 @@ export function describeClaimForUser(c: Claim): ClaimDisplay {
         check: `Runs the endpoint at pin-eval; checks each declared assertion (e.g. non-empty body, terminal status, response shape) within the bound. WARN-on-missing-env when no base URL is resolvable. RED on actual feature breakage.`,
       };
     }
+    case "render-collection": {
+      return {
+        title: `render-collection: every route under ${c.pathTemplate} renders healthily`,
+        promise: `Each route enumerated from ${c.routes.from} renders with status 200, no error-boundary markers, body ≥ ${(c.expect.minBodyBytes ?? 500)} bytes. Adding a new item to the collection covers it AUTOMATICALLY — no pin edit.`,
+        check: `Resolves the route set from the declared source at run time, GETs each, asserts per-slug. Reports WHICH slug failed — not just "preview broke." Catches the "malformed row crashes only its own route" failure mode that single-slug render pins miss (prerender/resolver divergence, draft-route 404s, per-tenant bugs).`,
+      };
+    }
+    case "visibility-invariant": {
+      return {
+        title: `visibility-invariant: ${c.publicRoute} respects the ${c.rule.field} discriminant`,
+        promise: `Items where ${c.rule.field} ∈ [${c.rule.publicValues.join(", ")}] render 200; items NOT matching return 404/307/308. Assert the NEGATIVE that render pins structurally cannot — "draft/private/archived MUST NOT be publicly reachable."`,
+        check: `Reads the unfiltered collection from ${c.collection.modulePath}#${c.collection.exportName}, splits by the discriminant, hits both halves, fails on items that violate either direction. Reports which specific slug leaked.`,
+      };
+    }
   }
 }
 
@@ -2977,6 +3156,10 @@ export function badCaseForClaim(claim: Claim): string {
         : claim.route;
       return `smoke: \`${epDesc}\` no longer produces a real outcome — the feature looks built but fails one of its declared assertions (silent empty return, missing terminal state, wrong shape, or hung worker).`;
     }
+    case "render-collection":
+      return `render-collection: at least one route under \`${claim.pathTemplate}\` no longer renders healthily (prerender/resolver divergence, draft-404, error boundary, or empty body). Single-slug pins are blind to this; the collection coverage is what catches it.`;
+    case "visibility-invariant":
+      return `visibility-invariant: an item leaked publicly that should have been hidden — or vice versa — on \`${claim.publicRoute}\`. The negative assertion is the half render pins structurally cannot provide.`;
   }
 }
 
@@ -3102,6 +3285,10 @@ export function claimRoute(c: Claim): string | null {
       return c.filePath;
     case "smoke-functional":
       return c.route;
+    case "render-collection":
+      return c.pathTemplate;
+    case "visibility-invariant":
+      return c.publicRoute;
   }
 }
 
@@ -3314,6 +3501,12 @@ export function claimKey(c: Claim): string {
       return c.entrypoint.kind === "http-route"
         ? `smoke-functional:${c.entrypoint.method}:${c.route}`
         : `smoke-functional:${c.route}`;
+    case "render-collection":
+      // Key on path template + source. Adding/removing items in the
+      // collection should NOT change the key — that's the whole point.
+      return `render-collection:${c.pathTemplate}:${c.routes.from}`;
+    case "visibility-invariant":
+      return `visibility-invariant:${c.publicRoute}:${c.rule.field}`;
   }
 }
 

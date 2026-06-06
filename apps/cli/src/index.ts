@@ -104,6 +104,8 @@ import { generateNullableResultTest } from "./templates/nullableResult.js";
 import { generateResponseShapeTest } from "./templates/responseShape.js";
 import { generateMassMutationTest } from "./templates/massMutation.js";
 import { generateSmokeFunctionalTest } from "./templates/smokeFunctional.js";
+import { generateRenderCollectionTest } from "./templates/renderCollection.js";
+import { generateVisibilityInvariantTest } from "./templates/visibilityInvariant.js";
 
 // Convenience dispatcher — given any Claim, pick the right generator.
 // Keeps callers (CLI, landing demo, hosted Worker) DRY.
@@ -234,6 +236,10 @@ function dispatchToTemplate(claim: Claim, opts: GenerateOpts): GeneratedTest {
       return generateMassMutationTest(claim, opts);
     case "smoke-functional":
       return generateSmokeFunctionalTest(claim, opts);
+    case "render-collection":
+      return generateRenderCollectionTest(claim, opts);
+    case "visibility-invariant":
+      return generateVisibilityInvariantTest(claim, opts);
   }
   // Exhaustiveness guard — if a new Claim variant is added without a
   // case here, TS will fail to compile this assignment with a clear
