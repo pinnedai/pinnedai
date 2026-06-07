@@ -57,10 +57,94 @@ function walkDir(root: string, found: string[], maxFiles = 5000): void {
   }
 }
 
-// Resolve a relative import specifier to an actual file path in the
-// repo. Conservative — only tries common extensions + index files.
-// Returns null when the specifier is a bare module name (node_modules).
-function resolveImport(fromAbsFile: string, spec: string, repoRoot: string): string | null {
+// 0.4.3 P0 fix (Cipherwake): TypeScript path-alias support.
+// Real Next.js apps use `@/components/Hero` (mapped from
+// `tsconfig.json#compilerOptions.paths`). Without parsing tsconfig,
+// the graph treats every aliased import as a bare-package import →
+// edge never added → editing a component never bubbles up to the
+// page → pin never flagged.
+//
+// We parse tsconfig.json / jsconfig.json with a tolerant JSON-with-
+// comments stripper, extract paths, and resolve aliases before the
+// "is it relative?" check.
+type PathAliases = Array<{
+  // Prefix to match (no trailing *). E.g. "@/" from "@/*".
+  prefix: string;
+  // Suffix to match (no leading *). E.g. "" from "@/*".
+  suffix: string;
+  // Absolute target prefixes — what to substitute. E.g. ["/abs/repo/"].
+  targets: string[];
+}>;
+
+function stripJsonComments(s: string): string {
+  // Naive but enough for tsconfig.json. Handles // and /* */ comments
+  // and trailing commas in objects/arrays. Tolerant — doesn't try to
+  // be a real parser.
+  return s
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "")
+    .replace(/,(\s*[}\]])/g, "$1");
+}
+
+function loadPathAliases(repoRoot: string): PathAliases {
+  const aliases: PathAliases = [];
+  for (const fname of ["tsconfig.json", "jsconfig.json", "tsconfig.base.json"]) {
+    const p = join(repoRoot, fname);
+    if (!existsSync(p)) continue;
+    let raw: string;
+    try { raw = readFileSync(p, "utf8"); } catch { continue; }
+    let parsed: any;
+    try { parsed = JSON.parse(stripJsonComments(raw)); } catch { continue; }
+    const co = parsed?.compilerOptions ?? {};
+    const baseUrlRel = typeof co.baseUrl === "string" ? co.baseUrl : ".";
+    const baseUrlAbs = resolve(repoRoot, baseUrlRel);
+    const paths = co.paths ?? {};
+    if (!paths || typeof paths !== "object") continue;
+    for (const [key, valRaw] of Object.entries(paths)) {
+      const targetsList = Array.isArray(valRaw) ? valRaw.filter((v): v is string => typeof v === "string") : [];
+      if (targetsList.length === 0) continue;
+      // Key shape: "@/*" or "@/components/*" or "exact-name".
+      const starIdx = key.indexOf("*");
+      let prefix: string, suffix: string;
+      if (starIdx >= 0) {
+        prefix = key.slice(0, starIdx);
+        suffix = key.slice(starIdx + 1);
+      } else {
+        prefix = key;
+        suffix = "";
+      }
+      const targets = targetsList.map((t) => {
+        const ti = t.indexOf("*");
+        const targetPrefix = ti >= 0 ? t.slice(0, ti) : t;
+        return resolve(baseUrlAbs, targetPrefix);
+      });
+      aliases.push({ prefix, suffix, targets });
+    }
+  }
+  return aliases;
+}
+
+// Resolve an import specifier to an actual file path in the repo.
+// Handles relative imports AND tsconfig path aliases.
+function resolveImport(
+  fromAbsFile: string,
+  spec: string,
+  repoRoot: string,
+  aliases: PathAliases
+): string | null {
+  // Try alias resolution first — applies to non-relative specs.
+  for (const a of aliases) {
+    if (!spec.startsWith(a.prefix)) continue;
+    if (a.suffix && !spec.endsWith(a.suffix)) continue;
+    const middle = spec.slice(a.prefix.length, spec.length - a.suffix.length);
+    for (const targetPrefix of a.targets) {
+      const candidate = join(targetPrefix, middle);
+      const resolved = tryExtensions(candidate);
+      if (resolved) return resolved;
+    }
+  }
+
+  // Then fall through to relative / absolute / tilde paths.
   if (!spec.startsWith(".") && !spec.startsWith("/") && !spec.startsWith("~")) {
     return null; // bare package import — not in repo
   }
@@ -70,9 +154,12 @@ function resolveImport(fromAbsFile: string, spec: string, repoRoot: string): str
   else if (spec.startsWith("~")) candidate = join(repoRoot, spec.slice(1));
   else candidate = resolve(baseDir, spec);
 
+  return tryExtensions(candidate);
+}
+
+function tryExtensions(candidate: string): string | null {
   // Strip trailing .js / .ts to attempt extension matching.
   const stripped = candidate.replace(/\.(?:[mc]?[jt]sx?|cjs|mjs)$/, "");
-
   const tries = [
     candidate,
     ...CODE_EXTENSIONS.map((ext) => stripped + ext),
@@ -88,6 +175,10 @@ export function buildDependencyGraph(repoRoot: string, opts: { maxFiles?: number
   const maxFiles = opts.maxFiles ?? 5000;
   const files: string[] = [];
   walkDir(repoRoot, files, maxFiles);
+  // 0.4.3 P0: resolve tsconfig path aliases so @/components/Hero etc.
+  // become real graph edges. Without this, every @-aliased import was
+  // dropped → editing a component never bubbled up to the page.
+  const aliases = loadPathAliases(repoRoot);
   const importers = new Map<string, Set<string>>();
   for (const file of files) {
     let content: string;
@@ -95,7 +186,7 @@ export function buildDependencyGraph(repoRoot: string, opts: { maxFiles?: number
     IMPORT_REGEX.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = IMPORT_REGEX.exec(content)) !== null) {
-      const target = resolveImport(file, m[1], repoRoot);
+      const target = resolveImport(file, m[1], repoRoot, aliases);
       if (!target) continue;
       const relTarget = relative(repoRoot, target);
       if (!importers.has(relTarget)) importers.set(relTarget, new Set());

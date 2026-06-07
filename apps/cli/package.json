@@ -1,6 +1,6 @@
 {
   "name": "pinnedai",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Smoke-test AI-built features so they actually work — not just parse. `pinned smoke add` runs your endpoint and asserts real invariants. `pinned render add` renders EVERY route in a collection (Next.js generateStaticParams, a getter, sitemap) — adding a new row covers it automatically. `pinned visibility add` asserts the negative — drafts MUST return 404, not 200 (catches leaks render pins miss). `pinned dev` boots your dev server + runs pins locally with zero config. Auto-detects Vercel / Netlify / Cloudflare Pages / Render preview URLs in CI. Plus: enum-drift contracts, FP suppression, readiness gate, AI-lesson sync into CLAUDE.md / AGENTS.md / .cursorrules. Free beta · Founder Pro waitlist open.",
   "type": "module",
   "license": "Apache-2.0",

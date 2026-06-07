@@ -2,6 +2,57 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.4.3] — 2026-06-07
+
+0.4.2 fixed dynamic-route → page-file resolution but the in-source E2E used **relative** imports (`../../../components/IdeaLanding`) — exactly the shape my resolver already handled. Real Next.js apps use TypeScript path aliases (`@/components/...`) and the graph was silently dropping every aliased edge as "bare package import." On top of that, `hook-postedit`'s dev-server probe only looked at `.pinnedai/config.json#http.url` — no config meant "no server detected" even with `next dev` demonstrably bound to :3000. Two P0 fixes plus the regression test that catches both.
+
+### Fixed (P0) — `blast-radius` dependency graph dropped TypeScript path aliases
+
+Cipherwake repro on socialideagen:
+```
+$ pinned blast-radius components/IdeaLanding.tsx   → No smoke pins affected
+$ pinned blast-radius components/Hero.tsx          → No smoke pins affected
+$ pinned blast-radius lib/ideas.ts                 → No smoke pins affected
+```
+…even though `app/preview/[slug]/page.tsx` imported all three via `@/components/...` / `@/lib/...`.
+
+Cause: `resolveImport` in `blastRadius.ts` only handled `./`, `../`, and absolute paths. Anything else — including every `@/...` and `~/...` import in the wild — was treated as a third-party package and dropped from the graph. So the transitive importer walk had no edge from page → component → sub-component / data module.
+
+Fix: new `loadPathAliases(repoRoot)` reads `tsconfig.json`, `jsconfig.json`, and `tsconfig.base.json` (with proper JSON-with-comments + trailing-comma stripping), then `resolveImport(spec, fromFile, repoRoot, aliases)` tries alias expansion **first** — applying `compilerOptions.baseUrl` and `compilerOptions.paths` (e.g. `"@/*": ["./*"]`, `"@/*": ["./src/*"]`, `"~/*": ["./*"]`, multi-target arrays), then falls back to relative/absolute resolution. Extracted `tryExtensions(base)` for the `.ts` / `.tsx` / `.js` / `.jsx` / `/index.*` waterfall so both code paths share the same suffix logic.
+
+### Fixed (P0) — `hook-postedit` couldn't find a dev server on the default port
+
+Cipherwake repro:
+```
+$ next dev &
+$ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/   → 200
+$ echo "..." > components/Hero.tsx && /* PostToolUse fires */
+pinned hook-postedit: no dev server is running on localhost; skipping smoke.
+```
+
+Cause: `probeRunningDevServer` only read `.pinnedai/config.json#http.url`. Most users never wrote a config — the dev server was running, the hook just didn't know to look at it.
+
+Fix: multi-fallback chain in the hook —
+1. `PREVIEW_URL` env var (existing)
+2. `resolveBaseUrl()` waterfall (Vercel/Netlify/CF Pages/Render, then `PINNED_BASE_URL`, then config)
+3. `probeRunningDevServer()` (config-path, kept for explicit overrides)
+4. **NEW** port-scan: `localhost:3000 → 3001 → 5173 → 5174 → 4321 → 8080 → 8000 → 4000` with 500 ms timeout each and `X-Pinned-Probe: 1` header for grep-ability in the user's server logs
+
+The hook now always emits to stderr **which** source the URL came from (`source: PREVIEW_URL` / `source: resolveBaseUrl` / `source: probeRunningDevServer` / `source: port-scan:3000`). Silent attach failures become loud.
+
+### Added — `hookPostedit.realedit.test.ts`: the E2E that actually catches both bugs
+
+0.4.2's E2E used `../../../components/IdeaLanding` (relative) and no live server. Both shipped bugs were invisible to it. The new file:
+- Creates a Next.js-shape tmpdir with `tsconfig.json` declaring `"@/*": ["./*"]` and a `page.tsx` that imports `@/components/IdeaLanding` + `@/lib/ideas`
+- Asserts `buildDependencyGraph` produces the edge `page.tsx → components/IdeaLanding.tsx` (would have FAILED in 0.4.2)
+- Boots `createServer` on `127.0.0.1:0`, captures the ephemeral port, runs the hook against it via `PINNED_BASE_URL`, asserts the output is non-empty and does NOT say "no dev server"
+- A second test binds to a known port (4000 — last on the scan list) and verifies the port-scan path discovers it
+- 6 tests, all pass; full suite is now 26 files / 443 tests
+
+### Discipline note
+
+This was the *third* time in this release cycle that an in-source test passed while the real-world shape failed: 0.4.0 (lockfile FP detector tested only on synthetic diffs), 0.4.1 (PostToolUse hook tested at the wiring layer not the firing layer), 0.4.2 (E2E used relative imports). The pattern: my test setup mimics the code structure that's convenient to write, not the structure that real codebases use. New rule going forward: every E2E that touches the dependency graph MUST use path-aliased imports + a real `tsconfig.json`, because that's what every Next.js / Vite / Vue / Nuxt project actually ships.
+
 ## [0.4.2] — 2026-06-07
 
 The 0.4.1 PostToolUse auto-install shipped wiring tests ("settings.json has the entry") instead of behavior tests ("hook actually fires on an edit"). Cipherwake caught it in the field: the hook was installed correctly but produced NOTHING on every edit because blast-radius didn't connect literal routes / template routes to their dynamic page files. Three P0 fixes.

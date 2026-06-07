@@ -11437,22 +11437,66 @@ program
       return;
     }
 
-    // Probe for a running dev server. If none, emit a soft note (the
-    // hook is best-effort — don't fail loudly because the agent is
-    // editing while no server is up).
+    // Probe for a running dev server. Multi-fallback chain (0.4.3 P0
+    // fix — Cipherwake reported next dev on :3000 wasn't detected
+    // because probeRunningDevServer only reads .pinnedai/config.json).
+    //
+    // Order:
+    //   1. PREVIEW_URL env (explicit)
+    //   2. PINNED_SMOKE_BASE_URL / PINNED_BASE_URL (set by pinned dev)
+    //   3. CI provider vars (Vercel/Netlify/CF/Render — same as smoke
+    //      pin resolver)
+    //   4. .pinned/base-url.json cache (last-known-good from pinned dev)
+    //   5. probeRunningDevServer (strict config-path check)
+    //   6. Port scan for common dev ports — the missing fallback that
+    //      caused Cipherwake's :3000 server to be invisible. Hits each
+    //      port with a 500ms timeout; first 200/3xx/4xx wins.
     let previewUrl = process.env.PREVIEW_URL;
+    let probeSource = "PREVIEW_URL";
     if (!previewUrl) {
       try {
-        const probed = await probeRunningDevServer(cwd);
-        if (probed) previewUrl = probed.url;
+        const { resolveBaseUrl } = await import("./baseUrl.js");
+        const resolved = resolveBaseUrl({ cwd });
+        if (resolved) { previewUrl = resolved.url; probeSource = resolved.source; }
       } catch { /* swallow */ }
     }
     if (!previewUrl) {
+      try {
+        const probed = await probeRunningDevServer(cwd);
+        if (probed) { previewUrl = probed.url; probeSource = "config-http-url"; }
+      } catch { /* swallow */ }
+    }
+    if (!previewUrl) {
+      // Port scan — the load-bearing fallback. Without this, vibe
+      // coders who didn't run `pinned init --auto` with http.mode=local
+      // get the silent-skip trap even with a real dev server running.
+      const COMMON_DEV_PORTS = [3000, 3001, 5173, 5174, 4321, 8080, 8000, 4000];
+      for (const port of COMMON_DEV_PORTS) {
+        try {
+          const url = `http://localhost:${port}`;
+          const res = await fetch(url + "/", {
+            signal: AbortSignal.timeout(500),
+            headers: { "X-Pinned-Probe": "1" },
+          });
+          // Any HTTP response = something's there. We accept 2xx/3xx/4xx
+          // (a dev server can legitimately 404 the root path).
+          if (res.status >= 100 && res.status < 600) {
+            previewUrl = url;
+            probeSource = `port-scan:${port}`;
+            break;
+          }
+        } catch { /* port not bound or timeout — try next */ }
+      }
+    }
+    if (!previewUrl) {
       process.stdout.write(
-        `🛟 pinned: ${affectedPinFiles.length} guard(s) cover the route(s) you just edited, but no dev server is running on localhost. Start your dev server (npm run dev) so Pinned can verify the next edit automatically.\n`
+        `🛟 pinned: ${affectedPinFiles.length} guard(s) cover the route(s) you just edited, but no dev server is running on localhost (tried PREVIEW_URL, .pinned/base-url.json cache, ports 3000/3001/5173/5174/4321/8080/8000/4000). Start your dev server (npm run dev) so Pinned can verify the next edit automatically.\n`
       );
       return;
     }
+    // Debug-readable: tell the user/agent WHICH URL was attached and HOW
+    // it was discovered, so silent failures become loud failures.
+    process.stderr.write(`pinned hook-postedit: attached to ${previewUrl} (source: ${probeSource})\n`);
 
     // Run the affected pins against the dev server.
     try {
