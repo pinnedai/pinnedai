@@ -5785,7 +5785,7 @@ program
     const claims = reg.claims
       .filter((c) => c.status === "active")
       .map((c) => ({ claimId: c.claimId, claim: c.claim }));
-    const index = buildSmokePinIndex(claims);
+    const index = buildSmokePinIndex(claims, cwd);
     const affected = affectedSmokePins(index, files, graph, { maxDepth: Number(opts.maxDepth) });
     if (opts.json) {
       process.stdout.write(JSON.stringify({ affectedClaimIds: affected, files, maxDepth: Number(opts.maxDepth) }, null, 2) + "\n");
@@ -11387,40 +11387,52 @@ program
         if (typeof e.file_path === "string") editedFiles.add(e.file_path);
       }
     }
-    if (editedFiles.size === 0) return; // nothing to verify
+    // 0.4.2 P0 fix (Cipherwake): every silent-exit path must emit a
+    // distinguishable line so the agent can tell "verified" from
+    // "did nothing." `if (editedFiles.size === 0) return;` and friends
+    // were silent — that's why the hook looked decorative.
+    if (editedFiles.size === 0) {
+      process.stdout.write(`pinned: no file paths in PostToolUse payload — nothing to verify.\n`);
+      return;
+    }
 
     const cwd = process.cwd();
     const pinnedDir = join(cwd, opts.dir);
-    if (!existsSync(pinnedDir)) return; // no pins installed — silent
-
-    // Map edited files → routes. Convert absolute paths to repo-relative
-    // before running deriveRouteFromPath.
-    const { deriveRouteFromPath } = await import("./scanDiff.js");
-    const affectedRoutes = new Set<string>();
-    for (const f of editedFiles) {
-      const rel = f.startsWith(cwd + sep) ? f.slice(cwd.length + 1) : f;
-      const route = deriveRouteFromPath(rel);
-      if (route) affectedRoutes.add(route);
+    if (!existsSync(pinnedDir)) {
+      process.stdout.write(`pinned: ${opts.dir} doesn't exist — run \`pinned init\` to set up pins.\n`);
+      return;
     }
-    if (affectedRoutes.size === 0) return; // edits didn't touch routable code
 
-    // Find active pin files that cover any of those routes.
+    // 0.4.2 P0 fix (Cipherwake): use blast-radius for affected-pin
+    // resolution. The old route-matching path (deriveRouteFromPath +
+    // affectedRoutes.has(r)) had the same dynamic-route gap as
+    // blast-radius — it never connected `/preview/benchmob` to the
+    // dynamic page at `app/preview/[slug]/page.tsx`. blast-radius now
+    // handles the route→file resolution AND the transitive importer
+    // walk in one place.
     let reg;
-    try { reg = readRegistry(pinnedDir); } catch { return; }
-    const affectedPinFiles: string[] = [];
-    for (const e of reg.claims) {
-      if (e.status !== "active") continue;
-      const r = claimRoute(e.claim);
-      if (!r) continue;
-      if (affectedRoutes.has(r)) {
-        affectedPinFiles.push(`tests/pinned/${e.filename}`);
-      }
+    try { reg = readRegistry(pinnedDir); } catch (e) {
+      process.stdout.write(`pinned: failed to read ${opts.dir}/.registry.json — ${(e as Error).message}\n`);
+      return;
     }
+    const { buildDependencyGraph, buildSmokePinIndex, affectedSmokePins } = await import("./blastRadius.js");
+    const editedFilesRel = Array.from(editedFiles).map((f) => f.startsWith(cwd + sep) ? f.slice(cwd.length + 1) : f);
+    const graph = buildDependencyGraph(cwd);
+    const claims = reg.claims
+      .filter((c) => c.status === "active")
+      .map((c) => ({ claimId: c.claimId, claim: c.claim, filename: c.filename }));
+    const index = buildSmokePinIndex(claims, cwd);
+    const affectedIds = affectedSmokePins(index, editedFilesRel, graph, { maxDepth: 4 });
+    const affectedPinFiles = affectedIds
+      .map((id) => claims.find((c) => c.claimId === id))
+      .filter((c): c is { claimId: string; claim: any; filename: string } => !!c)
+      .map((c) => `tests/pinned/${c.filename}`);
     if (affectedPinFiles.length === 0) {
-      // No pin covers the edited route — emit a soft suggestion the
-      // agent will read (and Pinned-aware agents act on).
+      // 0.4.2 P0 fix: was silent. Now emit a line naming the edited
+      // file(s) so the user knows the hook actually ran and just
+      // didn't find any covering pins.
       process.stdout.write(
-        `🛟 pinned: edit touched route(s) ${Array.from(affectedRoutes).join(", ")} but no Pinned guard covers them. Consider \`pinned check --description "<what this route should do>"\` to add one.\n`
+        `pinned: 0 pins cover the edited file(s): ${editedFilesRel.join(", ")}. (Use \`pinned blast-radius <file>\` to debug coverage; \`pinned smoke add\` / \`pinned render add\` to add one.)\n`
       );
       return;
     }
@@ -11476,7 +11488,7 @@ program
         // Inject a Pinned-prefixed message the agent will see in its
         // next turn. Keep it COMPACT — agents have limited context.
         process.stdout.write(
-          `🛟 pinned: ${failures} guard${failures === 1 ? "" : "s"} FAILED after your edit to ${Array.from(affectedRoutes).join(", ")}. ` +
+          `🛟 pinned: ${failures} guard${failures === 1 ? "" : "s"} FAILED after your edit to ${editedFilesRel.join(", ")}. ` +
           `Pinned ran the affected pin(s) against ${previewUrl} (attached to your dev server) — your change broke a protected contract.\n\n` +
           `Failing pin(s):\n` +
           failed.slice(0, 3).map((l) => `  • ${l}`).join("\n") +
@@ -11487,7 +11499,7 @@ program
         // Brief positive confirmation. Agents that report this in their
         // final answer give the user visible reassurance.
         process.stdout.write(
-          `🛟 pinned: ✓ ${passes} guard(s) for ${Array.from(affectedRoutes).join(", ")} still pass after your edit (verified in ${elapsedSec}s against ${previewUrl}).\n`
+          `🛟 pinned: ✓ ${passes} guard(s) for ${editedFilesRel.join(", ")} still pass after your edit (verified in ${elapsedSec}s against ${previewUrl}).\n`
         );
       }
     } catch (e) {

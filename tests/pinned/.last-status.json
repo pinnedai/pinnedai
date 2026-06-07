@@ -7,9 +7,9 @@
   "recentlyAddedCount": 4,
   "recentlyAddedAt": "2026-06-06T08:13:38.643Z",
   "suggestedCount": 5,
-  "lastCheckedSha": "ee72b7cb60002e18379eccdf49fa044ffec47724",
-  "lastCheckedDirtyHash": "2856a50763bfbbb1",
-  "updatedAt": "2026-06-07T06:08:32.858Z",
+  "lastCheckedSha": "b012b5c046927fd88cb788935d1b4e66f6bee1d9",
+  "lastCheckedDirtyHash": "f2c15e22283c9d12",
+  "updatedAt": "2026-06-07T10:56:26.783Z",
   "lastAutoProtectAt": "2026-05-26T15:35:19.295Z",
   "lastAddNotifiedAt": "2026-06-05T13:06:53.990Z",
   "recentlyAddedSummaries": [
@@ -35,11 +35,11 @@
   "lastCatchAt": "2026-06-02T23:23:38.541Z",
   "lastCatchClaimId": "baseline-20260525-auth-required-api-admin-19rdd0",
   "catchHistory": [],
-  "checksRun": 67,
-  "verifiedStreak": 20,
+  "checksRun": 68,
+  "verifiedStreak": 21,
   "skippedCount": 3,
-  "lastVerifiedAt": "2026-06-06T08:23:07.123Z",
-  "lastCoveredAt": "2026-06-06T08:23:07.129Z",
+  "lastVerifiedAt": "2026-06-07T06:08:37.120Z",
+  "lastCoveredAt": "2026-06-07T06:08:37.122Z",
   "lastCoveredCount": 68,
   "caughtClaimIds": []
 }

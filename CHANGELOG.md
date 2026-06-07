@@ -2,6 +2,56 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.4.2] — 2026-06-07
+
+The 0.4.1 PostToolUse auto-install shipped wiring tests ("settings.json has the entry") instead of behavior tests ("hook actually fires on an edit"). Cipherwake caught it in the field: the hook was installed correctly but produced NOTHING on every edit because blast-radius didn't connect literal routes / template routes to their dynamic page files. Three P0 fixes.
+
+### Fixed (P0) — `blast-radius` didn't resolve dynamic routes to page files
+
+Repro on real Next.js App Router app:
+```
+$ pinned blast-radius "app/preview/[slug]/page.tsx"           → No smoke pins affected
+$ pinned blast-radius components/IdeaLanding.tsx Hero.tsx     → No smoke pins affected
+$ pinned blast-radius lib/ideas.ts                            → No smoke pins affected
+```
+
+Cause: smoke pin entrypoints are literal routes (`/preview/benchmob`); render-collection / visibility-invariant are templates (`/preview/[slug]`); but the source file is the dynamic `app/preview/[slug]/page.tsx`. `filesForSmokeClaim` had a comment that literally said *"http-route: no file (the route is a runtime address, not a static file we can name from the claim alone)"* — and that's the bug. I wrote it off as out of scope.
+
+Fix: new `deriveLikelyPageFilesForRoute(route, repoRoot)` walks route segments and at each level accepts an exact-name directory OR a dynamic `[param]` / `[...slug]` / `[[...slug]]` directory OR a transparent `(group)` route group. Supports:
+- Next.js App Router (`app/...` and `src/app/...`)
+- Next.js Pages Router (`pages/preview/[slug].tsx` filename style AND directory style)
+- SvelteKit (`src/routes/.../+page.svelte`)
+- Astro (`src/pages/.../index.astro`)
+- API routes (`app/.../route.ts`)
+
+Then the transitive importer walk (already in blast-radius) covers components + data modules.
+
+### Fixed (P0) — `hook-postedit` silent no-op was indistinguishable from success
+
+When blast-radius returned empty, hook-postedit silently exited → no output → Claude couldn't tell "verified, all good" from "did nothing." Multiple silent-exit paths (`if (editedFiles.size === 0) return;`, `if (!existsSync(pinnedDir)) return;`, etc.) all return-with-nothing.
+
+Fix: every silent-exit now emits a distinguishable single-line message. The "0 pins covered" case now reads `pinned: 0 pins cover the edited file(s): <files>. (Use \`pinned blast-radius <file>\` to debug coverage)` so the user can act on it.
+
+Also: the hook now uses `buildSmokePinIndex` + `affectedSmokePins` (the same pipeline `pinned blast-radius` uses) instead of its own ad-hoc route-equality matching that had the same dynamic-route gap. One source of truth for "edit → affected pins."
+
+### Added (P0) — behavior test, not wiring test
+
+The 0.4.1 acceptance was "settings.json gets the PostToolUse entry." That's WIRING. The required acceptance per the field report: spin up a fresh repo, install the pin, programmatically edit a file, fire `hook-postedit`, assert the hook emits a NON-EMPTY result.
+
+Two new vitest matrices:
+- `blastRadius.dynamic-route.test.ts` — 15 tests against Next App Router / Pages Router / SvelteKit / Astro routing conventions + the full Cipherwake repro (page / component / data-module / unrelated-file all flag the right pins).
+- `hookPostedit.e2e.test.ts` — 5 tests that programmatically edit a file, pipe a real PostToolUse payload to `node dist/cli.js hook-postedit`, and assert the output is non-empty and names the affected pin(s). Negative case: unrelated edit emits the "0 pins covered" diagnostic, not silent.
+
+These match the field report's exact acceptance: "ASSERT the hook emits a NON-EMPTY result naming the pin and its pass/fail outcome."
+
+### Tested
+
+- 437/437 vitest (was 417; +20 new across dynamic-route + hook E2E)
+- Cipherwake's exact command `blast-radius app/preview/[slug]/page.tsx` now lists both pins
+- 42/42 dyad sweep across 6 repos × 7 new-command invocations — no regressions
+
+---
+
 ## [0.4.1] — 2026-06-07
 
 Bug-pack release. Two P0 fixes that made 0.4.0's `render-collection` pin unusable on Next.js App Router, plus closing the "automatic verification on opt-in" gap Cipherwake flagged in the field.
