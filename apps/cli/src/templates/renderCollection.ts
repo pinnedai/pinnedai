@@ -179,12 +179,18 @@ function __pinnedHasErrorBoundary(html: string): { found: boolean; marker?: stri
   return { found: false };
 }
 
-function __pinnedHasNotFoundShape(html: string, status: number): boolean {
-  if (status === 404) return true;
-  // Next.js notFound() renders the not-found.tsx; check for common
-  // "404 — Page Not Found" markers.
-  const markers = ["This page could not be found", "Page Not Found", "404 -"];
-  return markers.some((m) => html.includes(m));
+function __pinnedHasNotFoundShape(_html: string, status: number): boolean {
+  // 0.4.1 Bug 2 fix (Cipherwake-reported): the body-substring heuristic
+  // ("This page could not be found", "Page Not Found", "404 -")
+  // false-positives on every healthy 200 page in Next.js App Router.
+  // Reason: Next embeds the not-found boundary in EVERY page's streamed
+  // RSC payload — so a healthy 200 page also contains those markers
+  // (from the not-found component that exists in the tree but isn't
+  // shown). Trust the HTTP status instead. notFound() in Next.js
+  // returns 404 (both Pages and App routers), so the status check IS
+  // the signal. The visibility-invariant pin gets this right — render-
+  // collection now matches.
+  return status === 404;
 }
 
 describe(\`render-collection (\${PATH_TEMPLATE})\`, () => {

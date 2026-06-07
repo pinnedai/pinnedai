@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep, isAbsolute as pathIsAbsolute_renderAdd } from "node:path";
 
 import { execFileSync, spawnSync as childSpawnSync } from "node:child_process";
 import {
@@ -1306,6 +1306,61 @@ program
         out(`= ${relative(cwd, sl.path)} (already wired)`);
       } else if (sl.status === "conflict") {
         out(`! ${relative(cwd, sl.path)}: ${sl.reason}`);
+      }
+    }
+
+    // 4b. PostToolUse auto-verify hook (Cipherwake Gap 6 — make
+    // smoke verification AUTOMATIC on opt-in). Per the field report:
+    // "opting into Pinned should mean opting into automatic
+    // verification, not just passive rules." Auto mode installs by
+    // default; manual mode asks with one consent line.
+    const wantAutoVerifyHook = installAll
+      ? true
+      : ttyAsk
+        ? await promptInstall({
+            title: "Claude PostToolUse auto-verify hook",
+            whatItDoes:
+              `Registers \`pinned hook-postedit\` in .claude/settings.json's PostToolUse. After Claude edits a file, Pinned identifies which pins cover the affected routes, runs them against your running dev server, and surfaces the result in Claude's next turn.`,
+            whyYouWant:
+              `Without this, an agent has to remember to run the test suite — and they skip (proven in field reports). With it, smoke verification is automatic on every edit. If no dev server is running, the hook emits one loud line telling you to start one — never silent.`,
+            touches: `.claude/settings.json (adds hooks.PostToolUse entry matching Edit|Write|MultiEdit; marker-bounded — preserves any other PostToolUse hooks)`,
+            bypassHint: `Run \`pinned uninstall\` (removes only our marker-bounded entry).`,
+            preview: () => "Adds:\n  hooks.PostToolUse[].matcher = 'Edit|Write|MultiEdit'\n  hooks.PostToolUse[].hooks[0] = { type: 'command', command: 'npx --no-install pinnedai hook-postedit' }",
+          })
+        : false;
+    if (wantAutoVerifyHook) {
+      const targetDir = join(cwd, ".claude");
+      const settingsFile = join(targetDir, "settings.json");
+      type ClaudeHook = { matcher?: string; hooks?: Array<{ type: string; command: string }> };
+      type ClaudeSettings = { hooks?: { PostToolUse?: ClaudeHook[] } } & Record<string, unknown>;
+      let existing: ClaudeSettings = {};
+      if (existsSync(settingsFile)) {
+        try { existing = JSON.parse(readFileSync(settingsFile, "utf8")) as ClaudeSettings; }
+        catch { /* malformed — caller (above step) already warned */ }
+      }
+      const PINNED_HOOK_CMD = "npx --no-install pinnedai hook-postedit";
+      const desired = JSON.parse(JSON.stringify(existing)) as ClaudeSettings;
+      desired.hooks = desired.hooks ?? {};
+      const existingArr = desired.hooks.PostToolUse ?? [];
+      const alreadyPresent = existingArr.some((h) =>
+        (h.hooks ?? []).some((step) =>
+          typeof step.command === "string" && step.command.includes("pinned hook-postedit")
+        )
+      );
+      if (alreadyPresent) {
+        out(`= ${relative(cwd, settingsFile)} (PostToolUse auto-verify hook already wired)`);
+      } else {
+        const pinnedEntry: ClaudeHook = {
+          matcher: "Edit|Write|MultiEdit",
+          hooks: [{ type: "command", command: PINNED_HOOK_CMD }],
+        };
+        desired.hooks.PostToolUse = [...existingArr, pinnedEntry];
+        mkdirSync(targetDir, { recursive: true });
+        writeFileSync(settingsFile, JSON.stringify(desired, null, 2) + "\n");
+        out(`+ ${relative(cwd, settingsFile)} (PostToolUse auto-verify hook wired)`);
+        out(`  ↳ Claude now auto-runs affected pins after every Edit/Write.`);
+        out(`  ↳ When no dev server is up, the hook emits one loud line — never silent.`);
+        out(`  ↳ Run \`pinned dev\` in another terminal to give the hook a server to verify against.`);
       }
     }
 
@@ -6180,6 +6235,46 @@ program
       if (!opts.module) {
         err("✗ --from=generate-static-params requires --module <path-to-page-file>.\n");
         process.exit(2);
+      }
+      // 0.4.1 Bug 1 fix (Cipherwake): App Router page files transitively
+      // import JSX/React components, which the vitest enumeration
+      // context can't resolve (React is not defined). Detect this BEFORE
+      // generating a broken pin and tell the user the exact alternative
+      // command. Long-term fix is AST-extracting just the function —
+      // tracked as a follow-up.
+      // Use the already-imported `isAbsolute` + `join` from node:path
+      // at the top of this file (cli.ts is ESM-only at the bundled
+      // output layer; require() doesn't work).
+      const ABS_MODULE = pathIsAbsolute_renderAdd(opts.module) ? opts.module : join(process.cwd(), opts.module);
+      if (existsSync(ABS_MODULE)) {
+        try {
+          const src = readFileSync(ABS_MODULE, "utf8");
+          // Heuristic: file uses JSX (returns <Component> shape) OR
+          // imports react / a relative component file. Either means the
+          // module can't be cleanly imported in the vitest enumeration
+          // context.
+          const hasJsx = /<[A-Z][A-Za-z0-9_]*[\s/>]/.test(src);
+          const importsReact = /from\s+["']react["']|import\s+React\b/.test(src);
+          const importsRelativeComponent = /from\s+["']\.\.?\//.test(src);
+          if (hasJsx || importsReact || importsRelativeComponent) {
+            err(`✗ ${opts.module} imports JSX/React components — the pin's enumeration step can't import this in vitest's context (you'd see "React is not defined" at run time).\n`);
+            err(`  Use --from=collection-getter instead. Extract just the slug source into a plain-TS file:\n\n`);
+            err(`    // lib/idea-slugs.ts (plain TS, no JSX)\n`);
+            err(`    import { IDEAS } from "./ideas";\n`);
+            err(`    export function getAllSlugs() {\n`);
+            err(`      return IDEAS.map((i) => ({ slug: i.slug }));\n`);
+            err(`    }\n\n`);
+            err(`  Then:\n\n`);
+            err(`    pinned render add \\\n`);
+            err(`      --path '${opts.path}' \\\n`);
+            err(`      --from collection-getter \\\n`);
+            err(`      --module lib/idea-slugs.ts --export getAllSlugs\n\n`);
+            err(`  (AST-extracting just generateStaticParams from a JSX file is on the roadmap — for now this manual extraction is the supported path.)\n`);
+            process.exit(2);
+          }
+        } catch (e) {
+          // Read failure — proceed anyway; the runtime error will surface.
+        }
       }
       routes = { from: "generate-static-params", modulePath: opts.module };
     } else if (opts.from === "collection-getter") {

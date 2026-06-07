@@ -2,6 +2,46 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.4.1] — 2026-06-07
+
+Bug-pack release. Two P0 fixes that made 0.4.0's `render-collection` pin unusable on Next.js App Router, plus closing the "automatic verification on opt-in" gap Cipherwake flagged in the field.
+
+### Fixed (P0) — `render-collection` false-positives `notFound()` on EVERY healthy 200 page
+
+Cipherwake dogfood on a Next.js 15 App Router repo: 9 routes all returned real HTTP 200 with full content, but the pin reported 9/9 failed with `notFound() shape detected (prerendered but resolver 404s)`.
+
+Cause: the `__pinnedHasNotFoundShape` heuristic used body-substring markers (`"This page could not be found"`, `"Page Not Found"`, `"404 -"`). Next.js App Router embeds the not-found boundary as part of every page's streamed RSC payload — so a healthy 200 page also contains those substrings (from the not-found component that exists in the tree but isn't shown).
+
+Fix: trust the actual HTTP status. `notFound()` returns 404 in both routers. The body markers are removed entirely. Matches what `visibility-invariant` already does (it checks real HTTP status, never trusts body content). As shipped in 0.4.0, this pin red-flagged a perfectly healthy multi-tenant app on every route — a 100% false-positive that would block CI.
+
+### Fixed (P0) — `--from=generate-static-params` threw "React is not defined" on JSX pages
+
+`pinned render add --from generate-static-params --module app/preview/[slug]/page.tsx` generated a pin whose runtime tried to dynamic-import the page module to call `generateStaticParams()`. App Router pages transitively import JSX/React components, and in the vitest enumeration context React isn't in scope → `route enumeration failed: React is not defined`. Any page that imports components broke this source — essentially all App Router pages.
+
+Fix: detect JSX / `from "react"` / relative component imports at `pinned render add` time and fail fast with the exact alternative command. Until AST-based extraction lands, the supported path is `--from=collection-getter` against a plain-TS module exporting the slug source. The error message includes the exact substitute command, copy-paste ready.
+
+### Added — `pinned init --auto` now installs the Claude PostToolUse auto-verify hook by default
+
+Per Cipherwake's field observation: opting into Pinned should mean opting into AUTOMATIC verification, not just passive rules. Before: `install-claude-hook` was a separate opt-in command that `pinned init` never ran, so vibe-coders got zero automatic verification. After: auto mode bundles it; manual mode asks with one consent line.
+
+When the hook fires after an edit and no dev server is detected, it emits one loud line (already shipped) — never silent. Run `pinned dev` in another terminal to give it a server to verify against.
+
+### Tested
+
+- 417/417 vitest
+- Bug 2 acceptance test: stub returns 200 + embedded not-found markers → pin now PASSES (was 100% FP)
+- Bug 1 acceptance test: JSX page → fails fast with the exact alternative command; non-JSX module → generates the pin normally (negative case preserved)
+- `pinned init --auto` E2E: PostToolUse hook installed in `.claude/settings.json` alongside the existing statusline + UserPromptSubmit failure-hook
+- 42/42 dyad sweep across 6 repos × 7 new-command invocations — no regressions
+
+### Known follow-ups
+
+- AST extraction of just `generateStaticParams` from a JSX module — replaces the manual `--from=collection-getter` workaround.
+- Non-Claude fallback for the auto-verify hook (Cursor / Copilot / Windsurf). Today, `git pre-push` + `pinned watch` exist but don't run vitest. Tracked as part of the Gap 6 work.
+- Self-check after `install-claude-hook` — run one affected pin and confirm it EXECUTED (not skipped) before declaring install complete.
+
+---
+
 ## [0.4.0] — 2026-06-06
 
 The Cipherwake-dogfood release. Five gaps caught during a real socialideagen session where Pinned ran zero tests locally AND in CI, and the one real regression (stub-404 / prerender divergence) was caught by manual review, not a pin. Each gap below is closed with the exact acceptance test from the field report.
