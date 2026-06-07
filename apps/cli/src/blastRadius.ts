@@ -77,13 +77,52 @@ type PathAliases = Array<{
 }>;
 
 function stripJsonComments(s: string): string {
-  // Naive but enough for tsconfig.json. Handles // and /* */ comments
-  // and trailing commas in objects/arrays. Tolerant — doesn't try to
-  // be a real parser.
-  return s
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/^\s*\/\/.*$/gm, "")
-    .replace(/,(\s*[}\]])/g, "$1");
+  // 0.4.4 P0 fix (Cipherwake): the previous regex-only version matched
+  // the `*/` *inside* glob patterns like `"**/*.ts"` and treated it as
+  // a closing block-comment delimiter, eating everything between the
+  // `/*` in `"@/*"` and the `*/` in `"**/*"`. That wiped out the paths
+  // section of every standard Next.js tsconfig.
+  //
+  // Proper fix: walk character-by-character; only honor // and /* */
+  // when we're OUTSIDE a string literal. Handles backslash escapes
+  // inside strings.
+  let out = "";
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const c = s[i];
+    if (c === '"') {
+      out += c;
+      i++;
+      while (i < n) {
+        const ch = s[i];
+        out += ch;
+        i++;
+        if (ch === "\\" && i < n) {
+          out += s[i];
+          i++;
+          continue;
+        }
+        if (ch === '"') break;
+      }
+      continue;
+    }
+    if (c === "/" && i + 1 < n && s[i + 1] === "/") {
+      while (i < n && s[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && i + 1 < n && s[i + 1] === "*") {
+      i += 2;
+      while (i + 1 < n && !(s[i] === "*" && s[i + 1] === "/")) i++;
+      i = Math.min(i + 2, n);
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  // Trailing commas before } or ] — still safe outside strings since
+  // we've already stripped comments.
+  return out.replace(/,(\s*[}\]])/g, "$1");
 }
 
 function loadPathAliases(repoRoot: string): PathAliases {

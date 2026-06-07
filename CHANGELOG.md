@@ -2,6 +2,36 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.4.4] — 2026-06-07
+
+0.4.3's path-alias support passed my tests but **still failed in the real world.** Cipherwake reproduced again on socialideagen: `pinned blast-radius components/IdeaLanding.tsx → No smoke pins affected`. The fix below is the actual cause, and I added the test that would have caught it.
+
+### Fixed (P0) — `stripJsonComments` corrupted standard Next.js tsconfig
+
+Cause: the 0.4.3 `stripJsonComments` was regex-based. The regex `/\/\*[\s\S]*?\*\//g` matched any `/*` to any later `*/`. The standard Next.js scaffold tsconfig has:
+- `"@/*": ["./*"]` in `compilerOptions.paths` — contains `/*`
+- `"include": ["**/*.ts", "**/*.tsx", ".next/types/**/*.ts"]` — every `**/*` glob contains the literal `*/` substring (positions 1-2 of `**/`)
+
+The regex matched from the `/*` in `"@/*"` straight through to the first `*/` in `"**/*.ts"`, deleting the entire `paths` block in the process. `JSON.parse` then failed silently (the loader caught the throw and continued with zero aliases), so every `@/`-prefixed import in the repo became "bare package import" and was dropped from the graph. The page → component edge never existed → blast-radius on a component returned zero pins.
+
+My 0.4.3 test fixture used `JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@/*": ["./*"] } } })` with no `include` field, so it had no glob patterns. The corruption never triggered. The test passed; the bug shipped.
+
+Fix: replaced the regex stripper with a string-aware tokenizer (`apps/cli/src/blastRadius.ts:79`) that walks character by character and only honors `//` and `/* */` outside string literals. Handles backslash escapes inside strings.
+
+### Added — CLI-binary E2E tests (the level that would have caught both 0.4.2 and 0.4.3 bugs)
+
+`apps/cli/src/hookPostedit.realedit.test.ts` now drives `node dist/cli.js blast-radius` as a subprocess against a fixture that uses the **actual** Next.js scaffold tsconfig — including `include: ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"]`. Four new tests:
+- depth-0 control (page file itself)
+- depth-1 transitive (`components/IdeaLanding.tsx` imported by page via `@/`)
+- depth-2 transitive (`components/Hero.tsx` imported by `IdeaLanding` via `@/`)
+- data module (`lib/ideas.ts` imported by page via `@/`)
+
+These tests would have failed in 0.4.3. They run the bundled `dist/cli.js`, not the in-source helpers — every bug in this release cycle survived in-source tests because the in-source layer wasn't the failure point.
+
+### Discipline
+
+Fourth in-a-row "test passed, real world failed" pattern (lockfile FP, PostToolUse wiring-vs-firing, relative-vs-aliased imports, stripped-down-vs-real tsconfig). The thread is: **my test fixtures keep mimicking the simplest legal shape, not the standard real-world shape.** Every E2E that exercises a parser or a dependency graph now uses real fixtures copied from real templates, not minimum-viable test material.
+
 ## [0.4.3] — 2026-06-07
 
 0.4.2 fixed dynamic-route → page-file resolution but the in-source E2E used **relative** imports (`../../../components/IdeaLanding`) — exactly the shape my resolver already handled. Real Next.js apps use TypeScript path aliases (`@/components/...`) and the graph was silently dropping every aliased edge as "bare package import." On top of that, `hook-postedit`'s dev-server probe only looked at `.pinnedai/config.json#http.url` — no config meant "no server detected" even with `next dev` demonstrably bound to :3000. Two P0 fixes plus the regression test that catches both.

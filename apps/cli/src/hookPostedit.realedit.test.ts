@@ -42,15 +42,39 @@ function setupAliasedNextRepo() {
   mkdirSync(join(dir, "lib"), { recursive: true });
   mkdirSync(join(dir, "tests/pinned"), { recursive: true });
 
-  // The REAL-WORLD shape: path-aliased imports via tsconfig.json.
-  writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({
-    compilerOptions: {
-      baseUrl: ".",
-      paths: {
-        "@/*": ["./*"],
-      },
-    },
-  }, null, 2));
+  // 0.4.4 P0: this MUST match the real Next.js scaffold shape, not a
+  // stripped-down test fixture. The realistic shape (a) omits baseUrl
+  // (Next 14+ default) AND (b) carries an `include` glob like
+  // `"**/*.ts"` whose `*/` sequence the 0.4.3 stripJsonComments regex
+  // matched as a block-comment closer, eating the paths section. 0.4.3
+  // shipped passing tests on a stripped-down tsconfig and the bug
+  // survived in every real Next.js repo.
+  writeFileSync(
+    join(dir, "tsconfig.json"),
+    `{
+  "compilerOptions": {
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{"name": "next"}],
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+`
+  );
 
   writeFileSync(
     join(dir, "app/preview/[slug]/page.tsx"),
@@ -214,5 +238,51 @@ describe("hook-postedit — debug-readable URL attribution", () => {
       { PINNED_BASE_URL: `http://localhost:${port}` }
     );
     expect(out.length).toBeGreaterThan(0);
+  });
+});
+
+// 0.4.4 — drive the BUNDLED CLI binary, not the internal functions.
+// 0.4.3 tests asserted on the in-source helpers and ALL passed, but
+// `pinned blast-radius` on the real Cipherwake fixture still returned
+// 0 affected pins because the bundled stripJsonComments was eating
+// the `paths` section when the tsconfig also had `include` globs.
+// These tests run `node dist/cli.js blast-radius ...` directly and
+// assert on its JSON output — they would have failed in 0.4.3.
+describe("CLI blast-radius binary — real-world Next.js tsconfig + globs", () => {
+  function blastRadiusJson(file: string): { affectedClaimIds: string[] } {
+    const out = execFileSync("node", [CLI, "blast-radius", file, "--json", "--quiet"], {
+      cwd: dir,
+      encoding: "utf8",
+      timeout: 20000,
+    });
+    return JSON.parse(out);
+  }
+
+  it("editing the page file itself → pin flagged (depth-0 control)", () => {
+    setupAliasedNextRepo();
+    expect(blastRadiusJson("app/preview/[slug]/page.tsx").affectedClaimIds).toContain("preview-render");
+  });
+
+  it("editing a component imported via @/ → pin flagged (depth-1, the Cipherwake bug)", () => {
+    setupAliasedNextRepo();
+    expect(blastRadiusJson("components/IdeaLanding.tsx").affectedClaimIds).toContain("preview-render");
+  });
+
+  it("editing a nested component (depth-2 transitive via @/) → pin flagged", () => {
+    setupAliasedNextRepo();
+    expect(blastRadiusJson("components/Hero.tsx").affectedClaimIds).toContain("preview-render");
+  });
+
+  it("editing a data module imported via @/ → pin flagged", () => {
+    setupAliasedNextRepo();
+    // Add the lib import — the standard setupAliasedNextRepo doesn't
+    // include it. We need page.tsx to import @/lib/ideas.
+    writeFileSync(
+      join(dir, "app/preview/[slug]/page.tsx"),
+      `import { IdeaLanding } from "@/components/IdeaLanding";
+       import { getAllIdeas } from "@/lib/ideas";
+       export default function Page({ params }: any) { return <IdeaLanding slug={params.slug} ideas={getAllIdeas()} />; }`
+    );
+    expect(blastRadiusJson("lib/ideas.ts").affectedClaimIds).toContain("preview-render");
   });
 });
