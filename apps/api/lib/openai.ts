@@ -8,7 +8,10 @@
 // strict JSON output). At 100 calls/repo/mo × 1000 repos = $100/mo
 // OpenAI bill at MVP scale. Watch this.
 
-import type { Claim } from "pinnedai";
+// Claim is a structural type shared with the CLI. We don't bind to the
+// CLI package here (would couple this Worker's deploy to the CLI's
+// build) — just declare what we need.
+type Claim = Record<string, unknown> & { template: string };
 
 const SYSTEM_PROMPT = `You extract structured claims from GitHub pull request descriptions.
 A "claim" is a verifiable behavioral promise about a route or webhook.

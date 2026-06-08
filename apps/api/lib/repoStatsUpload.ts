@@ -96,36 +96,30 @@ export async function handleRepoStatsUpload(
     for (const [model, ms] of Object.entries(ds.byModel ?? {})) {
       const hits = ms.hits ?? 0;
       if (hits <= 0) continue;
-      await db.rpc("upsert_detector_model_rollup", {
-        p_org: org,
-        p_detector: detector,
-        p_model: model,
-        p_tool: ms.tool ?? null,
-        p_hits: hits,
-        p_now: now,
-      }).catch(async () => {
-        // RPC not available — fall back to read-modify-write.
-        const { data: existing } = await db
-          .from("detector_model_rollup")
-          .select("hits")
-          .eq("org", org)
-          .eq("detector", detector)
-          .eq("ai_model", model)
-          .maybeSingle();
-        const nextHits = (existing?.hits ?? 0) + hits;
-        await db.from("detector_model_rollup").upsert(
-          {
-            org,
-            detector,
-            ai_model: model,
-            ai_tool: ms.tool ?? null,
-            hits: nextHits,
-            first_seen: existing ? undefined : now,
-            last_seen: now,
-          },
-          { onConflict: "org,detector,ai_model" }
-        );
-      });
+      // We don't ship the upsert_detector_model_rollup RPC by default —
+      // the initial migration is plain DDL. Use read-modify-write
+      // (cheap enough for opt-in analytics; the volume here is bounded
+      // by Pro subscriber count).
+      const { data: existing } = await db
+        .from("detector_model_rollup")
+        .select("hits")
+        .eq("org", org)
+        .eq("detector", detector)
+        .eq("ai_model", model)
+        .maybeSingle();
+      const nextHits = (existing?.hits ?? 0) + hits;
+      await db.from("detector_model_rollup").upsert(
+        {
+          org,
+          detector,
+          ai_model: model,
+          ai_tool: ms.tool ?? null,
+          hits: nextHits,
+          first_seen: existing ? undefined : now,
+          last_seen: now,
+        },
+        { onConflict: "org,detector,ai_model" }
+      );
     }
   }
 

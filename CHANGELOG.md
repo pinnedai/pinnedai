@@ -1,6 +1,86 @@
 # Changelog
 
-All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
+All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version. The Vercel-hosted backend lives in `apps/api/` and is versioned alongside.
+
+## [0.5.0] — 2026-06-08
+
+**First honest stable release.** Promoted from `0.5.0-beta.9` after the failure-mode gate (`apps/cli/src/failureModes.gate.test.ts`) went green: 8/8 trust-contract assertions pass on a healthy Next.js fixture. Per `RELEASE.md`, this is what `npm install pinnedai` (no tag) now resolves to.
+
+### Why this stable is different from every prior version
+
+Every prior 0.4.x and 0.5.0-beta.N had failure modes that produced phantom regressions on healthy real apps (literal `/preview/[slug]` 404, dead-port FAIL instead of SKIP, 307→login FAIL, 27-pin init dumps, silent uninstall no-ops, etc.). The 0.5.0 cut bundles every bug fix from the dogfood pass + the gate that prevents them from coming back.
+
+### Highlights
+
+- **Browser-mode render pin** (`pinned render add --browser`) — opt-in Playwright Tier-2 pin that asserts images load and pages have zero console errors. Catches the 0×0 broken-SVG class HTTP-only pins are blind to.
+- **Auto-suggest visibility-invariant** in `pinned sweep` — surfaces the draft-leak class (status/published/visibility discriminant + public route) as a HIGH-tier proposal.
+- **Tier-by-VALUE auto-pin** — `init --auto` no longer dumps 27 pins. LOW templates (page-renders / journey / happy-path) are deferred to `pinned protect --include-low`. Median init now produces ≤10 HIGH-tier pins.
+- **Incremental detection at hook time** — pre-commit + PostToolUse now propose server-action-write, paid-api-call, edge-function-write, cron-handler, stripe-event-handled, visibility-invariant. Previously these only fired at sweep time.
+- **Model attribution at edit-time** — hook-postedit persists `.pinned/last-edit-context.json` so subsequent static sweeps tag detector hits with the agent that produced them (Claude / GPT / Cursor / etc.).
+- **Auto-populate REAL/FP** — `runInferEventResolutions` is now wired into both sweep and hook-postedit. The catch ledger populates from normal use; no manual `pinned confirm` needed.
+- **Preserve `.pinned/` durable history across uninstall** — AI lessons, repo-stats, suppressions, contracts all survive `uninstall --yes`. `--all-state` opts into a true clean slate.
+- **page-render SKIP semantics** — unreachable PREVIEW_URL → `ctx.skip()` (yellow), not throw (red). Any 3xx redirect → SKIP. Real 5xx still FAILS. Dynamic `[slug]` routes never get a page-renders pin in the first place.
+- **`uninstall --yes` actually works** — all `__require("fs")` calls replaced with top-level imports; verify() probes confirm post-state; `✗` prints if anything didn't get removed.
+- **Vercel + Supabase backend port** (`apps/api/`) — replaces the never-deployed Cloudflare Worker. Edge Functions on Vercel, Supabase Postgres for state, daily usage-snapshot cron. `api.pinnedai.dev` deployable from `apps/api/DEPLOY.md`.
+
+### Failure-mode gate (the wall protecting stable)
+
+`apps/cli/src/failureModes.gate.test.ts` — 8 trust-contract assertions:
+
+1. Dynamic `[slug]` route → no literal-bracket page-renders pin
+2. Dead PREVIEW_URL → SKIP, not FAIL
+3. 307→/login route → SKIP
+4. Real 5xx → STILL FAILS (the real case preserved)
+5. `init --auto` → ≤10 pins, zero LOW-tier
+6. `uninstall --yes` → preserves durable history
+7. `hook-failure` on clean pass → silent (no phantom regression prompt)
+8. `recordEditContext` → writes file AND emits observable stderr
+
+`@latest` only promotes when this is green. See `RELEASE.md` for the full discipline.
+
+### Per-beta history (summarized)
+
+| Beta | What |
+|---|---|
+| beta.1 | Browser render pin + visibility-invariant auto-suggest + commandE2ECatalog enforcement |
+| beta.2 | P0: page-render SKIP on unreachable + ANY 3xx (not just /login) |
+| beta.3 | Preserve `.pinned/` durable history across uninstall |
+| beta.4 | Tier-by-VALUE + promote enum-drift on visibility column |
+| beta.5 | Wire HIGH detectors into pre-commit/PostToolUse hooks |
+| beta.6 | Model attribution at edit-time + auto-populate REAL/FP |
+| beta.7 | Dead-endpoint warning + Open VSX listing refresh |
+| beta.8 | Cloudflare Worker usage-snapshot infrastructure (later deprecated) |
+| beta.9 | 5 dogfood-reported P0 trust-killers (dynamic-route literal-bracket / infra skip / journey defer / stale-template hint / edit-context observability) |
+| **0.5.0** | Vercel/Supabase port (apps/api), failure-mode gate, first honest stable cut |
+
+### Apps/edge deprecation
+
+`apps/edge/` is now `apps/edge.deprecated/`. The CF Worker code stays in the repo as reference (the algorithms — JWT validation, IP hashing, computeSnapshot — ported cleanly to `apps/api/lib/`). Will be deleted after 0.5.1.
+
+### Test matrix
+
+- 546/546 vitest CLI (38 test files; +8 gate)
+- 49/49 deprecated-edge vitest (unchanged, kept passing during deprecation)
+- 42/42 dyad-apps sweep (10 real repos)
+- 8/8 failure-mode gate
+
+### Installation
+
+```bash
+npm install pinnedai            # @latest, this 0.5.0
+npm install pinnedai@beta       # what beta.N will land at next
+```
+
+### Upgrading from 0.4.x
+
+```bash
+npm i -g pinnedai@latest
+
+# In each repo using pinnedai:
+pinned regenerate --all         # refresh stale-template pins (one-time, addresses the dogfood class)
+```
+
+If you see phantom regressions after upgrade, that's the stale-template class — `pinned regenerate --all` fixes it. New pins generated under 0.5.0 won't have this issue.
 
 ## [0.5.0-beta.9] — 2026-06-08
 
