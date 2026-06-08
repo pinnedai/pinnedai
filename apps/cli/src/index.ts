@@ -105,6 +105,7 @@ import { generateResponseShapeTest } from "./templates/responseShape.js";
 import { generateMassMutationTest } from "./templates/massMutation.js";
 import { generateSmokeFunctionalTest } from "./templates/smokeFunctional.js";
 import { generateRenderCollectionTest } from "./templates/renderCollection.js";
+import { generateRenderCollectionBrowserTest } from "./templates/renderCollectionBrowser.js";
 import { generateVisibilityInvariantTest } from "./templates/visibilityInvariant.js";
 
 // Convenience dispatcher — given any Claim, pick the right generator.
@@ -237,7 +238,12 @@ function dispatchToTemplate(claim: Claim, opts: GenerateOpts): GeneratedTest {
     case "smoke-functional":
       return generateSmokeFunctionalTest(claim, opts);
     case "render-collection":
-      return generateRenderCollectionTest(claim, opts);
+      // 0.5.0-beta: same template name, two emit paths. claim.browser
+      // is opt-in via `pinned render add --browser` and only set when
+      // the user asked for the Tier-2 browser pin.
+      return claim.browser
+        ? generateRenderCollectionBrowserTest(claim, opts)
+        : generateRenderCollectionTest(claim, opts);
     case "visibility-invariant":
       return generateVisibilityInvariantTest(claim, opts);
   }

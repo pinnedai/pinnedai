@@ -2,6 +2,66 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.1] — 2026-06-07
+
+Cipherwake field-reported four asks from a real Next.js 15 dogfood session. All four ship in this release. The headline is **browser-mode render pins** — Pinned can now load each route in a real headless browser and assert what the HTTP-only render template is structurally blind to: that images actually render and the page is alive in a browser.
+
+### Added (BETA) — Feature 1+2: browser-mode render-collection pin
+
+Cipherwake's exact bug: a raw `&` in generated SVG text broke XML parsing → a `data:image/svg+xml` hero image rendered 0×0 in the browser. The page returned HTTP 200 with full body content, so the HTTP render-collection pin PASSED. The hero was invisible to users and nothing flagged it.
+
+New flow:
+```
+pinned render add --path '/preview/[slug]' --from collection-getter \
+  --module lib/ideas.ts --export getAllIdeas --browser
+```
+
+The emitted pin (`<id>-browser.test.ts`) enumerates routes the same way as the HTTP version, then for each one:
+- Loads it in headless Chromium via Playwright
+- Asserts every `<img>` (including data-URI SVGs) has `naturalWidth > 0` — fails with the broken-image src + the route
+- Asserts zero `console.error` / `pageerror` / CSP violations — catches the "200 but blank in browser" failure class (CSP-broken client JS, hydration errors)
+
+Beta posture, per [[anything-annoying-must-be-opt-in]] + [[full-stack-roadmap-2026-06-03]]:
+- Playwright is an **optional** peer dep. `pinned render add --browser` prints the install hint when Playwright isn't found, but writes the pin anyway so it's ready when it lands.
+- The emitted pin SKIPS with a loud WARN if Playwright isn't installed at run time. Never blocks CI.
+- Attach-only: uses the same Vercel/Netlify/CF Pages/Render `resolveBaseUrl` waterfall as the HTTP template. **Never auto-boots a server.**
+- Filename carries a `-browser` suffix so it's visible in PINS.md / vitest output / blame.
+- The describe block is labeled `[BETA]`.
+
+New CLI options on `pinned render add`:
+- `--browser` — opt in
+- `--browser-check images,console` — comma-separated subset
+- `--browser-timeout-ms 30000` — per-route timeout
+- `--no-network-idle` — skip the network-idle wait for highly dynamic pages
+
+### Added — Feature 3: auto-suggest visibility-invariant pin in `pinned sweep`
+
+`detectVisibilityDiscriminant(tree)` in `apps/cli/src/scanDiff.ts` flags the highest-value pattern Pinned can suggest unprompted: a collection-getter module whose items carry a `status` / `published` / `visibility` / `isPublic` / `draft` / `archived` discriminant, AND a dynamic Next.js public route that imports it. This is exactly the socialideagen "draft leaked to /preview/<draft>" bug class.
+
+Detection is precision-bound: requires at least 2 distinct stringly values for the discriminant field (a single value is a constant, not a gate) AND at least 2 occurrences (single appearance is noise). The sweep proposal includes the observed values and a sensible default `publicValues=["live"]` when no conventional public-value token is observed in source — the user reviews before pinning.
+
+### Added — Feature 4: command-E2E catalog enforcement test
+
+`apps/cli/src/commandE2ECatalog.test.ts` is a meta-test that maintains a hand-curated list of state-mutating commands and detectors. For each entry it asserts:
+- The matching E2E test file exists in `src/`
+- The file contains a real-state assertion (filesystem read, JSON parse, `existsSync` check) — not just a stdout match
+- Adding a new `.e2e.test.ts` file without a catalog entry fails the build
+
+This codifies the discipline that came from four "✓ but did nothing" bugs in 0.4.x: every command that claims to do X must re-read state and assert X actually happened, and the E2E must look at the disk, not at the command's stdout. Mirrors the rule from [[positive-and-negative-tests-required]].
+
+### Test matrix
+
+- 491/491 vitest pass (+44 from this release: 11 browser-emit + 4 real-Chromium browser-execution + 8 detector + 8 catalog + 13 carried)
+- 42/42 dyad sweep
+- Real Chromium e2e against an HTTP server serving an unencoded-`&` SVG: image-check FAILS as expected, healthy page PASSES
+- Real Chromium e2e against a page with `console.error`: console-check FAILS as expected, clean page PASSES
+
+### Notes
+
+- Playwright is added as a `devDependency` so the E2E can exercise the real path locally. The package's published `dependencies` field is unchanged — Playwright remains an optional install on the user's side.
+- The first 0.5 ship is `0.5.0-beta.1`. Beta tag stays until the browser pin has been exercised against ≥3 real projects per the launch-bar memory.
+- Cipherwake also sent two larger asks in the same session window (page-render FALSE-FAIL on unreachable / auth-gated routes; the 6-ask architecture rewrite around incremental detection + auto-pin-by-value + analytics). Those ship next, separately, against this release.
+
 ## [0.4.5] — 2026-06-07
 
 `pinned uninstall --yes` was a complete no-op that falsely reported success. Cipherwake caught it in the field: every ✓ line printed while nothing was actually removed — the workflow file, `.pinnedai/`, `.pinned/`, and both `.claude/settings.json` hooks all survived. Three independent bugs converged into one identical symptom.

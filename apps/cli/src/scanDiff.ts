@@ -8330,3 +8330,238 @@ export function detectInteractionCandidates(filesByPath: Map<string, string>): I
 
   return out;
 }
+
+// 0.5.0-beta (Cipherwake Feature 3): auto-suggest visibility-invariant
+// when a collection-getter on a public route has a status/draft/published/
+// visibility/isPublic-style discriminant field.
+//
+// Real bug class this surfaces: a `status: "draft"` collection item is
+// publicly resolvable on `/preview/<draft>` because a gate was applied
+// to DB rows but not to a static seed. Cipherwake's socialideagen
+// session shipped this exact bug. Render-collection passes (the
+// route returns 200); visibility-invariant is the only template that
+// catches it — but only if you knew to add one.
+//
+// Detection model: deliberately precision-bound. We look for exported
+// arrays / functions whose declared/inferred literal items contain
+// one of a known discriminant set, AND we look for a public Next.js
+// dynamic route file that imports that module. If both halves match,
+// we surface a single proposal.
+export type VisibilityDiscriminantHit = {
+  // Path to the module that owns the collection (the getter or array).
+  collectionModulePath: string;
+  // The named export — function or const.
+  exportName: string;
+  // The field on each item that gates visibility (e.g., "status").
+  discriminantField: string;
+  // The literal values observed in the source. We can't always tell
+  // which are "public" vs "private" — we surface them ALL and let the
+  // user confirm. Standard convention is `live`/`published`/`active`
+  // being public.
+  observedValues: string[];
+  // The public route's path template that consumes this collection
+  // (e.g., `/preview/[slug]`).
+  publicRoute: string;
+  // The Next.js page file that imports the collection.
+  publicPageFile: string;
+  // Human-readable suggestion text.
+  suggestedPin: string;
+};
+
+const VISIBILITY_DISCRIMINANT_FIELDS = [
+  "status", "published", "visibility", "isPublic", "draft",
+  "archived", "live", "is_published", "is_archived", "is_draft",
+] as const;
+
+// Conservative literal-value extractor. Walks an export's RHS and
+// pulls out simple string-valued occurrences of `<field>: "value"`.
+// Returns null when nothing recognizable was found — never throws.
+function extractDiscriminantFromCollectionModule(
+  source: string,
+  exportName: string
+): { field: string; values: string[] } | null {
+  // 1. Find the export's body. We accept three shapes:
+  //      export const NAME = [ ... ]
+  //      export function NAME() { return [...] }
+  //      export const NAME = () => [...]
+  //      export const NAME = function () { return [...] }
+  // We grab a window of up to ~8000 chars after the export keyword —
+  // enough to cover a few hundred items.
+  const escName = exportName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const startRe = new RegExp(
+    `export\\s+(?:const|let|function)\\s+${escName}\\b`,
+    ""
+  );
+  const m = startRe.exec(source);
+  if (!m) return null;
+  const window = source.slice(m.index, m.index + 8000);
+
+  // 2. For each candidate field, count appearances. The field that
+  // appears most often (and at least 2× — single appearance is noise)
+  // is the strongest discriminant signal.
+  let best: { field: string; count: number; values: Set<string> } | null = null;
+  for (const field of VISIBILITY_DISCRIMINANT_FIELDS) {
+    // Match `field: "value"` or `'value'`. We constrain to short values
+    // (no template literals, no expressions) — the discriminant should
+    // be a closed vocabulary.
+    const re = new RegExp(
+      `\\b${field}\\s*:\\s*["']([a-zA-Z0-9_-]{1,32})["']`,
+      "g"
+    );
+    const values = new Set<string>();
+    let n = 0;
+    let mm: RegExpExecArray | null;
+    while ((mm = re.exec(window)) !== null) {
+      n++;
+      values.add(mm[1]);
+    }
+    if (n >= 2 && (!best || n > best.count)) {
+      best = { field, count: n, values };
+    }
+  }
+  if (!best) return null;
+  // Sanity: at least 2 distinct values; otherwise it's not a
+  // discriminant, it's a constant. (e.g., every item has `status: "x"` —
+  // that's not a visibility gate.)
+  if (best.values.size < 2) return null;
+  return { field: best.field, values: Array.from(best.values).sort() };
+}
+
+// Map a Next.js dynamic page file path to its route template.
+function pageFileToRoute(filePath: string): string | null {
+  // app/foo/[slug]/page.tsx -> /foo/[slug]
+  // pages/foo/[slug].tsx -> /foo/[slug]
+  let p = filePath.replace(/\\/g, "/");
+  if (p.startsWith("src/")) p = p.slice(4);
+  if (p.startsWith("app/") && /\/page\.(?:tsx?|jsx?)$/.test(p)) {
+    return "/" + p.slice("app/".length).replace(/\/page\.(?:tsx?|jsx?)$/, "");
+  }
+  if (p.startsWith("pages/")) {
+    const stripped = p.slice("pages/".length).replace(/\.(?:tsx?|jsx?)$/, "");
+    if (stripped === "index") return "/";
+    return "/" + stripped.replace(/\/index$/, "");
+  }
+  return null;
+}
+
+export function detectVisibilityDiscriminant(
+  filesByPath: Map<string, string>
+): VisibilityDiscriminantHit[] {
+  const out: VisibilityDiscriminantHit[] = [];
+
+  // 1. Collect every exported function/const that LOOKS like a
+  // collection-getter. We index by (modulePath, exportName).
+  type GetterRef = { modulePath: string; exportName: string };
+  const getters: GetterRef[] = [];
+  for (const [path, content] of filesByPath) {
+    if (!/\.(?:tsx?|jsx?)$/.test(path)) continue;
+    // Skip test files and node_modules.
+    if (/\.test\.|\.spec\.|node_modules/.test(path)) continue;
+    // Only look at files in lib/, src/, data/, or root-ish paths —
+    // exclude pages and components where false positives are common.
+    if (/(^|\/)(?:components?|pages?|app)\//.test(path)) continue;
+    // Quick filter: must contain at least one discriminant field name.
+    let hasField = false;
+    for (const f of VISIBILITY_DISCRIMINANT_FIELDS) {
+      if (content.includes(f + ":") || content.includes(f + " :")) { hasField = true; break; }
+    }
+    if (!hasField) continue;
+    // Find exports.
+    const exportRe = /export\s+(?:const|let|function)\s+([A-Za-z_$][\w$]*)/g;
+    let m: RegExpExecArray | null;
+    while ((m = exportRe.exec(content)) !== null) {
+      getters.push({ modulePath: path, exportName: m[1] });
+    }
+  }
+
+  // 2. For each candidate getter, extract the discriminant.
+  type Resolved = GetterRef & { discriminant: { field: string; values: string[] } };
+  const resolved: Resolved[] = [];
+  for (const g of getters) {
+    const src = filesByPath.get(g.modulePath);
+    if (!src) continue;
+    const d = extractDiscriminantFromCollectionModule(src, g.exportName);
+    if (d) resolved.push({ ...g, discriminant: d });
+  }
+  if (resolved.length === 0) return out;
+
+  // Group resolved discriminants by module — multiple exports from
+  // the same file collapse to one proposal. We pick the FIRST export
+  // that had a discriminant as the proposal's exportName (best match
+  // is whichever is consumed by a public route).
+  type ResolvedModule = {
+    modulePath: string;
+    exportNames: string[];
+    discriminant: { field: string; values: string[] };
+  };
+  const byModule = new Map<string, ResolvedModule>();
+  for (const r of resolved) {
+    const existing = byModule.get(r.modulePath);
+    if (existing) {
+      existing.exportNames.push(r.exportName);
+    } else {
+      byModule.set(r.modulePath, {
+        modulePath: r.modulePath,
+        exportNames: [r.exportName],
+        discriminant: r.discriminant,
+      });
+    }
+  }
+  // Also: track every export name from a module-with-discriminant
+  // (the discriminant is on the literal data but a wrapper function
+  // exported alongside is a likely consumer surface — e.g.
+  // `getAll() { return IDEAS }`).
+  for (const m of byModule.values()) {
+    const src = filesByPath.get(m.modulePath);
+    if (!src) continue;
+    const exportRe = /export\s+(?:const|let|function)\s+([A-Za-z_$][\w$]*)/g;
+    let mm: RegExpExecArray | null;
+    while ((mm = exportRe.exec(src)) !== null) {
+      if (!m.exportNames.includes(mm[1])) m.exportNames.push(mm[1]);
+    }
+  }
+
+  // 3. For each module with a discriminant, find a dynamic page that
+  // imports ANY of its exports AND maps to a public route.
+  for (const m of byModule.values()) {
+    const moduleBaseName = m.modulePath.replace(/\.(?:tsx?|jsx?)$/, "");
+    const aliasable = moduleBaseName.replace(/^src\//, "");
+    const importNeedles = [
+      `from "@/${aliasable}"`,
+      `from '@/${aliasable}'`,
+      `from "~/${aliasable}"`,
+      `from '~/${aliasable}'`,
+      `/${aliasable.split("/").pop()}"`,
+      `/${aliasable.split("/").pop()}'`,
+    ];
+    for (const [pagePath, pageContent] of filesByPath) {
+      if (!/\/page\.(?:tsx?|jsx?)$/.test(pagePath) && !/^pages\//.test(pagePath) && !/^src\/pages\//.test(pagePath)) continue;
+      if (!/\[\w+\]|\[\.\.\.\w+\]/.test(pagePath)) continue;
+      const matchesImportPath = importNeedles.some((n) => pageContent.includes(n));
+      if (!matchesImportPath) continue;
+      // Must use AT LEAST one of the module's exports by name.
+      const usedExport = m.exportNames.find((name) => new RegExp(`\\b${name}\\b`).test(pageContent));
+      if (!usedExport) continue;
+      const route = pageFileToRoute(pagePath);
+      if (!route) continue;
+      out.push({
+        collectionModulePath: m.modulePath,
+        exportName: usedExport,
+        discriminantField: m.discriminant.field,
+        observedValues: m.discriminant.values,
+        publicRoute: route,
+        publicPageFile: pagePath,
+        suggestedPin:
+          `Public route ${route} consumes ${m.modulePath}#${usedExport}, ` +
+          `whose items have a "${m.discriminant.field}" discriminant ` +
+          `(observed values: ${m.discriminant.values.map((v) => `"${v}"`).join(", ")}). ` +
+          `Render-collection pins are blind to the "private item leaked to a public route" failure mode — ` +
+          `add a visibility-invariant pin to assert items where ${m.discriminant.field} != "live"/"published"/"active" ` +
+          `return 404/307/308. Catches "draft/private/archived leaked publicly" bugs.`,
+      });
+      // One proposal per (collection, route).
+      break;
+    }
+  }
+  return out;
+}

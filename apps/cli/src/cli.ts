@@ -3738,6 +3738,7 @@ program
       detectNullableResults,
       detectResponseShape,
       detectMassMutation,
+      detectVisibilityDiscriminant,
       buildImportGraph,
       findFamilyMembers,
       deriveRouteFromPath: drfp,
@@ -3747,7 +3748,7 @@ program
 
     // 3. Detectors.
     type Proposal = {
-      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility" | "enum-drift" | "env-required" | "supabase-column" | "expected-header" | "nullable-result" | "response-shape" | "mass-mutation";
+      kind: "happy-path" | "page-renders" | "journey" | "interaction-baseline" | "server-action-write" | "stripe-event-handled" | "paid-api-call" | "edge-function-write" | "cron-handler" | "page-accessibility" | "enum-drift" | "env-required" | "supabase-column" | "expected-header" | "nullable-result" | "response-shape" | "mass-mutation" | "visibility-invariant";
       route: string;
       method?: "POST" | "PUT" | "PATCH" | "DELETE" | "GET";
       filePath: string;
@@ -4040,6 +4041,56 @@ program
           line: h.line,
           raw: h.suggestedPin,
         },
+      });
+    }
+
+    // 0.5.0-beta (Cipherwake Feature 3): visibility-invariant auto-
+    // suggest. When a collection-getter on a public route carries a
+    // status/draft/published-style discriminant, surface a pin proposal
+    // — render-collection alone is blind to "draft leaked publicly."
+    // This is the highest-value pattern Pinned can suggest unprompted
+    // (the socialideagen draft-leak class).
+    for (const h of detectVisibilityDiscriminant(tree)) {
+      // The visibility-invariant claim wants concrete publicValues —
+      // the values that are SUPPOSED to be public. We can't infer that
+      // safely from source alone (a "live" value is conventional but
+      // not universal). Heuristic: any observed value matching the
+      // conventional public-vocabulary list is treated as public; if
+      // none match, we default to the most common single-token form
+      // ("live") and surface the proposal with a "confirm publicValues"
+      // hint in the reason. The user can edit before pinning.
+      const CONVENTIONAL_PUBLIC = new Set([
+        "live", "published", "active", "public", "available", "approved", "online",
+      ]);
+      const publicValues = h.observedValues.filter((v) => CONVENTIONAL_PUBLIC.has(v.toLowerCase()));
+      const guessedPublicValues = publicValues.length > 0 ? publicValues : ["live"];
+      const reason = h.suggestedPin + (publicValues.length === 0
+        ? ` (No conventional public-value observed in the source — defaulting publicValues=["live"]; review before pinning.)`
+        : "");
+      proposals.push({
+        kind: "visibility-invariant",
+        route: h.publicRoute,
+        filePath: h.collectionModulePath,
+        reason,
+        claim: {
+          template: "visibility-invariant",
+          publicRoute: h.publicRoute,
+          // The visibility-invariant template's pathTemplate is the
+          // dynamic-route shape; we use the same string here.
+          pathTemplate: h.publicRoute,
+          collection: {
+            from: "collection-getter",
+            modulePath: h.collectionModulePath,
+            exportName: h.exportName,
+          },
+          rule: {
+            field: h.discriminantField,
+            publicValues: guessedPublicValues,
+          },
+          // Required base fields per the claim type.
+          route: h.publicRoute,
+          raw: h.suggestedPin,
+        } as Claim,
       });
     }
 
@@ -6195,6 +6246,10 @@ program
   .option("--max-routes <n>", "Cap on routes rendered (deterministic sample). Default 20.", "20")
   .option("--min-body-bytes <n>", "Minimum body length to consider a render healthy. Default 500.", "500")
   .option("--allow-error-boundary", "Don't fail on React/Next error boundary markers in HTML (rare — usually keep this off).")
+  .option("--browser", "[BETA] Tier-2 browser-mode pin (Cipherwake Features 1+2). Renders every route in a real headless browser and asserts: every <img> has naturalWidth > 0 (catches broken-image regressions HTTP fetch can't see) + zero console.error / pageerror / CSP violations. Requires Playwright (opt-in install: `npm i -D playwright && npx playwright install chromium`). Pin file gets a -browser suffix.")
+  .option("--browser-check <list>", "Comma-separated subset for --browser: images,console (default: images,console).", "images,console")
+  .option("--browser-timeout-ms <n>", "Per-route timeout in milliseconds for --browser. Default 30000.", "30000")
+  .option("--no-network-idle", "For --browser: skip the network-idle wait (use for highly dynamic pages whose network never settles).")
   .option("--pr-id <id>", "PR identifier — namespaces the generated file (default: render-coll).", "render-coll")
   .option("--out-dir <path>", "Directory to write to (default: tests/pinned).", "tests/pinned")
   .option("--dry-run", "Print the generated test instead of writing.")
@@ -6209,6 +6264,10 @@ program
     maxRoutes: string;
     minBodyBytes: string;
     allowErrorBoundary?: boolean;
+    browser?: boolean;
+    browserCheck: string;
+    browserTimeoutMs: string;
+    networkIdle?: boolean;
     prId: string;
     outDir: string;
     dryRun?: boolean;
@@ -6291,6 +6350,32 @@ program
       }
       routes = { from: "sitemap", prefix: opts.sitemapPrefix };
     }
+    // 0.5.0-beta Cipherwake Features 1+2: opt-in browser pin via --browser.
+    let browser: import("./claimParser.js").RenderCollectionClaim["browser"] | undefined;
+    if (opts.browser) {
+      const raw = (opts.browserCheck ?? "images,console").split(",").map((s) => s.trim()).filter(Boolean);
+      const valid = raw.filter((v): v is "images" | "console" => v === "images" || v === "console");
+      if (valid.length === 0) {
+        err("✗ --browser-check must include at least one of: images, console. Got: " + opts.browserCheck + "\n");
+        process.exit(2);
+      }
+      browser = {
+        check: valid,
+        timeoutMs: Number(opts.browserTimeoutMs),
+        waitForNetworkIdle: opts.networkIdle !== false,
+      };
+      // Adoption hint: detect Playwright in the customer's
+      // node_modules. We don't FAIL when it's missing — the emitted
+      // test itself skips with WARN. We just give the user the
+      // exact install command up-front so the first run isn't a
+      // confusing "test skipped because Playwright not installed."
+      const pwManifest = join(process.cwd(), "node_modules", "playwright", "package.json");
+      if (!existsSync(pwManifest)) {
+        err("⚠  Pinned [BETA browser pin]: Playwright not found in node_modules. The pin will WARN+SKIP at run time unless you install it:\n");
+        err("     npm i -D playwright && npx playwright install chromium\n");
+        err("   (Continuing — the pin file is still written so it's ready when Playwright lands.)\n\n");
+      }
+    }
     const claim: import("./claimParser.js").RenderCollectionClaim = {
       template: "render-collection",
       pathTemplate: opts.path,
@@ -6302,7 +6387,8 @@ program
         minBodyBytes: Number(opts.minBodyBytes),
       },
       cap: { maxRoutes: Number(opts.maxRoutes), sample: "deterministic" },
-      raw: `pinned render add --path ${opts.path} --from ${opts.from}`,
+      ...(browser ? { browser } : {}),
+      raw: `pinned render add --path ${opts.path} --from ${opts.from}${opts.browser ? " --browser" : ""}`,
     };
     const gen = generateTest(claim, { prId: opts.prId, pinnedVersion: version });
     if (opts.dryRun) {

@@ -980,6 +980,35 @@ export type RenderCollectionClaim = {
     maxRoutes?: number;
     sample?: "deterministic" | "all";
   };
+  // 0.5.0-beta (Cipherwake Features 1+2): browser-mode rendering.
+  // Opt-in via `pinned render add --browser`. When set, the emitted
+  // pin uses Playwright to actually load each route in a real browser
+  // and assert (a) every <img> has naturalWidth > 0 (catches the
+  // 0×0 broken-SVG case the HTTP-only pin missed) and (b) zero
+  // console.error / pageerror / CSP violations (catches the
+  // "200 but blank in browser" failure class HTTP fetch can't see).
+  //
+  // Beta semantics, per [[anything-annoying-must-be-opt-in]] +
+  // [[full-stack-roadmap-2026-06-03]]:
+  //  - Playwright is an OPTIONAL peer dep — if missing, the emitted
+  //    test skips with a loud WARN and `pinned render add --browser`
+  //    prints the install hint. Never auto-installs.
+  //  - Attach-only: uses the same resolveBaseUrl waterfall as the
+  //    HTTP version. Never auto-boots a dev server.
+  //  - Catches from browser pins are marked severity:"review" in
+  //    repo-stats so they don't inflate the deterministic breakCount.
+  //  - The pin file name carries a `-browser` suffix so it's visible
+  //    in PINS.md / vitest output / blame.
+  browser?: {
+    // Which assertions to run. Default ["images", "console"]; pass
+    // only ["images"] or ["console"] to narrow.
+    check: Array<"images" | "console">;
+    // Per-route timeout in milliseconds. Default 30000.
+    timeoutMs?: number;
+    // Network-idle wait. Default true; set false for highly dynamic
+    // pages whose network never settles.
+    waitForNetworkIdle?: boolean;
+  };
   // The unique identifier for the pin — used by claimKey/claimSlug.
   route: string;
   raw: string;
