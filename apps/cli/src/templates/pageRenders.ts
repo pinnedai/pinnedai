@@ -152,12 +152,27 @@ function repairPrompt(actualStatus: number, reason: string): string {
 describe("pinned: page-renders GET " + ROUTE, () => {
   const previewMissing = !PREVIEW_URL;
   const forceRequire = process.env.PINNED_REQUIRE_PREVIEW_URL === "1";
+  // 0.5.0-beta.9 (Cipherwake dogfood bug #1): if a page-renders pin
+  // was created with a dynamic-route shape (\`/preview/[slug]\`), the
+  // fetch would request the literal bracketed path → 404 every time
+  // → phantom regression on every prompt. Detect and SKIP — the
+  // user wants \`pinned render add --from collection-getter ...\`
+  // for dynamic routes, not page-renders.
+  const isDynamicRoute = /\\[[^\\]]+\\]/.test(ROUTE);
 
   beforeAll(() => {
     if (previewMissing && forceRequire) {
       throw new Error(
         "PREVIEW_URL env var required for pinned page-renders tests. " +
           "See https://pinnedai.dev/docs/preview-url"
+      );
+    }
+    if (isDynamicRoute && typeof console !== "undefined") {
+      console.warn(
+        "pinned [page-renders]: " + ROUTE + " is a dynamic route (contains [param]). " +
+        "Skipping — page-renders can't substitute concrete params. " +
+        "Use \`pinned render add --path '" + ROUTE + "' --from collection-getter --module <getter-path> --export <export-name>\` instead. " +
+        "Run \`pinned retire " + ORIGINAL_PR + "-<slug>\` to remove this pin."
       );
     }
   });
@@ -171,7 +186,8 @@ describe("pinned: page-renders GET " + ROUTE, () => {
   // PREVIEW_URL (e.g. the dev server stopped) would surface as a
   // regression in chat on every prompt — the phantom-regression
   // class.
-  it.skipIf(previewMissing && !forceRequire)("renders without crashing", pinnedWrapInfra(\`page-renders GET \${ROUTE}\`, async () => {
+  it.skipIf((previewMissing && !forceRequire) || isDynamicRoute)("renders without crashing", pinnedWrapInfra(\`page-renders GET \${ROUTE}\`, async (ctx) => {
+    void ctx;
     const url = PREVIEW_URL!.replace(/\\/$/, "") + ROUTE;
     const res = await pinnedFetch(url, {
       method: "GET",

@@ -2,6 +2,55 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.9] — 2026-06-08
+
+Five P0 fixes from Cipherwake's socialideagen dogfood pass against beta.8. All five are trust-killers: phantom regressions surfaced as catches on a healthy production app.
+
+### Fixed (P0) — Bug #1: page-render pin fetched literal `[slug]` → 404
+
+A page-renders pin generated for `/preview/[slug]` was requesting the literal bracketed path against the server every time. 404 every time. Hook-failure surfaced it as a regression on every prompt.
+
+Fix at two layers:
+1. **Detector** — `detectNewPagesInDiff` now drops routes containing `[param]` / `[...slug]` / `[[...slug]]`. Dynamic routes are structurally the wrong template — they need `render-collection` (which enumerates slugs at runtime).
+2. **Template** — defense-in-depth `isDynamicRoute` guard. If a dynamic route slips through, the emitted test SKIPS with a clear stderr message pointing the user to `pinned render add --from collection-getter`.
+
+### Fixed (P0) — Bug #2: infra-failure was labeled but vitest still RED
+
+`pinnedWrapInfra` re-threw an Error with "PINNED INFRA FAILURE — NOT a catch" text. The label was advisory. Vitest doesn't read labels — it saw a thrown Error and marked the test as failed. Hook-failure cached it as a catch.
+
+Fix: `pinnedWrapInfra` now calls `ctx.skip()` instead of throwing. Vitest reports SKIPPED (yellow), not failed (red). The catch ledger doesn't increment on skipped tests. `PINNED_TREAT_INFRA_AS_CATCH=1` reverts to the old throw-and-fail behavior for users who want infra-fails counted.
+
+### Fixed (P0) — Bug #3: journey pins still auto-pinned despite beta.4 LOW deferral
+
+The retroJourneys path bypassed the `safe[]` / `lowDeferred` filter — journey pins were emitted directly. So `journey` was correctly in `LOW_VALUE_TEMPLATES` but the gate never applied.
+
+Fix: count retroJourneys as deferred at the journey-emit site, surface them in the `↻ N low-tier deferred` summary, skip the emit. Total `journey` pins auto-written: 0.
+
+### Fixed (P0) — Bug #4: stale-template pins survive upgrade, keep false-failing
+
+Existing pin files use the pre-upgrade template emit. A user who upgrades CLI and runs `pinned test` still sees failures from the OLD template until `pinned regenerate --all`.
+
+Fix: failure-hook output now carries a one-line hint: *"If you upgraded Pinned recently and these failures look like phantom regressions, run `pinned regenerate --all` to refresh stale templates."* Reduces time-to-fix on this class to one command.
+
+### Fixed (P0) — Bug #6: `.pinned/last-edit-context.json` silently absent
+
+`recordEditContext` had `try { ... } catch { /* best-effort */ }` — failures were silently swallowed and the user saw no file.
+
+Fix: emit a debug-readable stderr line on EVERY call. Success: `pinned [edit-context]: wrote .pinned/last-edit-context.json model=... tool=...`. Failure: `pinned [edit-context]: FAILED to write ...: <error>`. Both observable in Claude Code's hook log.
+
+### Added — `dogfoodBugfixes.test.ts`
+
+12 cases covering all five bugs at unit + static-source levels. Each bug has a positive-catch test (the bug-class is detected/blocked) plus a control test (the legitimate case still works).
+
+### Note — stable-release gate is queued separately
+
+The session also surfaced a deeper question: when ANY recent version false-fires on a healthy repo, there's no version `npm i pinnedai` can land on without trust-killing first impressions. Tracked as task #188 — turn each of these five bugs into release-blocking failure-mode tests, define the gate, cut the first honest v0.5.0 stable, and point `@latest` at it. Until then, `@beta` is the only safe channel.
+
+### Test matrix
+
+- 538/538 vitest (+12 new dogfoodBugfixes)
+- 42/42 dyad sweep
+
 ## [0.5.0-beta.8] — 2026-06-08
 
 Usage-snapshot infrastructure mirroring the Cipherwake R94 pattern. Lays all the rails so the analytics work the moment `api.pinnedai.dev` is back up.

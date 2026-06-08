@@ -47,7 +47,21 @@ export function recordEditContext(cwd: string, ctx: Omit<EditContext, "recordedA
   try {
     mkdirSync(join(cwd, ".pinned"), { recursive: true });
     writeFileSync(p, JSON.stringify({ ...ctx, recordedAt: new Date().toISOString() }, null, 2) + "\n");
-  } catch { /* best-effort */ }
+    // 0.5.0-beta.9 (Cipherwake bug #6): emit a debug-readable stderr
+    // line on EVERY write. The dogfood Claude reported the file as
+    // absent — there was no signal whether the call fired silently
+    // or failed silently. Now both cases are observable in the hook
+    // logs / Claude Code's hook output.
+    try {
+      process.stderr.write(`pinned [edit-context]: wrote ${p} model=${ctx.model} tool=${ctx.tool ?? "none"}\n`);
+    } catch { /* stderr unavailable — give up */ }
+  } catch (e) {
+    // Don't swallow silently — make the failure observable. Caller's
+    // try/catch still prevents the hook from crashing on this.
+    try {
+      process.stderr.write(`pinned [edit-context]: FAILED to write ${p}: ${String(e).slice(0, 200)}\n`);
+    } catch { /* stderr unavailable */ }
+  }
 }
 
 function readRecentEditContext(cwd: string, ttlMs: number): EditContext | null {

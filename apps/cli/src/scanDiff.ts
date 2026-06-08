@@ -5155,6 +5155,18 @@ export function detectNewPagesInDiff(diffByFile: DiffByFile): DiffNewPageHit[] {
     if (seenRoutes.has(route)) continue;
     seenRoutes.add(route);
 
+    // 0.5.0-beta.9 (Cipherwake dogfood bug #1): page-renders fetches
+    // the literal route string. For a dynamic route like
+    // `/preview/[slug]` it would request `/preview/[slug]` against the
+    // server — which 404s every time, producing phantom regressions
+    // that hook-failure then surfaces on every prompt.
+    //
+    // Dynamic routes (containing `[param]` / `[...slug]` / `[[...slug]]`)
+    // are structurally the wrong template — they need render-collection
+    // (enumerates slugs at runtime). Drop them here; the user-facing
+    // recommendation is `pinned render add --from collection-getter`.
+    if (/\[[^\]]+\]/.test(route)) continue;
+
     out.push({
       template: "page-renders",
       route,

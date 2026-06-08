@@ -1,0 +1,24 @@
+{
+  "name": "pinnedai-api",
+  "version": "0.5.0-beta.9",
+  "private": true,
+  "type": "module",
+  "description": "Vercel Edge Functions + Supabase backend for pinnedai. Serves api.pinnedai.dev. Replaces the prior Cloudflare Worker (apps/edge.deprecated/) with the same logic on Vercel + Supabase so it runs alongside the existing pinnedai-landing Vercel project and Cipherwake's R94 analytics stack.",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel deploy --prod",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.9",
+    "@vercel/edge": "^1.2.0",
+    "typescript": "5.6.3",
+    "vercel": "^39.0.0",
+    "vitest": "2.1.9"
+  }
+}

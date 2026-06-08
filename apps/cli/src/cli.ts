@@ -1786,7 +1786,16 @@ program
           sharedToken: string;
           suggestedPin: string;
         }> }).retroJourneys ?? [];
-        for (const j of retroJourneys) {
+        // 0.5.0-beta.9 (Cipherwake bug #3): journey is in LOW_VALUE_TEMPLATES.
+        // The retroJourneys path bypassed the safe[]/lowDeferred split, so
+        // journey pins were still auto-written despite the beta.4 deferral.
+        // Count them as deferred and skip the emit. Counter feeds the
+        // "↻ N low-tier deferred" summary line below.
+        let lowDeferredJourneyCount = 0;
+        if (retroJourneys.length > 0) {
+          lowDeferredJourneyCount = retroJourneys.length;
+        }
+        for (const j of [] as typeof retroJourneys) {
           const claim: import("./claimParser.js").JourneyClaim = {
             template: "journey",
             label: j.label,
@@ -2198,9 +2207,12 @@ program
           ambiguous.length + Math.max(0, safe.length - MAX_BASELINE_AUTO_PINS);
         // 0.5.0-beta.4: surface the low-tier deferral count so the user
         // knows the LOW templates exist but were intentionally not
-        // auto-pinned. They can opt in later with `pinned protect --include-low`.
-        if (lowDeferred.length > 0) {
-          out(`  ↻ ${lowDeferred.length} low-tier suggestion${lowDeferred.length === 1 ? "" : "s"} deferred to opt-in (page-renders / journey / happy-path). Run \`pinned protect --include-low\` to add them.`);
+        // auto-pinned. 0.5.0-beta.9 (bug #3): retroJourneys are counted
+        // here too — they bypass the suggestions[] filter but get
+        // deferred at the journey-emit site.
+        const totalLowDeferred = lowDeferred.length + lowDeferredJourneyCount;
+        if (totalLowDeferred > 0) {
+          out(`  ↻ ${totalLowDeferred} low-tier suggestion${totalLowDeferred === 1 ? "" : "s"} deferred to opt-in (page-renders / journey / happy-path). Run \`pinned protect --include-low\` to add them.`);
         }
       } catch (e) {
         // Baseline failure should NEVER block init. Surface as a warning.

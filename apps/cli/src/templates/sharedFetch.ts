@@ -88,33 +88,57 @@ async function pinnedFetch(url: string, init: RequestInit = {}): Promise<Respons
 }
 
 // Helper for templates: wrap an it() body so that PinnedInfraFailure
-// errors emit a distinct "PINNED INFRA FAILURE" prompt (NOT counted
-// as a catch by \`pinned test\`'s catch-ledger). Real assertion
-// failures fall through and emit the usual "PINNED FAILURE" prompt.
-function pinnedWrapInfra(reason: string, body: () => Promise<void>): () => Promise<void> {
-  return async () => {
+// errors mark the test as SKIPPED (vitest \`ctx.skip()\`) instead of
+// throwing — Cipherwake-reported (0.5.0-beta.9): the prior version
+// re-threw with a "NOT a catch" label, but vitest still reported RED
+// and \`pinned test\` / hook-failure cached it as a regression. The
+// label was advisory text; vitest didn't know.
+//
+// New behavior: ctx.skip() makes vitest report the test as SKIPPED
+// (yellow ⏭️). The catch ledger sees skipped, not failed. Hook-failure
+// stops spamming.
+//
+// Real assertion failures still throw → fall through to the usual
+// "PINNED FAILURE" red path.
+//
+// PINNED_TREAT_INFRA_AS_CATCH=1 reverts to the old throw-and-fail
+// behavior for users who genuinely want infra-fails counted.
+function pinnedWrapInfra(
+  reason: string,
+  body: (ctx: { skip: (note?: string) => void }) => Promise<void>
+): (ctx: { skip: (note?: string) => void }) => Promise<void> {
+  return async (ctx) => {
     try {
-      await body();
+      await body(ctx);
     } catch (e) {
       if (e && (e as { pinnedInfraFailure?: boolean }).pinnedInfraFailure) {
         const details = (e as { details: string }).details;
-        throw new Error([
+        const treatAsCatch =
+          (globalThis as any).process?.env?.PINNED_TREAT_INFRA_AS_CATCH === "1";
+        const msg = [
           "",
           "═══ PINNED INFRA FAILURE — preview environment issue, NOT a catch ═══",
           "",
           "  Direction: " + reason,
           "  Cause: " + details,
           "",
-          "  This is classified as an INFRASTRUCTURE failure (preview down,",
-          "  DNS issue, network blip), NOT a regression catch. Pinned's",
-          "  catch ledger will NOT increment.",
+          "  Pinned classified this as INFRASTRUCTURE failure (preview down,",
+          "  DNS, network blip), NOT a regression catch. The test is SKIPPED",
+          "  and the catch ledger will NOT increment.",
           "",
           "  Fix the preview deployment, then re-run.",
-          "  If you believe this IS a real catch, set PINNED_TREAT_INFRA_AS_CATCH=1",
-          "  and re-run — that will count it as a catch.",
+          "  To treat infra as a real catch: PINNED_TREAT_INFRA_AS_CATCH=1",
           "═══════════════════════════════════════════════════════════════════",
           "",
-        ].join("\\n"));
+        ].join("\\n");
+        if (treatAsCatch) {
+          throw new Error(msg);
+        }
+        if (typeof console !== "undefined") console.warn(msg);
+        // Mark vitest's task as skipped — yellow, not red. ledger doesn't
+        // count skipped tests as catches.
+        try { ctx.skip("pinned [infra]: " + reason); } catch { /* older vitest */ }
+        return;
       }
       throw e;
     }

@@ -1270,6 +1270,17 @@ function failureMessage(lastStatus: LastStatus, activeClaimIds?: Set<string>): s
   lines.push(`  3. Do NOT delete or weaken any test in tests/pinned/ unless the user`);
   lines.push(`     explicitly asks to retire the pin.`);
   lines.push(``);
+  // 0.5.0-beta.9 (Cipherwake bug #4): stale-template hint. After a
+  // CLI upgrade, existing pin files keep using the pre-upgrade
+  // template emit. If a recent fix landed in pageRenders / pinnedFetch
+  // / pinnedWrapInfra etc., the existing pin won't pick it up until
+  // `pinned regenerate --all`. The dogfood Claude reported phantom
+  // regressions from a stale dynamic-route page-render pin even
+  // after upgrade — this hint reduces the time-to-fix on that class.
+  lines.push(`  • If you upgraded Pinned recently and these failures look like phantom`);
+  lines.push(`    regressions against a healthy app (e.g. dynamic-route 404s, dead-port`);
+  lines.push(`    errors), run \`pinned regenerate --all\` to refresh stale pin templates.`);
+  lines.push(``);
   if (totalCaught > 0) {
     lines.push(`  See tests/pinned/CATCHES.md for the running ledger (Pinned has caught ${totalCaught} regression${totalCaught === 1 ? "" : "s"} in this repo).`);
     lines.push(``);
