@@ -2,6 +2,52 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.7] — 2026-06-08
+
+CLI hardening for the dead `api.pinnedai.dev` endpoint + Open VSX marketplace copy refresh.
+
+### Added — clear warning when the hosted endpoint is unreachable
+
+`llmExtract`, `llmSummarize`, and `pinned analytics upload` all default to `https://api.pinnedai.dev`. That backend is currently down (Vercel `DEPLOYMENT_NOT_FOUND` — the Cloudflare Worker at `apps/edge/` has its routes config commented out, never deployed). Previously: silent fallback to regex-only / silent upload failure.
+
+Now: when any of those three paths sees a 404-with-DEPLOYMENT_NOT_FOUND / 503 / 502 / network error, it emits a clear stderr warning:
+
+```
+⚠  pinned: hosted endpoint https://api.pinnedai.dev is unreachable (llmExtract).
+   This is the Pinned-hosted LLM fallback / analytics proxy. With it down:
+     - LLM extraction falls back to regex-only (works, but lower recall on natural-language PRs)
+     - Hosted analytics upload pauses
+   To proceed without the fallback:
+     PINNEDAI_BYOK=anthropic   PINNEDAI_ANTHROPIC_API_KEY=...   (or)
+     PINNEDAI_BYOK=openai      PINNEDAI_OPENAI_API_KEY=...
+   To point at a self-hosted Worker:
+     PINNEDAI_ENDPOINT=https://your-worker.dev   (or pass --endpoint)
+   To silence this warning:
+     PINNEDAI_SUPPRESS_ENDPOINT_WARN=1
+```
+
+Throttled to once per (source, endpoint) per process so CI retry loops don't spam.
+
+### Changed — Open VSX / VS Code Marketplace copy
+
+`apps/vscode-extension/package.json`:
+- `displayName`: "pinnedai — Pin PR claims as permanent CI tests" → "pinnedai — Stop your AI coder from repeating bugs"
+- `description` rewritten to match `pinnedai.dev`'s current positioning
+- Version bumped 0.1.2 → 0.1.3 so Open VSX picks up the metadata change
+
+### Added — `deadEndpointWarning.test.ts`
+
+4 cases covering the warning copy, the per-(source, endpoint) throttle, multi-source emission, and `PINNEDAI_SUPPRESS_ENDPOINT_WARN=1` honoring.
+
+### Test matrix
+
+- 525/525 vitest (+5 new: 4 warning + 1 catalog)
+- 42/42 dyad sweep
+
+### Still queued
+
+- Pinnedai usage-snapshot cron + the actual api.pinnedai.dev redeploy (Task #182) — blocked on Cloudflare credentials, needs your hands.
+
 ## [0.5.0-beta.6] — 2026-06-08
 
 Closes the 0.6.0 architecture queue — last two asks (#5 + #6).

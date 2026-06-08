@@ -210,6 +210,16 @@ async function callExtract(
     }
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
+      // 0.5.0-beta.7 (Cipherwake hardening): surface dead-endpoint
+      // cases clearly instead of silent regex fallback. The Vercel
+      // DEPLOYMENT_NOT_FOUND header / 404 / 503 all mean the hosted
+      // backend is unreachable. Emit a STDERR warning with the
+      // actionable fix so users running in CI know what's happening.
+      const vercelDown = res.status === 404 && /(DEPLOYMENT_NOT_FOUND|deployment could not be found)/i.test(detail);
+      const upstreamDown = vercelDown || res.status === 503 || res.status === 502;
+      if (upstreamDown) {
+        warnDeadEndpoint(baseUrl, "llmExtract");
+      }
       return {
         ok: false,
         reason: "error",
@@ -231,8 +241,39 @@ async function callExtract(
       quota: data.quota,
     };
   } catch (e) {
+    // Network-level error — also could be the endpoint being entirely
+    // gone. Surface the warning here too.
+    warnDeadEndpoint(baseUrl, "llmExtract");
     return { ok: false, reason: "error", error: `Extract call failed: ${String(e)}` };
   }
+}
+
+// 0.5.0-beta.7 (Cipherwake hardening): a single shared warning for
+// "hosted endpoint unreachable" cases. Throttled to once per process
+// so a CI run that re-tries doesn't spam the same line. Writes to
+// stderr so it surfaces in GitHub Actions logs but doesn't pollute
+// stdout-consumers (e.g. JSON parsers).
+const WARNED_DEAD = new Set<string>();
+export function warnDeadEndpoint(baseUrl: string, source: string): void {
+  const key = `${source}:${baseUrl}`;
+  if (WARNED_DEAD.has(key)) return;
+  WARNED_DEAD.add(key);
+  if (process.env.PINNEDAI_SUPPRESS_ENDPOINT_WARN === "1") return;
+  try {
+    process.stderr.write(
+      `\n⚠  pinned: hosted endpoint ${baseUrl} is unreachable (${source}).\n` +
+      `   This is the Pinned-hosted LLM fallback / analytics proxy. With it down:\n` +
+      `     - LLM extraction falls back to regex-only (works, but lower recall on natural-language PRs)\n` +
+      `     - Hosted analytics upload pauses\n` +
+      `   To proceed without the fallback:\n` +
+      `     PINNEDAI_BYOK=anthropic   PINNEDAI_ANTHROPIC_API_KEY=...   (or)\n` +
+      `     PINNEDAI_BYOK=openai      PINNEDAI_OPENAI_API_KEY=...\n` +
+      `   To point at a self-hosted Worker:\n` +
+      `     PINNEDAI_ENDPOINT=https://your-worker.dev   (or pass --endpoint)\n` +
+      `   To silence this warning:\n` +
+      `     PINNEDAI_SUPPRESS_ENDPOINT_WARN=1\n\n`
+    );
+  } catch { /* stderr write failure — give up silently */ }
 }
 
 function isPaid(plan: Plan): boolean {

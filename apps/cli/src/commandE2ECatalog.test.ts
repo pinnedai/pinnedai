@@ -129,6 +129,11 @@ const DETECTORS: DetectorEntry[] = [
     e2eTestFile: "modelAttributionAndAutoConfirm.test.ts",
     stateAssertionPatterns: [/recordEditContext/, /inferEventResolutions/, /runInferEventResolutions/],
   },
+  {
+    detector: "dead-endpoint warning (Cipherwake hardening)",
+    e2eTestFile: "deadEndpointWarning.test.ts",
+    stateAssertionPatterns: [/warnDeadEndpoint/, /PINNEDAI_BYOK/, /SUPPRESS_ENDPOINT_WARN/],
+  },
 ];
 
 const SRC_DIR = join(process.cwd(), "src");

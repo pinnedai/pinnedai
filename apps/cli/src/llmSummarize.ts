@@ -84,6 +84,15 @@ export async function llmSafetySummarize(
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
+      // 0.5.0-beta.7 (Cipherwake hardening): surface dead-endpoint
+      // case clearly instead of silent fallback. Same warning as
+      // llmExtract — shared helper.
+      const vercelDown = res.status === 404 && /(DEPLOYMENT_NOT_FOUND|deployment could not be found)/i.test(detail);
+      const upstreamDown = vercelDown || res.status === 503 || res.status === 502;
+      if (upstreamDown) {
+        const { warnDeadEndpoint } = await import("./llmExtract.js");
+        warnDeadEndpoint(endpoint, "llmSummarize");
+      }
       return {
         ok: false,
         reason: `${endpoint}/v1/summarize returned ${res.status}: ${detail.slice(0, 200)}`,
@@ -95,6 +104,8 @@ export async function llmSafetySummarize(
     }
     return { ok: true, markdown: data.markdown };
   } catch (e) {
+    const { warnDeadEndpoint } = await import("./llmExtract.js");
+    warnDeadEndpoint(endpoint, "llmSummarize");
     return { ok: false, reason: `Summarize call failed: ${String(e)}` };
   }
 }

@@ -1,8 +1,8 @@
 {
   "name": "pinnedai-vscode",
-  "displayName": "pinnedai — Pin PR claims as permanent CI tests",
-  "description": "Status-bar indicator + command palette integration for the pinnedai CLI. Works in VS Code, Cursor, and any VS Code-family editor.",
-  "version": "0.1.2",
+  "displayName": "pinnedai — Stop your AI coder from repeating bugs",
+  "description": "Pinned finds AI-prone failure patterns in your repo and turns them into regression guards. This extension shows the live Pinned status bar (how many guards are active, what was just caught) and adds command-palette shortcuts for the local `pinned` CLI. Works in VS Code, Cursor, Windsurf, and any VS Code-family editor.",
+  "version": "0.1.3",
   "publisher": "pinnedai",
   "engines": {
     "vscode": "^1.85.0"

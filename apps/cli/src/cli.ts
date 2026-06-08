@@ -6825,6 +6825,14 @@ program
           }
           out("");
         } else {
+          // 0.5.0-beta.7 (Cipherwake hardening): if the endpoint is
+          // dead, surface the clear warning + escape hatches.
+          const detail = typeof resultText === "string" ? resultText : "";
+          const vercelDown = res.status === 404 && /(DEPLOYMENT_NOT_FOUND|deployment could not be found)/i.test(detail);
+          if (vercelDown || res.status === 503 || res.status === 502) {
+            const { warnDeadEndpoint } = await import("./llmExtract.js");
+            warnDeadEndpoint(cfg.endpoint, "analytics upload");
+          }
           err(`✗ Upload failed (${res.status}): ${JSON.stringify(resultJson)}\n`);
           process.exit(1);
         }
