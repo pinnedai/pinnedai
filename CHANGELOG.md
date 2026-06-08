@@ -2,6 +2,37 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.5] — 2026-06-08
+
+Cipherwake 0.6.0 ask #1: wire incremental detection on hooks.
+
+### Fixed (P0) — pre-commit / PostToolUse stayed silent on risky surfaces
+
+Cipherwake reported: "pre-commit printed '✓ No new behaviors to protect' on EVERY commit across a session that added public routes, a BYOK server action handling API keys, and status-gated content. Inert. Sweep found everything at the end of the session, but the pre-commit / PostToolUse loop missed it all in real time."
+
+Root cause: `classifyDiff()` in `autoProtect.ts` was missing 6 HIGH-value detectors that `sweep` already had:
+- `detectServerActionWrites` — the BYOK server-action class
+- `detectPaidApiCalls` — OpenAI/Anthropic with model literals
+- `detectEdgeFunctionWrites` — Supabase Edge writes
+- `detectCronHandlers` — Vercel / GH-Actions cron
+- `detectStripeEventDispatches` — webhook event-type case statements
+- `detectVisibilityDiscriminant` — status/draft public-route leak (new in 0.5.0-beta.1)
+
+All six now fire on the diff at hook time, each as a `decision: "ask"` candidate (user still confirms — the alternative is auto-dumping LOTS, which is the noise ask #2 addresses). Detectors that were already wired: enum-drift, env-required, supabase-column, expected-header, nullable-result, response-shape, mass-mutation.
+
+### Added — `incrementalDetection.test.ts`
+
+4 cases assert classifyDiff actually proposes the HIGH-value pins:
+- server-action-write on a `"use server"` export with a db insert
+- paid-api-call on an `openai.chat.completions.create(...)` site
+- visibility-invariant when a status-discriminant collection + dynamic-route page both exist
+- a fixture with all four risky surfaces produces ≥3 candidates (NOT zero — the Cipherwake bug)
+
+### Test matrix
+
+- 512/512 vitest (+5 new: 4 incrementalDetection + 1 catalog entry)
+- 42/42 dyad sweep
+
 ## [0.5.0-beta.4] — 2026-06-08
 
 Two more 0.6.0 asks: stop dumping LOW-tier pins on init, and promote enum-drift on visibility discriminants out of the Review tier.

@@ -4109,9 +4109,6 @@ program
         claim: {
           template: "visibility-invariant",
           publicRoute: h.publicRoute,
-          // The visibility-invariant template's pathTemplate is the
-          // dynamic-route shape; we use the same string here.
-          pathTemplate: h.publicRoute,
           collection: {
             from: "collection-getter",
             modulePath: h.collectionModulePath,
@@ -4121,7 +4118,6 @@ program
             field: h.discriminantField,
             publicValues: guessedPublicValues,
           },
-          // Required base fields per the claim type.
           route: h.publicRoute,
           raw: h.suggestedPin,
         } as Claim,

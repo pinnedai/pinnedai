@@ -15,7 +15,7 @@ import type { Claim } from "./claimParser.js";
 import { claimKey } from "./claimParser.js";
 import type { RegistryEntry } from "./registry.js";
 import type { ChangedFile } from "./scanDiff.js";
-import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, detectNewPagesInDiff, detectNewValidationSchemasInDiff, detectHostConditionalInDiff, detectJourneyPairsInDiff, detectEnumDrift, detectEnvRequired, detectSupabaseColumnExists, detectExpectedHeaders, detectNullableResults, detectResponseShape, detectMassMutation, type DiffByFile } from "./scanDiff.js";
+import { scanDiffFull, findUnprotectedSiblings, AUTH_CHECK_PATTERNS, detectAuthChecksInDiff, detectValidationAddedInDiff, detectNewPostEndpointsInDiff, detectNewPagesInDiff, detectNewValidationSchemasInDiff, detectHostConditionalInDiff, detectJourneyPairsInDiff, detectEnumDrift, detectEnvRequired, detectSupabaseColumnExists, detectExpectedHeaders, detectNullableResults, detectResponseShape, detectMassMutation, detectServerActionWrites, detectPaidApiCalls, detectEdgeFunctionWrites, detectCronHandlers, detectVisibilityDiscriminant, detectStripeEventDispatches, type DiffByFile } from "./scanDiff.js";
 import { readFileSync as fsReadFileSync } from "node:fs";
 import { isAbsolute as pathIsAbsolute, join as pathJoin } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
@@ -542,6 +542,146 @@ export function classifyDiff(input: ClassifyInput): ClassifyResult {
         reason: h.suggestedPin,
         triggeredBy: h.filePath,
         decision: "ask", // critical risk — always confirm
+      });
+    }
+
+    // 0.5.0-beta.5 (Cipherwake 0.6.0 ask #1): wire the remaining
+    // HIGH-value detectors into the agent loop so risky surfaces get
+    // proposed AS they're added (pre-commit / PostToolUse), not only
+    // when the user manually runs `pinned sweep`. Cipherwake reported:
+    // "pre-commit printed '✓ No new behaviors to protect' on EVERY
+    // commit across a session that added public routes, a BYOK server
+    // action handling API keys, and status-gated content. Inert."
+    // These were all detectable — they just weren't wired here.
+    //
+    // Decision policy: ask (not auto-add). Each of these is HIGH-value
+    // BUT the user still gets to confirm — the alternative is auto-
+    // dumping LOTS of pins, which is the noise Cipherwake also flagged.
+
+    // server-action-write — Server Actions with a write surface
+    // (db-insert / db-update / db-delete / external write). Real bug
+    // class: the BYOK action that was missed in the dogfood session.
+    for (const h of detectServerActionWrites(tree)) {
+      tryEmit({
+        claim: {
+          template: "server-action-write",
+          actionModule: h.filePath,
+          exportName: h.exportName,
+          writeTarget: h.writeShape.target,
+          writeLibrary: h.writeShape.library,
+          writeKind: h.writeShape.kind,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.filePath,
+        decision: "ask",
+      });
+    }
+
+    // paid-api-call — OpenAI/Anthropic/etc. API call with a model
+    // literal. Catches both model swaps (silent quality regression)
+    // and missing max_tokens (unbounded-spend risk).
+    for (const h of detectPaidApiCalls(tree)) {
+      tryEmit({
+        claim: {
+          template: "paid-api-call",
+          filePath: h.filePath,
+          provider: h.provider,
+          callExpr: h.callExpr,
+          modelString: h.modelString,
+          hasMaxTokens: h.hasMaxTokens,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.filePath,
+        decision: "ask",
+      });
+    }
+
+    // edge-function-write — Supabase Edge Function performing a write.
+    for (const h of detectEdgeFunctionWrites(tree)) {
+      tryEmit({
+        claim: {
+          template: "edge-function-write",
+          functionName: h.functionName,
+          filePath: h.filePath,
+          writeTarget: h.writeShape.target,
+          writeLibrary: h.writeShape.library,
+          writeKind: h.writeShape.kind,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.filePath,
+        decision: "ask",
+      });
+    }
+
+    // cron-handler — Vercel/GH-Actions cron schedules. Schedule
+    // changes are silent reliability regressions.
+    for (const h of detectCronHandlers(tree)) {
+      tryEmit({
+        claim: {
+          template: "cron-handler",
+          source: h.source,
+          identifier: h.identifier,
+          schedule: h.schedule,
+          handlerFile: h.handlerFile,
+          declarationFile: h.declarationFile,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.handlerFile ?? h.identifier,
+        decision: "ask",
+      });
+    }
+
+    // stripe-event-handled — Stripe webhook event-type case statements.
+    // Catches the "one-letter typo in a case literal silently un-
+    // provisions paying customers" class.
+    for (const h of detectStripeEventDispatches(tree)) {
+      tryEmit({
+        claim: {
+          template: "stripe-event-handled",
+          filePath: h.filePath,
+          events: h.events,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.filePath,
+        decision: "ask",
+      });
+    }
+
+    // visibility-invariant — collection-getter on a public route
+    // carrying a status/published/visibility discriminant. The
+    // socialideagen draft-leak class. New in 0.5.0-beta.1.
+    for (const h of detectVisibilityDiscriminant(tree)) {
+      const CONVENTIONAL_PUBLIC = new Set([
+        "live", "published", "active", "public", "available",
+        "approved", "online", "ready", "visible",
+      ]);
+      const publicValues = h.observedValues.filter((v) =>
+        CONVENTIONAL_PUBLIC.has(String(v).toLowerCase())
+      );
+      tryEmit({
+        claim: {
+          template: "visibility-invariant",
+          publicRoute: h.publicRoute,
+          collection: {
+            from: "collection-getter",
+            modulePath: h.collectionModulePath,
+            exportName: h.exportName,
+          },
+          rule: {
+            field: h.discriminantField,
+            publicValues: publicValues.length > 0 ? publicValues : ["live"],
+          },
+          route: h.publicRoute,
+          raw: h.suggestedPin,
+        },
+        reason: h.suggestedPin,
+        triggeredBy: h.publicPageFile,
+        decision: "ask",
       });
     }
   } catch {

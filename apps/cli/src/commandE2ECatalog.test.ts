@@ -119,6 +119,11 @@ const DETECTORS: DetectorEntry[] = [
     e2eTestFile: "tieredAutoPin.test.ts",
     stateAssertionPatterns: [/LOW_VALUE_TEMPLATES/, /confidence/, /confirmed/],
   },
+  {
+    detector: "incremental detection on hooks (Cipherwake 0.6.0 #1)",
+    e2eTestFile: "incrementalDetection.test.ts",
+    stateAssertionPatterns: [/classifyDiff/, /server-action-write/, /paid-api-call/, /visibility-invariant/],
+  },
 ];
 
 const SRC_DIR = join(process.cwd(), "src");
