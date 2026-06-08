@@ -2,6 +2,70 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.8] — 2026-06-08
+
+Usage-snapshot infrastructure mirroring the Cipherwake R94 pattern. Lays all the rails so the analytics work the moment `api.pinnedai.dev` is back up.
+
+### Added — Worker request logging + daily snapshot cron
+
+`apps/edge/src/usageLog.ts` — every Worker call now writes one row into `pin_events` (append-only). Records:
+- IP hash (SHA-256 with daily-rotating salt — never raw IPs)
+- Classified `client_class` (cli / mcp / action / web / bot / other)
+- Endpoint, status code, repo (from OIDC), CLI version
+
+Fire-and-forget via `ctx.waitUntil` — logging never blocks the response.
+
+`scheduled()` handler runs daily at `10 9 * * *` UTC, computes:
+- 24h + 7d event totals + unique-IP counts
+- Per-client-class 7d rollup (calls, unique IPs, top-IP-share)
+- Per-endpoint 7d rollup
+
+Writes one row per UTC date into `usage_snapshots` with `source = "daily-cron"`. Idempotent on `snapshot_date`.
+
+### Added — admin endpoints
+
+- `GET /admin/usage` — today's WoW report (unique-IP delta + pct vs 7 days prior) + recent 14-day snapshot history
+- `POST /admin/usage/snapshot?date=YYYY-MM-DD` — manual trigger (used by backfill script)
+
+Both gated by `ADMIN_KEY` bearer.
+
+### Added — schema migration
+
+`apps/edge/schema.sql` extends with two new tables:
+- `pin_events` (append-only event log)
+- `usage_snapshots` (daily rollup)
+
+Existing `CREATE TABLE IF NOT EXISTS` pattern — re-running schema apply is safe.
+
+### Added — backfill script + cron trigger + deploy runbook
+
+- `apps/edge/scripts/backfill-usage-snapshots.mjs` populates N days from existing `pin_events`
+- `wrangler.toml` carries `[triggers] crons = ["10 9 * * *"]` so cron fires automatically on deploy
+- `apps/edge/DEPLOY.md` step-by-step runbook for the full deploy
+
+### Tests
+
+`apps/edge/src/usageLog.test.ts` — 11 cases covering classify / hashIp / logEvent / computeSnapshot / writeSnapshot / readWoW. Full Worker test suite now 49/49.
+
+### Still blocked
+
+Worker code is ready. The actual `api.pinnedai.dev` deploy still needs your hands per `apps/edge/DEPLOY.md`:
+- `wrangler d1 create pinnedai-quota` → copy id into wrangler.toml
+- `wrangler d1 execute pinnedai-quota --remote --file=./schema.sql`
+- `wrangler secret put OPENAI_API_KEY` + `ADMIN_KEY`
+- Uncomment the `routes = [{ pattern = "api.pinnedai.dev", custom_domain = true }]` line
+- Ensure pinnedai.dev DNS is on Cloudflare (apex zone)
+- `wrangler deploy`
+- `node scripts/backfill-usage-snapshots.mjs 30`
+
+Once that's done, the dead-endpoint warning (0.5.0-beta.7) stops firing and the WoW report becomes queryable.
+
+### Test matrix
+
+- 526/526 CLI vitest
+- 49/49 Worker vitest (+11 new)
+- 42/42 dyad sweep
+
 ## [0.5.0-beta.7] — 2026-06-08
 
 CLI hardening for the dead `api.pinnedai.dev` endpoint + Open VSX marketplace copy refresh.

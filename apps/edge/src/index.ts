@@ -20,6 +20,7 @@ import { extractClaimsLLM } from "./openai.js";
 import { hashBody, getCached, setCached } from "./cache.js";
 import { validateSubscription, createSubscription } from "./subscriptions.js";
 import { handleBadge } from "./badge.js";
+import { logEvent, computeSnapshot, writeSnapshot, readWoW } from "./usageLog.js";
 
 export type Env = {
   QUOTA: D1Database;
@@ -36,35 +37,49 @@ export type Env = {
 };
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    // 0.5.0-beta.8 (R94 mirror): wrap every handler so its endpoint
+    // + status code lands in pin_events. fire-and-forget via
+    // ctx.waitUntil so logging never blocks the response.
+    const recordEvent = (endpoint: string, response: Response): Response => {
+      ctx.waitUntil(
+        logEvent(env.QUOTA, {
+          request,
+          endpoint,
+          statusCode: response.status,
+        })
+      );
+      return response;
+    };
 
     if (request.method === "GET" && url.pathname === "/healthz") {
-      return json({ ok: true, service: "pinnedai-edge" });
+      return recordEvent("/healthz", json({ ok: true, service: "pinnedai-edge" }));
     }
 
     if (request.method === "GET" && url.pathname.startsWith("/badge/")) {
-      return handleBadge(request);
+      const r = await handleBadge(request);
+      return recordEvent("/badge", r);
     }
 
     if (request.method === "GET" && url.pathname === "/admin/stats") {
-      return handleAdminStats(request, env);
+      return recordEvent("/admin/stats", await handleAdminStats(request, env));
     }
 
     if (request.method === "POST" && url.pathname === "/admin/subscription") {
-      return handleAdminCreateSubscription(request, env);
+      return recordEvent("/admin/subscription", await handleAdminCreateSubscription(request, env));
     }
 
     if (request.method === "POST" && url.pathname === "/v1/extract") {
-      return handleExtract(request, env);
+      return recordEvent("/v1/extract", await handleExtract(request, env));
     }
 
     if (request.method === "POST" && url.pathname === "/v1/plan") {
-      return handlePlanCheck(request, env);
+      return recordEvent("/v1/plan", await handlePlanCheck(request, env));
     }
 
     if (request.method === "POST" && url.pathname === "/v1/summarize") {
-      return handleSummarize(request, env);
+      return recordEvent("/v1/summarize", await handleSummarize(request, env));
     }
 
     // 0.3.0+ — hosted analytics upload. Pro+ only. Customer opts in
@@ -73,12 +88,65 @@ export default {
     // guardrail]] this is the durable paid-tier moat lever.
     if (request.method === "POST" && url.pathname === "/v1/repo-stats") {
       const { handleRepoStatsUpload } = await import("./repoStatsUpload.js");
-      return handleRepoStatsUpload(request, env);
+      return recordEvent("/v1/repo-stats", await handleRepoStatsUpload(request, env));
     }
 
-    return json({ error: "not found" }, 404);
+    // 0.5.0-beta.8 — usage-snapshot admin endpoints. /admin/usage
+    // returns the latest snapshot + WoW report. /admin/usage/snapshot
+    // is the cron trigger (gated by ADMIN_KEY).
+    if (request.method === "GET" && url.pathname === "/admin/usage") {
+      return recordEvent("/admin/usage", await handleAdminUsage(request, env));
+    }
+    if (request.method === "POST" && url.pathname === "/admin/usage/snapshot") {
+      return recordEvent("/admin/usage/snapshot", await handleAdminSnapshot(request, env));
+    }
+
+    return recordEvent("not-found", json({ error: "not found" }, 404));
+  },
+
+  // 0.5.0-beta.8 — Cloudflare Workers scheduled trigger. Configured
+  // in wrangler.toml with `[[triggers]] crons = ["10 9 * * *"]`. Runs
+  // at 09:10 UTC daily (10 min after any common 09:00 cron slot,
+  // mirroring Cipherwake's R94 schedule to avoid contention).
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil((async () => {
+      try {
+        const now = Date.now();
+        const snap = await computeSnapshot(env.QUOTA, now);
+        await writeSnapshot(env.QUOTA, snap, "daily-cron", now);
+      } catch (e) {
+        // Cron failures are best-effort; never crash the runtime.
+        console.error("scheduled() snapshot failed:", e);
+      }
+    })());
   },
 } satisfies ExportedHandler<Env>;
+
+// Admin: read latest snapshot + WoW report. Gated by ADMIN_KEY.
+async function handleAdminUsage(request: Request, env: Env): Promise<Response> {
+  const auth = request.headers.get("authorization") ?? "";
+  if (auth !== `Bearer ${env.ADMIN_KEY}`) return json({ error: "unauthorized" }, 401);
+  const today = new Date().toISOString().slice(0, 10);
+  const wow = await readWoW(env.QUOTA, today);
+  const recent = await env.QUOTA
+    .prepare("SELECT * FROM usage_snapshots ORDER BY snapshot_date DESC LIMIT 14")
+    .all();
+  return json({ today: wow, recent: recent.results ?? [] });
+}
+
+// Admin: manually trigger a snapshot (idempotent — upserts the date row).
+// Used by the backfill script + ad-hoc "snapshot now".
+async function handleAdminSnapshot(request: Request, env: Env): Promise<Response> {
+  const auth = request.headers.get("authorization") ?? "";
+  if (auth !== `Bearer ${env.ADMIN_KEY}`) return json({ error: "unauthorized" }, 401);
+  const url = new URL(request.url);
+  const dateParam = url.searchParams.get("date");
+  const now = dateParam ? new Date(dateParam + "T00:00:00Z").getTime() + 86400_000 : Date.now();
+  const source = dateParam ? "backfill" : "daily-cron";
+  const snap = await computeSnapshot(env.QUOTA, now);
+  await writeSnapshot(env.QUOTA, snap, source, Date.now());
+  return json({ ok: true, snapshot: snap });
+}
 
 async function handleExtract(request: Request, env: Env): Promise<Response> {
   // Cheapest reject first — auth header presence + format.

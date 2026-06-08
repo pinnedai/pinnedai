@@ -17,6 +17,13 @@ compatibility_date = "2026-05-19"
 # Public route under the apex domain. Update once pinnedai.dev DNS is live.
 # routes = [{ pattern = "api.pinnedai.dev", custom_domain = true }]
 
+# 0.5.0-beta.8 — daily usage-snapshot cron. Fires at 09:10 UTC every
+# day, ten minutes after the conventional 09:00 cron slot to avoid
+# contention with other daily jobs. Same schedule as Cipherwake's
+# R94 mirror so the two projects' analytics windows align.
+[triggers]
+crons = ["10 9 * * *"]
+
 [[d1_databases]]
 binding = "QUOTA"
 database_name = "pinnedai-quota"

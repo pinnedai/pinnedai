@@ -95,3 +95,78 @@ CREATE TABLE IF NOT EXISTS detector_model_rollup (
   PRIMARY KEY (org, detector, ai_model)
 );
 CREATE INDEX IF NOT EXISTS idx_detector_model_rollup_org ON detector_model_rollup (org, detector);
+
+-- 0.5.0-beta.8 (Cipherwake R94 mirror): append-only event log + daily
+-- usage snapshots for "are we growing week-over-week" visibility.
+--
+-- pin_events is the foundation — every Worker call writes one row:
+-- ip_hash (SHA-256, never raw IP), client_class (cli/mcp/action/web/
+-- bot/other), endpoint, created_at, repo (when known, from OIDC),
+-- cli_version. From this single table both the daily cron and any
+-- future trust-diff/health-check ad-hoc queries derive everything.
+--
+-- IP hashing: SHA-256(ip + salt), salt = HMAC daily-rotating secret.
+-- No raw IPs ever stored. Hash collision is fine — we only need to
+-- count uniques per day, not identify users across days.
+CREATE TABLE IF NOT EXISTS pin_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at INTEGER NOT NULL,         -- unix ms
+  ip_hash TEXT NOT NULL,                -- SHA-256(ip + daily salt)
+  client_class TEXT NOT NULL,           -- 'cli' | 'mcp' | 'action' | 'web' | 'bot' | 'other'
+  endpoint TEXT NOT NULL,               -- '/v1/extract' | '/v1/summarize' | '/v1/repo-stats' | '/badge/...' | etc
+  repo TEXT,                            -- '<org>/<repo>' when OIDC carries it; null otherwise
+  cli_version TEXT,                     -- from User-Agent or X-Pinned-Version header
+  user_agent TEXT,                      -- first 200 chars of UA, useful for client-class disambiguation
+  status_code INTEGER NOT NULL          -- the HTTP response code we returned (200/400/429/500 etc)
+);
+CREATE INDEX IF NOT EXISTS idx_pin_events_created ON pin_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pin_events_class_created ON pin_events (client_class, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pin_events_endpoint_created ON pin_events (endpoint, created_at DESC);
+
+-- Daily snapshot — one row per UTC date. Powers /admin/usage trend
+-- chart + WoW growth signal. Computed by the daily cron at 09:10 UTC
+-- by reading pin_events from the past 24h + 7d windows.
+--
+-- Per-class metrics carry BOTH raw call counts AND unique-IP counts
+-- AND top-IP-share — so a class dominated by a single noisy CI host
+-- (top_ip_share > 50%) can be flagged as dogfood-inflated. Real
+-- adoption is the unique-IP growth, not the raw-call growth.
+CREATE TABLE IF NOT EXISTS usage_snapshots (
+  snapshot_date TEXT PRIMARY KEY,       -- YYYY-MM-DD, UTC
+  recorded_at INTEGER NOT NULL,         -- unix ms
+
+  period_24h_events INTEGER NOT NULL DEFAULT 0,
+  period_24h_unique_ips INTEGER NOT NULL DEFAULT 0,
+
+  period_7d_events INTEGER NOT NULL DEFAULT 0,
+  period_7d_unique_ips INTEGER NOT NULL DEFAULT 0,
+
+  -- Per-class 7d rollups. PinnedAI has no Chrome extension so no
+  -- ext_scans column — kept consistent with Cipherwake otherwise.
+  cli_calls_7d INTEGER NOT NULL DEFAULT 0,
+  cli_unique_ips_7d INTEGER NOT NULL DEFAULT 0,
+  cli_top_ip_share_pct INTEGER NOT NULL DEFAULT 0,
+
+  mcp_calls_7d INTEGER NOT NULL DEFAULT 0,
+  mcp_unique_ips_7d INTEGER NOT NULL DEFAULT 0,
+  mcp_top_ip_share_pct INTEGER NOT NULL DEFAULT 0,
+
+  action_calls_7d INTEGER NOT NULL DEFAULT 0,
+  action_unique_ips_7d INTEGER NOT NULL DEFAULT 0,
+  action_top_ip_share_pct INTEGER NOT NULL DEFAULT 0,
+
+  web_calls_7d INTEGER NOT NULL DEFAULT 0,
+  web_unique_ips_7d INTEGER NOT NULL DEFAULT 0,
+  web_top_ip_share_pct INTEGER NOT NULL DEFAULT 0,
+
+  bot_calls_7d INTEGER NOT NULL DEFAULT 0,
+  bot_unique_ips_7d INTEGER NOT NULL DEFAULT 0,
+
+  -- Endpoint-level rollup, JSON: { "/v1/extract": { count, unique_ips }, ... }
+  by_endpoint_json TEXT NOT NULL DEFAULT '{}',
+
+  -- Source: 'daily-cron' or 'backfill' so the trend chart can show
+  -- which days were computed live vs reconstructed.
+  source TEXT NOT NULL DEFAULT 'daily-cron'
+);
+CREATE INDEX IF NOT EXISTS idx_usage_snapshots_date_desc ON usage_snapshots (snapshot_date DESC);
