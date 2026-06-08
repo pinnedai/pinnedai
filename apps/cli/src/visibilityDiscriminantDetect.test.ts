@@ -73,10 +73,6 @@ describe("detectVisibilityDiscriminant (Cipherwake Feature 3)", () => {
   });
 
   it("recognizes isPublic / published / draft / archived variants", () => {
-    const cases = [
-      { field: "isPublic", values: [`isPublic: true`, `isPublic: false`] },
-      { field: "published", values: [`published: "yes"`, `published: "no"`] },
-    ];
     // Note: isPublic-with-booleans doesn't match (we look for string
     // literals). We deliberately don't catch boolean discriminants in
     // 0.5.0-beta because false-positive risk is high (booleans are

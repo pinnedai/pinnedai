@@ -83,6 +83,15 @@ const CATALOG: CatalogEntry[] = [
       /broken images/i,
     ],
   },
+  {
+    command: "pinned generate (page-renders template SKIP semantics)",
+    effect: "ECONNREFUSED / 307 / auth-gated routes SKIP instead of FAIL; real 5xx still FAILS",
+    e2eTestFile: "pageRendersInfraSkip.e2e.test.ts",
+    stateAssertionPatterns: [
+      /PINNED INFRA FAILURE/,
+      /NOT a catch/i,
+    ],
+  },
 ];
 
 // Detector-only invariants — these aren't state mutators of the

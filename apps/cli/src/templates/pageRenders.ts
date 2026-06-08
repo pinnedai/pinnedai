@@ -85,17 +85,31 @@ const SOFT_404_MARKERS = [
   "NEXT_NOT_FOUND",                          // Next.js notFound() exception name
 ];
 
-// Auth-gated page detector — re-uses the same shape as auth-required's
-// validator. Login-redirect, login-form, or bare 401/403 all mean
-// "this page is gated; page-renders pin is out of scope." The
-// auth-required pin (if one exists for this route) covers the auth
-// contract separately.
+// 0.5.0-beta.2 (Cipherwake P0): the page-renders pin is structurally
+// asking "does this page render without crashing?" — and a 3xx
+// REDIRECT is not "the page rendered." The original detector tried
+// to recognize only login-shaped redirects (matching login / signin /
+// auth / account in the Location header), which missed:
+//   - root-redirect for unauthenticated users (admin route to /)
+//   - tenant-redirect (foo route to /tenant-picker)
+//   - rate-limit shed (any route to /try-again-later)
+//   - any custom redirect path that doesn't carry the magic words
+//
+// In every one of those, the page-renders pin would fail with "non-
+// success status" and the hook-failure mechanism would surface it
+// as a regression in chat on every prompt. That's the phantom-
+// regression class Cipherwake reported.
+//
+// Fix: page-renders pins SKIP on ANY 3xx. The pin's contract is
+// "the resolved page rendered correctly"; if the framework chose to
+// redirect, that's outside the page-renders pin's scope (an
+// auth-required pin / redirect-shape pin can assert on it instead).
 async function looksAuthGated(res: Response): Promise<boolean> {
   if (res.status === 401 || res.status === 403) return true;
-  if (res.status >= 300 && res.status < 400) {
-    const loc = res.headers.get("location") || "";
-    if (/\\b(login|signin|sign-in|auth|account)\\b/i.test(loc)) return true;
-  }
+  // ANY 3xx redirect = out of scope for page-renders. This includes
+  // 301/302/303/307/308 to login, root, tenant-picker, retry-later,
+  // and anything else the framework / middleware decided to do.
+  if (res.status >= 300 && res.status < 400) return true;
   if (res.status >= 200 && res.status < 300) {
     const body = await res.clone().text().catch(() => "");
     const hasPasswordInput = /<input[^>]*type=["']?password["']?/i.test(body);
@@ -148,7 +162,16 @@ describe("pinned: page-renders GET " + ROUTE, () => {
     }
   });
 
-  it.skipIf(previewMissing && !forceRequire)("renders without crashing", async () => {
+  // 0.5.0-beta.2 (Cipherwake P0): wrap the test body in pinnedWrapInfra
+  // so PinnedInfraFailure thrown by pinnedFetch on ECONNREFUSED /
+  // DNS / timeout / 502-503-504-retries-exhausted does NOT register
+  // as a catch. The infra failure prompt explicitly tells the user
+  // "preview environment issue, NOT a catch — \`pinned test\`'s
+  // catch ledger will NOT increment." Without this wrap, a dead
+  // PREVIEW_URL (e.g. the dev server stopped) would surface as a
+  // regression in chat on every prompt — the phantom-regression
+  // class.
+  it.skipIf(previewMissing && !forceRequire)("renders without crashing", pinnedWrapInfra(\`page-renders GET \${ROUTE}\`, async () => {
     const url = PREVIEW_URL!.replace(/\\/$/, "") + ROUTE;
     const res = await pinnedFetch(url, {
       method: "GET",
@@ -156,9 +179,9 @@ describe("pinned: page-renders GET " + ROUTE, () => {
       redirect: "manual",
     });
 
-    // Auth-gated page — out of scope for page-renders. The auth-required
-    // pin for this route covers the auth contract; we don't want to
-    // false-fail because a login page rendered correctly.
+    // Out of scope: any 3xx redirect (auth, root, tenant-picker, etc.)
+    // and login-shaped 2xx pages. See looksAuthGated above. The
+    // auth-required pin handles the gating contract separately.
     if (await looksAuthGated(res)) return;
 
     if (res.status !== 200 && res.status !== 304) {
@@ -197,7 +220,7 @@ describe("pinned: page-renders GET " + ROUTE, () => {
     }
     expect(res.status).toBeGreaterThanOrEqual(200);
     expect(res.status).toBeLessThan(400);
-  });
+  }));
 });
 `;
 

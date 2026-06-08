@@ -2,6 +2,40 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.2] — 2026-06-07
+
+P0 fix: page-renders pins were FALSE-FAILing on unreachable / auth-gated routes, and hook-failure was injecting phantom regressions into every prompt — the "mute-magnet" pattern Cipherwake reported.
+
+### Fixed (P0) — page-renders pins now SKIP on unreachable + any 3xx redirect
+
+Two bugs converged on the same symptom (Pinned reporting "21–23 regressions caught" on every prompt against a healthy prod):
+
+1. **`pinnedFetch` correctly throws `PinnedInfraFailure` on ECONNREFUSED / DNS / timeout / 502-503-504-retries-exhausted, but the page-renders test body wasn't wrapped in `pinnedWrapInfra`.** The infra failure bubbled up as a regular test failure → counted as a catch → surfaced as a phantom regression. `pinnedWrapInfra` was defined in `sharedFetch.ts` but never used by any template. Now wrapped on page-renders.
+
+2. **The auth-gated detector only skipped 3xx redirects whose Location header matched `/login/signin/sign-in/auth/account`.** Routes that 307 to root (`/admin → /`), tenant-picker (`/foo → /tenant-picker`), retry-later (`/* → /try-again-later`), or any custom non-login redirect path were scored as FAILURES. New behavior: page-renders SKIPS on ANY 3xx — the pin's contract is "the page rendered," and a redirect isn't a render. The auth-required pin (and any future redirect-shape pin) covers the redirect contract.
+
+### Added — `pageRendersInfraSkip.e2e.test.ts`
+
+Drives a generated page-renders pin via subprocess vitest against a real HTTP server. 5 cases, all pass:
+- ECONNREFUSED → output contains "PINNED INFRA FAILURE" + "NOT a catch"
+- 307 to /login → SKIPS (exit 0, no "PINNED FAILURE")
+- 307 to root (NO "login" in Location) → still SKIPS (any 3xx is out of scope)
+- Real 500 → FAILS with "PINNED FAILURE" (the real case still caught)
+- No PREVIEW_URL → SKIPS quietly (preserved)
+
+The catalog test (`commandE2ECatalog.test.ts`) now registers this file so it can't be deleted without tripping the discipline check.
+
+### Out of scope this release
+
+- Same wrap-in-infra fix has to land on the other HTTP templates (auth-required, idempotent, rate-limit, etc.) — they share the same hole. Tracked separately; the page-renders fix addresses the specific Cipherwake repro.
+- The "hook caching unreachable failures and re-surfacing them" half: with this template-level fix, the hook never receives an infra failure as a "catch" in the first place (vitest output now carries "PINNED INFRA FAILURE" + "NOT a catch" markers, which the classifier honors). A follow-up sweep over the cached `.last-status.json` to retroactively drop infra-classified entries can land in 0.6.x.
+
+### Test matrix
+
+- 497/497 vitest (+5 from this fix)
+- 42/42 dyad sweep
+- Real-server e2e proves SKIP-on-ECONNREFUSED, SKIP-on-307-to-anywhere, FAIL-on-500
+
 ## [0.5.0-beta.1] — 2026-06-07
 
 Cipherwake field-reported four asks from a real Next.js 15 dogfood session. All four ship in this release. The headline is **browser-mode render pins** — Pinned can now load each route in a real headless browser and assert what the HTTP-only render template is structurally blind to: that images actually render and the page is alive in a browser.
