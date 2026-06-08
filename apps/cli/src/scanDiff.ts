@@ -3852,7 +3852,34 @@ export function detectEnumDrift(filesByPath: Map<string, string>): EnumDriftHit[
     if (missingFromProducer.length === expectedValues.length && observedValues.length < 3) continue;
     // Confidence tier: shared vocabulary → confirmed; zero overlap →
     // review. Most cross-table column-name collisions land in review.
-    const confidence: EnumDriftHit["confidence"] = overlap.length > 0 ? "confirmed" : "review";
+    //
+    // 0.5.0-beta.4 (Cipherwake 0.6.0 ask #3): promote enum-drift on a
+    // VISIBILITY discriminant out of "review" even when overlap is
+    // zero. `col=status missing=["live"]` is the literal draft-leak
+    // class — the highest-value pattern Pinned can surface — and
+    // suppressing it by default is backwards. The conventional
+    // public-visibility tokens (live / published / active / public /
+    // available / approved / online) on a status-shaped column are
+    // a real signal: the consumer is gating on a visibility value
+    // the producer no longer emits → draft items render as if live.
+    let confidence: EnumDriftHit["confidence"] = overlap.length > 0 ? "confirmed" : "review";
+    const VISIBILITY_COLS = new Set([
+      "status", "published", "visibility", "is_public", "isPublic",
+      "draft", "is_draft", "isDraft", "archived", "is_archived",
+      "live", "state", "lifecycle",
+    ]);
+    const CONVENTIONAL_PUBLIC_TOKENS = new Set([
+      "live", "published", "active", "public", "available",
+      "approved", "online", "ready", "visible",
+    ]);
+    if (confidence === "review" && VISIBILITY_COLS.has(column)) {
+      const hasConventionalPublicMissing = missingFromProducer.some((v) =>
+        CONVENTIONAL_PUBLIC_TOKENS.has(String(v).toLowerCase())
+      );
+      if (hasConventionalPublicMissing) {
+        confidence = "confirmed";
+      }
+    }
 
     // Collect producer samples (3 max).
     const samples: Array<{ filePath: string; column: string; value: string }> = [];

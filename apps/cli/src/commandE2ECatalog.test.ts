@@ -114,6 +114,11 @@ const DETECTORS: DetectorEntry[] = [
     e2eTestFile: "visibilityDiscriminantDetect.test.ts",
     stateAssertionPatterns: [/detectVisibilityDiscriminant/, /toHaveLength\(/],
   },
+  {
+    detector: "tiered auto-pin + enum-drift promotion (Cipherwake 0.6.0 #2+#3)",
+    e2eTestFile: "tieredAutoPin.test.ts",
+    stateAssertionPatterns: [/LOW_VALUE_TEMPLATES/, /confidence/, /confirmed/],
+  },
 ];
 
 const SRC_DIR = join(process.cwd(), "src");

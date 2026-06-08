@@ -2,6 +2,41 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.4] — 2026-06-08
+
+Two more 0.6.0 asks: stop dumping LOW-tier pins on init, and promote enum-drift on visibility discriminants out of the Review tier.
+
+### Cipherwake 0.6.0 ask #2 — auto-pin by VALUE (HIGH default, LOW opt-in)
+
+`init --auto` and `pinned protect --all` used to auto-write LOW-tier templates that produce more noise than catches:
+- `page-renders` (generic, fires on every page; the bug from 0.5.0-beta.2 was a direct consequence)
+- `happy-path-with-side-effect` (broad, requires X-Pinned-Side-Effect wrapper)
+- `journey` (broad routes-by-shared-session/redirect)
+
+New default: those three are **deferred** — listed in the summary, not auto-pinned. Users opt in with `pinned protect --include-low` after they've seen the HIGH-value pins working. Real-world impact: an init that was producing ~27 pins (13 of them noisy page-rendersy/page-accessibility) now produces just the high-leverage set.
+
+### Cipherwake 0.6.0 ask #3 — promote enum-drift on status discriminant out of "review"
+
+`enum-drift` was tiered "confirmed" only when consumer reads had ≥1 overlap with the producer's emitted vocabulary. With zero overlap → "review" tier → not auto-pinned → suppressed by default. But `col=status missing=["live"]` IS the literal draft-leak class — the highest-value pattern Pinned can surface unprompted. Suppressing it by default was backwards.
+
+Fix: when the column is a known visibility-discriminant name (`status`, `published`, `visibility`, `isPublic`, `draft`, `archived`, `live`, `state`, `lifecycle`, etc.) AND any missing value is a conventional public token (`live`, `published`, `active`, `public`, `available`, `approved`, `online`, `ready`, `visible`), the hit is promoted to `confirmed` regardless of overlap. Other columns and other missing-value shapes stay in "review" — the false-positive risk is bounded to the visibility-discriminant pattern.
+
+### Tests
+
+`tieredAutoPin.test.ts` — 7 cases covering:
+- status column with missing=["live"] + zero overlap → confirmed (the promotion)
+- non-visibility column with zero overlap → still review (no false promotion)
+- status column with zero overlap but no conventional-public-missing → still review
+- LOW_VALUE_TEMPLATES set declared at both call sites (init --auto + protect --all)
+- deferral banner + --include-low flag present in source
+
+Plus the existing 6 detector tests + the catalog now references this file.
+
+### Test matrix
+
+- 507/507 vitest (+8 new from tieredAutoPin)
+- 42/42 dyad sweep
+
 ## [0.5.0-beta.3] — 2026-06-08
 
 First slice of the 0.6.0 architecture queue: durable `.pinned/` history now survives `pinned uninstall` so reinstalling restores accumulated value rather than starting from zero.

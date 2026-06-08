@@ -1657,8 +1657,31 @@ program
         // shape: any suggestion whose route is well-formed AND whose
         // suggestedPin parses back is auto-addable. Counters track
         // separately for the summary line.
+        // 0.5.0-beta.4 (Cipherwake 0.6.0 ask #2): tier auto-pin by VALUE.
+        // LOW-value templates produce noise more than catches in
+        // dogfood:
+        //   - page-renders (generic) — fires on every page; high FP
+        //     rate on auth-gated / 3xx / unreachable (the bug fixed
+        //     in 0.5.0-beta.2). Real-world dogfood produced 13
+        //     page-accessibility pins on one repo.
+        //   - happy-path-with-side-effect (broad) — requires the
+        //     X-Pinned-Side-Effect wrapper that real apps don't have.
+        //   - journey — broad routes-by-shared-session/redirect.
+        // HIGH-value templates (server-action-write, paid-api-call,
+        // env-required, enum-drift on a visibility column,
+        // visibility-invariant, supabase-column, expected-header,
+        // stripe-event-handled, cron-handler, secret-not-public,
+        // lockfile-integrity) auto-pin by default. LOW are still
+        // SURFACED in the ambiguous list (so the user knows they
+        // exist), they just aren't auto-written without explicit opt-in.
+        const LOW_VALUE_TEMPLATES = new Set<string>([
+          "page-renders",
+          "happy-path-with-side-effect",
+          "journey",
+        ]);
         const safe: typeof baselineResult.suggestions = [];
         const ambiguous: typeof baselineResult.suggestions = [];
+        const lowDeferred: typeof baselineResult.suggestions = [];
         for (const s of baselineResult.suggestions) {
           // Must have a real route + suggestedPin
           if (!s.route || !s.suggestedPin) {
@@ -1675,6 +1698,11 @@ program
           const reparsed = parseClaims(s.suggestedPin);
           if (reparsed.length !== 1) {
             ambiguous.push(s);
+            continue;
+          }
+          // LOW-tier deferral — listed in summary, not auto-pinned.
+          if (LOW_VALUE_TEMPLATES.has(s.template)) {
+            lowDeferred.push(s);
             continue;
           }
           safe.push(s);
@@ -2168,6 +2196,12 @@ program
         }
         baselineSuggested =
           ambiguous.length + Math.max(0, safe.length - MAX_BASELINE_AUTO_PINS);
+        // 0.5.0-beta.4: surface the low-tier deferral count so the user
+        // knows the LOW templates exist but were intentionally not
+        // auto-pinned. They can opt in later with `pinned protect --include-low`.
+        if (lowDeferred.length > 0) {
+          out(`  ↻ ${lowDeferred.length} low-tier suggestion${lowDeferred.length === 1 ? "" : "s"} deferred to opt-in (page-renders / journey / happy-path). Run \`pinned protect --include-low\` to add them.`);
+        }
       } catch (e) {
         // Baseline failure should NEVER block init. Surface as a warning.
         out(`  ! baseline scan failed: ${(e as Error).message} — skipping auto-pin`);
@@ -8497,6 +8531,10 @@ program
     "Protect every detected risk without asking (use in CI / scripts)."
   )
   .option(
+    "--include-low",
+    "Also include LOW-tier suggestions (page-renders / journey / happy-path-with-side-effect). Default: HIGH-value templates only — LOW templates are noisy on dogfood (per Cipherwake 0.6.0 ask #2)."
+  )
+  .option(
     "--dry-run",
     "Print what would be pinned without writing files."
   )
@@ -8507,7 +8545,7 @@ program
   )
   .option("--quiet", "Suppress the pinned banner header.")
   .action(
-    async (opts: { all?: boolean; dryRun?: boolean; dir: string }) => {
+    async (opts: { all?: boolean; includeLow?: boolean; dryRun?: boolean; dir: string }) => {
       printBanner();
       assertInsideDir(opts.dir, process.cwd());
       const root = process.cwd();
@@ -8519,14 +8557,41 @@ program
       const existingPins = existsSync(opts.dir)
         ? readRegistry(opts.dir).claims
         : [];
-      const result = scanDiffFull({
+      const fullResult = scanDiffFull({
         changedFiles: changed,
         prBodyClaims: [],
         existingPins,
       });
+      // 0.5.0-beta.4 (Cipherwake 0.6.0 ask #2): tier filter. Without
+      // --include-low we drop LOW-value templates from the proposal
+      // stream so `pinned protect --all` doesn't dump 13 page-renders
+      // pins onto the user. The same set as init --auto's lowDeferred.
+      const LOW_VALUE_TEMPLATES_PROTECT = new Set<string>([
+        "page-renders",
+        "happy-path-with-side-effect",
+        "journey",
+      ]);
+      const droppedLow: typeof fullResult.suggestions = [];
+      const keptSuggestions: typeof fullResult.suggestions = [];
+      for (const s of fullResult.suggestions) {
+        if (!opts.includeLow && LOW_VALUE_TEMPLATES_PROTECT.has(s.template)) {
+          droppedLow.push(s);
+        } else {
+          keptSuggestions.push(s);
+        }
+      }
+      const result = { ...fullResult, suggestions: keptSuggestions };
       if (result.suggestions.length === 0) {
-        out("✓ No unpinned risks detected. Nothing to protect.");
+        if (droppedLow.length > 0) {
+          out(`✓ No HIGH-tier unpinned risks. ${droppedLow.length} low-tier suggestion${droppedLow.length === 1 ? "" : "s"} available with --include-low.`);
+        } else {
+          out("✓ No unpinned risks detected. Nothing to protect.");
+        }
         return;
+      }
+      if (droppedLow.length > 0) {
+        out(`↻ ${droppedLow.length} low-tier suggestion${droppedLow.length === 1 ? "" : "s"} deferred (run with --include-low to include them).`);
+        out("");
       }
 
       out(`Pinned can protect ${result.suggestions.length} unpinned risk${result.suggestions.length === 1 ? "" : "s"}:`);
