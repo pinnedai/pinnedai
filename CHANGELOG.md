@@ -2,6 +2,48 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.3] — 2026-06-08
+
+First slice of the 0.6.0 architecture queue: durable `.pinned/` history now survives `pinned uninstall` so reinstalling restores accumulated value rather than starting from zero.
+
+### Fixed (Cipherwake 0.6.0 ask #4) — `pinned uninstall` no longer wipes durable history
+
+Previous behavior: `pinned uninstall --yes` did `rmSync(".pinned/", recursive)` → erased AI lessons, repo-stats, suppressions, contracts. Reinstalling then started from a blank slate; per-detector + per-model history was permanently gone. The user explicitly flagged this as breaking the moat: "lessons + stats are part of the durable value — preserve them across uninstall/reinstall like pins."
+
+New behavior: by default, durable artifacts survive uninstall. Ephemeral cache (`.last-cli-edit`, `base-url.json`, `last-status.json`) is cleaned.
+
+Preserved by default:
+- `.pinned/ai-lessons.md`
+- `.pinned/lessons.json`
+- `.pinned/repo-stats.json` (per-detector + per-model history)
+- `.pinned/suppressions.json` (FP suppressions)
+- `.pinned/smoke-history.json` (smoke pass/fail trail)
+- `.pinned/contracts/` (cross-repo enum contracts — user-authored)
+- `.pinned/analytics-config.json`
+
+Removed on uninstall (ephemeral only):
+- `.pinned/.last-cli-edit`
+- `.pinned/base-url.json`
+- `.pinned/last-status.json`
+- anything else not in the durable allowlist
+
+### Added — `--all-state` flag for true clean slate
+
+`pinned uninstall --all-state` wipes the entire `.pinned/` directory including durable history. For users who genuinely want a fresh start.
+
+### Tests
+
+`uninstall.e2e.test.ts` now has 15 cases (+2 new). The new cases assert: (a) every durable file is present after default uninstall, ephemeral cache is gone, (b) `--all-state` wipes everything, (c) repo-stats.json content survives byte-for-byte across uninstall.
+
+### Investigation surfaced separately — `api.pinnedai.dev` is down
+
+The Vercel-hosted backend returns `DEPLOYMENT_NOT_FOUND`. Architecture intent is the Cloudflare Worker at `apps/edge/` (per the commented-out `routes = [{ pattern = "api.pinnedai.dev" }]` in `wrangler.toml`), but it was never deployed to the production domain. Impact is narrower than the analytics-spec implied — only `GITHUB_ACTIONS=true` runs invoke `llmExtract` / `llmSummarize`; local `npx pinnedai` is gated and falls back to regex-only without ever calling the dead endpoint. `pinned analytics upload` is opt-in and silently fails for users who enabled it. Tracked separately (deploy needs CF credentials I don't have); a CLI hardening pass to surface a clear "hosted endpoint unreachable" warning is queued too.
+
+### Test matrix
+
+- 499/499 vitest (+2 new uninstall cases)
+- 42/42 dyad sweep
+
 ## [0.5.0-beta.2] — 2026-06-07
 
 P0 fix: page-renders pins were FALSE-FAILing on unreachable / auth-gated routes, and hook-failure was injecting phantom regressions into every prompt — the "mute-magnet" pattern Cipherwake reported.

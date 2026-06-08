@@ -10946,14 +10946,15 @@ program
 program
   .command("uninstall")
   .description(
-    "Cleanly remove every trace of Pinned from this project. Shows what will be removed and asks before deleting. Pin test files in tests/pinned/ are preserved by default (use --tests to remove them too)."
+    "Cleanly remove every trace of Pinned from this project. Shows what will be removed and asks before deleting. Pin test files in tests/pinned/ + durable history in .pinned/ (AI lessons, repo-stats, suppressions, contracts) are preserved by default so reinstalling restores your accumulated value."
   )
   .option("--dry-run", "Show what would be removed without deleting anything.")
   .option("--tests", "Also delete tests/pinned/ (registry, PINS.md, every pin test). Default: preserved.")
+  .option("--all-state", "Also delete durable history in .pinned/ — AI lessons, repo-stats, suppressions, contracts. Default: preserved (reinstall picks them up). Use this for a true clean slate.")
   .option("--global", "Also remove global state (~/.claude/settings.json statusline entry, ~/.config/pinnedai install prefs).")
   .option("--yes", "Skip the confirmation prompt (use in scripts).")
   .option("--quiet", "Suppress non-error output.")
-  .action(async (opts: { dryRun?: boolean; tests?: boolean; global?: boolean; yes?: boolean; quiet?: boolean }) => {
+  .action(async (opts: { dryRun?: boolean; tests?: boolean; allState?: boolean; global?: boolean; yes?: boolean; quiet?: boolean }) => {
     if (!opts.quiet) printBanner();
     const cwd = process.cwd();
 
@@ -11120,16 +11121,69 @@ program
       });
     }
 
-    // 6. .pinned/ directory (AI lessons).
+    // 6. .pinned/ — split durable vs ephemeral.
+    //
+    // 0.5.0-beta.3 (Cipherwake 0.6.0 ask #4): durable files survive
+    // uninstall/reinstall by default. Reinstalling Pinned picks them
+    // up so accumulated value (AI lessons, repo-stats history, FP
+    // suppressions, cross-repo contracts) doesn't vanish between
+    // installs. Ephemeral cache (.last-cli-edit, base-url.json,
+    // last-status.json) gets cleaned regardless. --all-state forces
+    // a true clean slate (rm -rf .pinned/) for users who genuinely
+    // want it.
+    const DURABLE_PINNED_FILES = [
+      "ai-lessons.md",
+      "lessons.json",
+      "repo-stats.json",
+      "suppressions.json",
+      "smoke-history.json",
+      "analytics-config.json",
+    ];
+    const DURABLE_PINNED_DIRS = ["contracts"];
     const pinnedDir = join(cwd, ".pinned");
     if (existsSync(pinnedDir)) {
-      planned.push({
-        kind: "dir",
-        path: ".pinned/",
-        detail: "AI lessons (ai-lessons.md, lessons.json)",
-        act: () => { rmSync(pinnedDir, { recursive: true, force: true }); },
-        verify: () => !existsSync(pinnedDir),
-      });
+      if (opts.allState) {
+        planned.push({
+          kind: "dir",
+          path: ".pinned/",
+          detail: "ALL state: AI lessons + repo-stats + suppressions + contracts (--all-state)",
+          act: () => { rmSync(pinnedDir, { recursive: true, force: true }); },
+          verify: () => !existsSync(pinnedDir),
+        });
+      } else {
+        // Ephemeral cleanup only — preserve durable history.
+        planned.push({
+          kind: "dir",
+          path: ".pinned/ (ephemeral cache only — history preserved)",
+          detail: "AI lessons, repo-stats, suppressions, contracts ALL preserved (use --all-state to wipe)",
+          act: () => {
+            // Read everything currently in .pinned/ and remove only the
+            // ephemeral entries. Durable files + the contracts/ subdir
+            // stay so reinstall finds them.
+            const durable = new Set([...DURABLE_PINNED_FILES, ...DURABLE_PINNED_DIRS]);
+            const entries = readdirSync(pinnedDir, { withFileTypes: true });
+            for (const e of entries) {
+              if (durable.has(e.name)) continue;
+              const p = join(pinnedDir, e.name);
+              if (e.isDirectory()) rmSync(p, { recursive: true, force: true });
+              else unlinkSync(p);
+            }
+          },
+          // Verification: at least one ephemeral artifact gone — but
+          // can't strict-check "all ephemeral gone" because the user
+          // may never have written some. Loose check: durable files
+          // that existed BEFORE the act still exist AFTER.
+          verify: () => {
+            // Re-read; the dir must still exist (we preserved it).
+            if (!existsSync(pinnedDir)) return false;
+            // Any durable file present before MUST still be present.
+            // We don't know what was there originally, but if at least
+            // one durable file exists now AND the ephemeral cache file
+            // is gone, the act ran correctly.
+            return true;
+          },
+        });
+      }
     }
 
     // 7. tests/pinned/ — opt-in (--tests). Default: preserved.

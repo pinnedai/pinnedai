@@ -41,7 +41,28 @@ function setupFullyInstalled() {
   mkdirSync(join(dir, ".github/workflows"), { recursive: true });
   mkdirSync(join(dir, ".pinnedai"), { recursive: true });
   mkdirSync(join(dir, ".pinned"), { recursive: true });
+  mkdirSync(join(dir, ".pinned/contracts"), { recursive: true });
   mkdirSync(join(dir, "tests/pinned"), { recursive: true });
+
+  // Durable .pinned/ artifacts — must survive a default uninstall
+  // (Cipherwake 0.6.0 ask #4).
+  writeFileSync(join(dir, ".pinned/ai-lessons.md"), "# AI lessons\n- rule one\n");
+  writeFileSync(join(dir, ".pinned/lessons.json"), '{"lessons":[]}\n');
+  writeFileSync(
+    join(dir, ".pinned/repo-stats.json"),
+    '{"version":1,"detectors":{"enum-drift":{"hits":7}}}\n'
+  );
+  writeFileSync(
+    join(dir, ".pinned/suppressions.json"),
+    '{"suppressions":[]}\n'
+  );
+  writeFileSync(
+    join(dir, ".pinned/contracts/status.json"),
+    '{"column":"status","values":["live","draft"]}\n'
+  );
+  // Ephemeral — should NOT survive (cache, not durable history).
+  writeFileSync(join(dir, ".pinned/.last-cli-edit"), "0001-01-01T00:00:00Z\n");
+  writeFileSync(join(dir, ".pinned/base-url.json"), '{"url":"http://localhost:3000"}\n');
 
   // The exact shape `pinned init` installs (verified against
   // claudeSettings.ts and the PostToolUse installer in cli.ts).
@@ -107,10 +128,34 @@ describe("pinned uninstall --yes — filesystem assertions, not stdout", () => {
     expect(existsSync(join(dir, ".pinnedai"))).toBe(false);
   });
 
-  it("removes .pinned/ from disk", () => {
+  it("PRESERVES .pinned/ durable history on default uninstall (Cipherwake 0.6.0 ask #4)", () => {
     setupFullyInstalled();
     runUninstall();
+    // Durable history MUST survive — that's the moat. Reinstalling
+    // Pinned should restore accumulated value, not start from zero.
+    expect(existsSync(join(dir, ".pinned"))).toBe(true);
+    expect(existsSync(join(dir, ".pinned/ai-lessons.md"))).toBe(true);
+    expect(existsSync(join(dir, ".pinned/lessons.json"))).toBe(true);
+    expect(existsSync(join(dir, ".pinned/repo-stats.json"))).toBe(true);
+    expect(existsSync(join(dir, ".pinned/suppressions.json"))).toBe(true);
+    expect(existsSync(join(dir, ".pinned/contracts/status.json"))).toBe(true);
+    // Ephemeral cache cleaned.
+    expect(existsSync(join(dir, ".pinned/.last-cli-edit"))).toBe(false);
+    expect(existsSync(join(dir, ".pinned/base-url.json"))).toBe(false);
+  });
+
+  it("removes EVERYTHING in .pinned/ when --all-state is passed", () => {
+    setupFullyInstalled();
+    runUninstall(["--all-state"]);
     expect(existsSync(join(dir, ".pinned"))).toBe(false);
+  });
+
+  it("repo-stats.json content survives byte-for-byte across default uninstall", () => {
+    setupFullyInstalled();
+    const before = readFileSync(join(dir, ".pinned/repo-stats.json"), "utf8");
+    runUninstall();
+    const after = readFileSync(join(dir, ".pinned/repo-stats.json"), "utf8");
+    expect(after).toBe(before);
   });
 
   it("removes the PostToolUse hook entry from .claude/settings.json (Cipherwake bug 2)", () => {
