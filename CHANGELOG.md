@@ -2,6 +2,40 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.4.5] — 2026-06-07
+
+`pinned uninstall --yes` was a complete no-op that falsely reported success. Cipherwake caught it in the field: every ✓ line printed while nothing was actually removed — the workflow file, `.pinnedai/`, `.pinned/`, and both `.claude/settings.json` hooks all survived. Three independent bugs converged into one identical symptom.
+
+### Fixed (P0) — `require("node:fs")` calls threw `ReferenceError`, inner `catch {}` swallowed it
+
+`apps/cli/src/cli.ts` had `act: () => { try { (require("node:fs") as ...).unlinkSync(...); } catch {} }` for every file/dir removal. tsup never emitted the `__require` shim into `dist/cli.js`, so every `__require("fs")` call threw `ReferenceError: __require is not defined`. The inner `catch {}` ate it, the outer loop saw no error, and `✓ ${path}` printed unconditionally.
+
+Fix: added `rmSync` to the top-level `node:fs` import (`unlinkSync` was already there) and replaced every `require("node:fs")` site with direct calls. Same change in `claudeSettings.ts:260` for the compose-wrapper deletion.
+
+### Fixed (P0) — PostToolUse hook substring check never matched
+
+The detection ran `step.command.includes("pinned hook-postedit")`. The installed command is `"npx --no-install pinnedai hook-postedit"` — substring `"pinned "` (with space) never appears in `"pinnedai "`. Detection always returned false; the PostToolUse removal step was never even planned.
+
+Fix: moved the detection + removal into a dedicated `uninstallClaudePostToolUseHook()` in `claudeSettings.ts` with a loose `isPinnedHookCommand(cmd, marker)` helper that accepts either `pinnedai` OR a word-boundaried `pinned` alongside the marker (`hook-postedit` / `hook-failure`).
+
+### Fixed (P0) — UserPromptSubmit failure hook had no removal logic at all
+
+`uninstall` only attempted statusLine + PostToolUse. The `hook-failure` entry installed by `installClaudeFailureHook()` was never removed — users believed Pinned was gone but the hook kept firing.
+
+Fix: added `uninstallClaudeFailureHook()` parallel to `uninstallClaudePostToolUseHook()`. Both are planned as separate `.claude/settings.json` entries so each gets its own ✓/✗ line.
+
+### Fixed — `✓` now requires post-state verification
+
+The output loop now runs a `verify()` probe after every `act()` and emits `✗ <path> — still present after removal attempt` if the target survived. The final banner counts failures and exits with code 1 if any step couldn't be verified. Mirrors the discipline from `hookPostedit.realedit.test.ts`: trust the post-state, not the action's return value.
+
+### Added — `uninstall.e2e.test.ts` (13 cases that all would have failed in 0.4.4)
+
+Drives `node dist/cli.js uninstall --yes` as a subprocess and asserts on filesystem + JSON state after exit. Covers: file removal (`.github/workflows/pinned.yml`, `.pinnedai/`, `.pinned/`), settings.json entry removal (statusLine, PostToolUse, UserPromptSubmit), `tests/pinned/` preservation default + `--tests` override, exit code, ✓-line presence, and two robustness cases (settings.json with only Pinned → becomes empty; non-Pinned PostToolUse entries are preserved).
+
+### Discipline
+
+Fifth in-a-row "command prints success while doing nothing." Same shape every time: an inner try/catch eats the failure, or a guard probe never matches, and the user-facing message is decoupled from what actually happened on disk. New rule baked into the E2E pattern: **every `✓` must be paired with a filesystem read or JSON parse that confirms the post-state.**
+
 ## [0.4.4] — 2026-06-07
 
 0.4.3's path-alias support passed my tests but **still failed in the real world.** Cipherwake reproduced again on socialideagen: `pinned blast-radius components/IdeaLanding.tsx → No smoke pins affected`. The fix below is the actual cause, and I added the test that would have caught it.

@@ -186,6 +186,17 @@ export function wireAgents(opts: WireOptions = {}): WireResult[] {
   return results;
 }
 
+// Does this agent file currently carry our Pinned-managed block?
+// Used by `pinned uninstall` to plan removal AND to verify post-state.
+export function hasPinnedAgentBlock(absPath: string): boolean {
+  if (!existsSync(absPath)) return false;
+  try {
+    return readFileSync(absPath, "utf8").includes(BEGIN_MARK);
+  } catch {
+    return false;
+  }
+}
+
 // Remove the Pinned-managed block from an agent file. Used by
 // `pinned uninstall-agent-rules`. Preserves any other content.
 export function unwireAgent(absPath: string): "removed" | "not-found" | "no-block" {

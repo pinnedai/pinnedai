@@ -13,6 +13,7 @@ import {
   mkdirSync,
   copyFileSync,
   renameSync,
+  unlinkSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 
@@ -257,14 +258,101 @@ export function uninstallClaudeStatusline(repoRoot: string): "removed" | "absent
     // Best-effort delete of the wrapper script file.
     try {
       const wrapperPath = `${repoRoot}/.pinnedai/statusline-combined.sh`;
-      const fs = require("node:fs") as typeof import("node:fs");
-      if (fs.existsSync(wrapperPath)) fs.unlinkSync(wrapperPath);
+      if (existsSync(wrapperPath)) unlinkSync(wrapperPath);
     } catch { /* non-fatal */ }
     return "removed";
   }
 
   // Case 3: third-party command, never Pinned-managed.
   return "absent";
+}
+
+// 0.4.5 P0 (Cipherwake-reported): the previous `pinned uninstall` was
+// only removing the statusLine entry from .claude/settings.json — both
+// the PostToolUse auto-verify hook AND the UserPromptSubmit failure
+// hook were left wired up, so Pinned kept firing after the user
+// "uninstalled" it. These two helpers do the surgery.
+//
+// Substring check is intentionally loose: we accept anything where the
+// command contains both "pinnedai" (or "pinned") AND the marker name.
+// The previous uninstaller's substring `"pinned hook-postedit"` failed
+// to match the actual installed command `"npx --no-install pinnedai
+// hook-postedit"` — the bare "pinned " prefix never appears in it.
+function isPinnedHookCommand(cmd: unknown, marker: string): boolean {
+  if (typeof cmd !== "string") return false;
+  const c = cmd.toLowerCase();
+  if (!c.includes(marker.toLowerCase())) return false;
+  return c.includes("pinnedai") || /\bpinned\b/.test(c);
+}
+
+export function uninstallClaudePostToolUseHook(repoRoot: string): "removed" | "absent" {
+  const path = settingsPath(repoRoot);
+  if (!existsSync(path)) return "absent";
+  const settings = readSettings(path);
+  const hooks = settings.hooks;
+  if (!hooks?.PostToolUse?.length) return "absent";
+
+  const filtered = hooks.PostToolUse.filter((entry) =>
+    !(entry?.hooks ?? []).some((h) => isPinnedHookCommand(h?.command, "hook-postedit"))
+  );
+  if (filtered.length === hooks.PostToolUse.length) return "absent";
+
+  if (filtered.length === 0) {
+    delete hooks.PostToolUse;
+  } else {
+    hooks.PostToolUse = filtered;
+  }
+  if (Object.keys(hooks).length === 0) {
+    delete (settings as { hooks?: unknown }).hooks;
+  }
+  writeSettingsAtomic(path, settings);
+  return "removed";
+}
+
+export function uninstallClaudeFailureHook(repoRoot: string): "removed" | "absent" {
+  const path = settingsPath(repoRoot);
+  if (!existsSync(path)) return "absent";
+  const settings = readSettings(path);
+  const hooks = settings.hooks;
+  if (!hooks?.UserPromptSubmit?.length) return "absent";
+
+  const filtered = hooks.UserPromptSubmit.filter((entry) =>
+    !(entry?.hooks ?? []).some((h) => isPinnedHookCommand(h?.command, "hook-failure"))
+  );
+  if (filtered.length === hooks.UserPromptSubmit.length) return "absent";
+
+  if (filtered.length === 0) {
+    delete hooks.UserPromptSubmit;
+  } else {
+    hooks.UserPromptSubmit = filtered;
+  }
+  if (Object.keys(hooks).length === 0) {
+    delete (settings as { hooks?: unknown }).hooks;
+  }
+  writeSettingsAtomic(path, settings);
+  return "removed";
+}
+
+// 0.4.5 — has-it-now check used after uninstall steps so the success
+// banner only fires if the post-state is actually clean. Same loose
+// substring check as the removers.
+export function claudeSettingsHasPinnedTraces(repoRoot: string): boolean {
+  const path = settingsPath(repoRoot);
+  if (!existsSync(path)) return false;
+  const settings = readSettings(path);
+  const cmd = settings.statusLine?.command ?? "";
+  if (cmd.includes("pinned") && cmd.includes("statusline")) return true;
+  for (const entry of settings.hooks?.PostToolUse ?? []) {
+    for (const h of entry?.hooks ?? []) {
+      if (isPinnedHookCommand(h?.command, "hook-postedit")) return true;
+    }
+  }
+  for (const entry of settings.hooks?.UserPromptSubmit ?? []) {
+    for (const h of entry?.hooks ?? []) {
+      if (isPinnedHookCommand(h?.command, "hook-failure")) return true;
+    }
+  }
+  return false;
 }
 
 export function installClaudeFailureHook(repoRoot: string): ClaudeInstallResult {

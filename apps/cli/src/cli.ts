@@ -17,6 +17,7 @@ import {
   readdirSync,
   lstatSync,
   unlinkSync,
+  rmSync,
 } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
@@ -10870,84 +10871,143 @@ program
     if (!opts.quiet) printBanner();
     const cwd = process.cwd();
 
-    type Removal = { kind: "file" | "block" | "dir"; path: string; detail?: string; act: () => void };
+    // 0.4.5 P0 (Cipherwake-reported): the prior uninstall was a no-op
+    // that falsely printed ✓ for every step. Three independent bugs:
+    //   (1) `require("node:fs")` calls — tsup never emitted the
+    //       `__require` shim, so every unlink/rmSync threw silently
+    //       and the inner `catch {}` ate the error.
+    //   (2) PostToolUse hook substring check looked for
+    //       "pinned hook-postedit" but the installed command is
+    //       "npx --no-install pinnedai hook-postedit" — the bare
+    //       "pinned " prefix never appears. Detection always missed.
+    //   (3) UserPromptSubmit / hook-failure had NO removal logic at
+    //       all — only PostToolUse was even attempted.
+    // Fix: use the top-level fs imports (not require), drop the inner
+    // try/catch (so the outer loop sees real errors), call dedicated
+    // claudeSettings.ts helpers for the hook surgery, and verify the
+    // post-state — ✓ prints only when the path/entry is actually gone.
+    type Removal = {
+      kind: "file" | "block" | "dir";
+      path: string;
+      detail?: string;
+      act: () => void;
+      // Re-check after act(). Returns true iff the thing is now gone.
+      verify: () => boolean;
+    };
     const planned: Removal[] = [];
 
     // 1. Git hooks — uninstall the Pinned-marked block from each.
-    const { uninstallHook } = await import("./gitHooks.js");
+    const { uninstallHook, isHookInstalled } = await import("./gitHooks.js");
     for (const name of ["pre-commit", "pre-push", "post-commit"] as const) {
-      planned.push({
-        kind: "block",
-        path: `.git/hooks/${name}`,
-        detail: "Pinned-managed block within hook",
-        act: () => { uninstallHook(cwd, name); },
-      });
+      if (isHookInstalled(cwd, name)) {
+        planned.push({
+          kind: "block",
+          path: `.git/hooks/${name}`,
+          detail: "Pinned-managed block within hook",
+          act: () => { uninstallHook(cwd, name); },
+          verify: () => !isHookInstalled(cwd, name),
+        });
+      }
     }
 
-    // 2. AI-coder rules blocks (CLAUDE.md, .cursorrules, etc.) — same
-    // marker-bounded removal as `uninstall-agent-rules`.
-    const { KNOWN_AGENT_TARGETS, unwireAgent } = await import("./agentConfig.js");
+    // 2. AI-coder rules blocks (CLAUDE.md, .cursorrules, etc.).
+    const { KNOWN_AGENT_TARGETS, unwireAgent, hasPinnedAgentBlock } = await import("./agentConfig.js");
     for (const t of KNOWN_AGENT_TARGETS) {
       const abs = join(cwd, t.path);
-      if (existsSync(abs)) {
+      if (existsSync(abs) && hasPinnedAgentBlock(abs)) {
         planned.push({
           kind: "block",
           path: t.path,
           detail: "Pinned-managed rules block",
           act: () => { unwireAgent(abs); },
+          verify: () => !hasPinnedAgentBlock(abs),
         });
       }
     }
 
-    // 3. Claude Code statusline entry (project-local .claude/settings.json).
+    // 3. Claude Code .claude/settings.json — statusline, PostToolUse
+    //    hook, UserPromptSubmit hook. Three separate plan entries so
+    //    each reports its own ✓/✗.
     const localClaudeSettings = join(cwd, ".claude", "settings.json");
     if (existsSync(localClaudeSettings)) {
-      try {
-        const { uninstallClaudeStatusline } = await import("./claudeSettings.js");
+      const {
+        uninstallClaudeStatusline,
+        uninstallClaudePostToolUseHook,
+        uninstallClaudeFailureHook,
+        isClaudeStatuslineInstalled,
+        claudeSettingsHasPinnedTraces,
+      } = await import("./claudeSettings.js");
+
+      if (isClaudeStatuslineInstalled(cwd)) {
         planned.push({
           kind: "block",
           path: ".claude/settings.json",
           detail: "Pinned statusline entry (compose-aware)",
           act: () => { uninstallClaudeStatusline(cwd); },
+          verify: () => !isClaudeStatuslineInstalled(cwd),
         });
-      } catch { /* helper missing — skip */ }
+      }
 
-      // 3b. PostToolUse hook entry (if installed by `pinned install-claude-hook`).
-      try {
-        const settings = JSON.parse(readFileSync(localClaudeSettings, "utf8")) as {
-          hooks?: { PostToolUse?: Array<{ hooks?: Array<{ command?: string }> }> };
-        };
-        const post = settings.hooks?.PostToolUse ?? [];
-        const hasPinnedHook = post.some((h) =>
-          (h.hooks ?? []).some((step) =>
-            typeof step.command === "string" && step.command.includes("pinned hook-postedit")
-          )
+      // Detect via the same helpers that do the surgery — substring
+      // checks live in one place now.
+      const hasTraces = claudeSettingsHasPinnedTraces(cwd);
+      if (hasTraces) {
+        // Read once and detect specific entries.
+        let raw = "{}";
+        try { raw = readFileSync(localClaudeSettings, "utf8"); } catch {}
+        let parsed: { hooks?: { PostToolUse?: Array<{ hooks?: Array<{ command?: string }> }>; UserPromptSubmit?: Array<{ hooks?: Array<{ command?: string }> }> } } = {};
+        try { parsed = JSON.parse(raw); } catch {}
+        const hasPost = (parsed.hooks?.PostToolUse ?? []).some((h) =>
+          (h.hooks ?? []).some((s) => {
+            const c = (s.command ?? "").toLowerCase();
+            return c.includes("hook-postedit") && (c.includes("pinnedai") || /\bpinned\b/.test(c));
+          })
         );
-        if (hasPinnedHook) {
+        const hasFailure = (parsed.hooks?.UserPromptSubmit ?? []).some((h) =>
+          (h.hooks ?? []).some((s) => {
+            const c = (s.command ?? "").toLowerCase();
+            return c.includes("hook-failure") && (c.includes("pinnedai") || /\bpinned\b/.test(c));
+          })
+        );
+        if (hasPost) {
           planned.push({
             kind: "block",
             path: ".claude/settings.json",
-            detail: "Pinned PostToolUse hook entry",
-            act: () => {
+            detail: "PostToolUse auto-verify hook",
+            act: () => { uninstallClaudePostToolUseHook(cwd); },
+            verify: () => {
               try {
-                const s = JSON.parse(readFileSync(localClaudeSettings, "utf8")) as {
-                  hooks?: { PostToolUse?: Array<{ hooks?: Array<{ command?: string }> }> };
-                };
-                if (s.hooks?.PostToolUse) {
-                  s.hooks.PostToolUse = s.hooks.PostToolUse.filter((h) =>
-                    !(h.hooks ?? []).some((step) =>
-                      typeof step.command === "string" && step.command.includes("pinned hook-postedit")
-                    )
-                  );
-                  if (s.hooks.PostToolUse.length === 0) delete s.hooks.PostToolUse;
-                  if (s.hooks && Object.keys(s.hooks).length === 0) delete (s as { hooks?: unknown }).hooks;
-                  writeFileSync(localClaudeSettings, JSON.stringify(s, null, 2) + "\n");
-                }
-              } catch { /* leave file as-is on error */ }
+                const s = JSON.parse(readFileSync(localClaudeSettings, "utf8")) as { hooks?: { PostToolUse?: Array<{ hooks?: Array<{ command?: string }> }> } };
+                return !(s.hooks?.PostToolUse ?? []).some((h) =>
+                  (h.hooks ?? []).some((step) => {
+                    const c = (step.command ?? "").toLowerCase();
+                    return c.includes("hook-postedit") && (c.includes("pinnedai") || /\bpinned\b/.test(c));
+                  })
+                );
+              } catch { return true; }
             },
           });
         }
-      } catch { /* unreadable settings — skip */ }
+        if (hasFailure) {
+          planned.push({
+            kind: "block",
+            path: ".claude/settings.json",
+            detail: "UserPromptSubmit failure hook",
+            act: () => { uninstallClaudeFailureHook(cwd); },
+            verify: () => {
+              try {
+                const s = JSON.parse(readFileSync(localClaudeSettings, "utf8")) as { hooks?: { UserPromptSubmit?: Array<{ hooks?: Array<{ command?: string }> }> } };
+                return !(s.hooks?.UserPromptSubmit ?? []).some((h) =>
+                  (h.hooks ?? []).some((step) => {
+                    const c = (step.command ?? "").toLowerCase();
+                    return c.includes("hook-failure") && (c.includes("pinnedai") || /\bpinned\b/.test(c));
+                  })
+                );
+              } catch { return true; }
+            },
+          });
+        }
+      }
     }
 
     // 4. GitHub Action workflow file.
@@ -10957,7 +11017,8 @@ program
         kind: "file",
         path: ".github/workflows/pinned.yml",
         detail: "Pinned CI workflow",
-        act: () => { try { (require("node:fs") as typeof import("node:fs")).unlinkSync(ghWorkflow); } catch {} },
+        act: () => { unlinkSync(ghWorkflow); },
+        verify: () => !existsSync(ghWorkflow),
       });
     }
 
@@ -10968,7 +11029,8 @@ program
         kind: "dir",
         path: ".pinnedai/",
         detail: "config + transient markers",
-        act: () => { try { (require("node:fs") as typeof import("node:fs")).rmSync(pinnedaiDir, { recursive: true, force: true }); } catch {} },
+        act: () => { rmSync(pinnedaiDir, { recursive: true, force: true }); },
+        verify: () => !existsSync(pinnedaiDir),
       });
     }
 
@@ -10979,7 +11041,8 @@ program
         kind: "dir",
         path: ".pinned/",
         detail: "AI lessons (ai-lessons.md, lessons.json)",
-        act: () => { try { (require("node:fs") as typeof import("node:fs")).rmSync(pinnedDir, { recursive: true, force: true }); } catch {} },
+        act: () => { rmSync(pinnedDir, { recursive: true, force: true }); },
+        verify: () => !existsSync(pinnedDir),
       });
     }
 
@@ -10991,7 +11054,8 @@ program
           kind: "dir",
           path: "tests/pinned/",
           detail: "EVERY pin test, registry, PINS.md, CATCHES.md",
-          act: () => { try { (require("node:fs") as typeof import("node:fs")).rmSync(pinsDir, { recursive: true, force: true }); } catch {} },
+          act: () => { rmSync(pinsDir, { recursive: true, force: true }); },
+          verify: () => !existsSync(pinsDir),
         });
       }
     }
@@ -11001,13 +11065,15 @@ program
       const globalClaudeSettings = join(process.env.HOME ?? "", ".claude", "settings.json");
       if (existsSync(globalClaudeSettings)) {
         try {
-          const { uninstallClaudeStatuslineGlobal } = await import("./claudeSettings.js") as { uninstallClaudeStatuslineGlobal?: () => void };
-          if (uninstallClaudeStatuslineGlobal) {
+          const mod = await import("./claudeSettings.js") as { uninstallClaudeStatuslineGlobal?: () => void };
+          if (mod.uninstallClaudeStatuslineGlobal) {
             planned.push({
               kind: "block",
               path: "~/.claude/settings.json",
               detail: "Pinned global statusline entry",
-              act: () => { uninstallClaudeStatuslineGlobal(); },
+              act: () => { mod.uninstallClaudeStatuslineGlobal!(); },
+              // No reliable global probe — assume removed if act() didn't throw.
+              verify: () => true,
             });
           }
         } catch { /* skip */ }
@@ -11018,7 +11084,8 @@ program
           kind: "dir",
           path: "~/.config/pinnedai/",
           detail: "global install prefs",
-          act: () => { try { (require("node:fs") as typeof import("node:fs")).rmSync(globalPrefs, { recursive: true, force: true }); } catch {} },
+          act: () => { rmSync(globalPrefs, { recursive: true, force: true }); },
+          verify: () => !existsSync(globalPrefs),
         });
       }
     }
@@ -11078,23 +11145,47 @@ program
       }
     }
 
+    // 0.4.5 P0: ✓ now requires the verify() probe to confirm the
+    // target is actually gone. If the act ran without throwing but
+    // the post-state still shows the entry/file, we print ✗ — never
+    // claim success the user can falsify by listing the directory.
     out("");
+    let failures = 0;
     for (const p of planned) {
+      let actError: Error | null = null;
       try {
         p.act();
-        out(`  ✓ ${p.path}`);
       } catch (e) {
-        err(`  ✗ ${p.path} — ${(e as Error).message}\n`);
+        actError = e as Error;
+      }
+      let stillPresent = true;
+      try {
+        stillPresent = !p.verify();
+      } catch (e) {
+        actError = actError ?? (e as Error);
+      }
+      if (!actError && !stillPresent) {
+        out(`  ✓ ${p.path}${p.detail ? "  (" + p.detail + ")" : ""}`);
+      } else {
+        failures++;
+        const reason = actError ? actError.message : "still present after removal attempt";
+        err(`  ✗ ${p.path}${p.detail ? "  (" + p.detail + ")" : ""} — ${reason}\n`);
       }
     }
     out("");
-    out("◆ Pinned has been uninstalled.");
+    if (failures === 0) {
+      out("◆ Pinned has been uninstalled.");
+    } else {
+      out(`◆ Uninstall finished with ${failures} failure${failures === 1 ? "" : "s"}.`);
+      out("  Re-run with the same options or remove the listed paths manually.");
+    }
     if (!opts.tests && existsSync(pinsDir)) {
       out("  tests/pinned/ preserved (re-install will pick them up).");
     }
     if (!opts.global) {
       out("  Global writes (if any) preserved. Run `pinned uninstall --global` to also remove those.");
     }
+    if (failures > 0) process.exitCode = 1;
   });
 
 program
