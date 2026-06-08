@@ -2,6 +2,56 @@
 
 All notable changes to pinnedai. Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file tracks the `pinnedai` npm package version; the Cloudflare Worker tracks its own version independently in `apps/edge/`.
 
+## [0.5.0-beta.6] — 2026-06-08
+
+Closes the 0.6.0 architecture queue — last two asks (#5 + #6).
+
+### Cipherwake 0.6.0 ask #5 — model attribution at edit-time
+
+`pinned report`'s MODELS column was mostly "unspecified-model" because static sweeps had no signal for who authored the line. Even when the user was clearly in Claude Code (`CLAUDE.md` present), heuristic mode only gave a tool, not a model.
+
+Fix: hook-postedit now persists `.pinned/last-edit-context.json` after each fire — captures the AI model, tool, and timestamp. `detectAiModel()` reads this file as a fallback BETWEEN BYOK and the agent-rule-file heuristic so static sweeps that run shortly after an agent edit (the common case during dogfood) get attributed to the agent that produced them.
+
+Stale entries (>30 min old) are ignored — the agent loop is fast and a stale file means the user moved on. PINNED_AI_MODEL env still wins (explicit override).
+
+### Cipherwake 0.6.0 ask #6 — auto-populate REAL/FP from real use
+
+`inferEventResolutions()` already existed in `repoStats.ts` with the right logic: when an event's source file has been edited SINCE the event fired, infer the catch is real (agent noticed + fixed); when a suppression matches, infer it's a FP. Comment-line said it "runs at every sweep" — but **nothing actually called it.** REAL/FP/RATE stayed at zero forever.
+
+Fix: wired `runInferEventResolutions()` into:
+- `pinned sweep` (after merging new hits)
+- `pinned hook-postedit` (after running affected pins)
+
+Both call it through the same helper. Git provides `fileChangedSince` via `git log -1 --format=%aI -- <file>`. Suppression store provides `isSuppressed`. The catch ledger now populates from normal use — no `pinned confirm` needed.
+
+### Added — `modelAttributionAndAutoConfirm.test.ts`
+
+8 cases covering:
+- `recordEditContext` writes the file at `.pinned/last-edit-context.json`
+- `detectAiModel` prefers fresh edit-context over heuristic
+- `detectAiModel` ignores stale (>30 min) context, falls through to heuristic
+- `PINNED_AI_MODEL` env still wins over edit-context
+- `inferEventResolutions` transitions open → confirmed on file-changed-since
+- `inferEventResolutions` transitions open → dismissed on suppression-match
+- `inferEventResolutions` leaves event open with no signal
+- Catalog-level invariant: `runInferEventResolutions` is referenced at sweep + hook + definition (3+ occurrences)
+
+### Test matrix
+
+- 521/521 vitest (+9 new: 8 ask #5+#6 + 1 catalog)
+- 42/42 dyad sweep
+
+### 0.6.0 architecture queue — DONE
+
+| Ask | Shipped in |
+|---|---|
+| #1 incremental detection on hooks | 0.5.0-beta.5 |
+| #2 auto-pin by VALUE (HIGH default) | 0.5.0-beta.4 |
+| #3 promote enum-drift on visibility column | 0.5.0-beta.4 |
+| #4 preserve repo-stats across uninstall | 0.5.0-beta.3 |
+| #5 model attribution at edit-time | 0.5.0-beta.6 |
+| #6 auto-populate REAL/FP | 0.5.0-beta.6 |
+
 ## [0.5.0-beta.5] — 2026-06-08
 
 Cipherwake 0.6.0 ask #1: wire incremental detection on hooks.

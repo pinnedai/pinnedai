@@ -124,6 +124,11 @@ const DETECTORS: DetectorEntry[] = [
     e2eTestFile: "incrementalDetection.test.ts",
     stateAssertionPatterns: [/classifyDiff/, /server-action-write/, /paid-api-call/, /visibility-invariant/],
   },
+  {
+    detector: "model attribution + auto-confirm (Cipherwake 0.6.0 #5+#6)",
+    e2eTestFile: "modelAttributionAndAutoConfirm.test.ts",
+    stateAssertionPatterns: [/recordEditContext/, /inferEventResolutions/, /runInferEventResolutions/],
+  },
 ];
 
 const SRC_DIR = join(process.cwd(), "src");

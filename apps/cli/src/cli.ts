@@ -4562,6 +4562,11 @@ program
         const updated = mhs(stats, hits, aiModel);
         wrs(statsDir, updated);
       }
+      // 0.5.0-beta.6 (Cipherwake 0.6.0 ask #6): run the resolver
+      // immediately after merging new hits, so any event whose source
+      // file the agent has since edited gets auto-confirmed. Was
+      // documented as running here but the call was never wired.
+      try { await runInferEventResolutions(cwd); } catch { /* best-effort */ }
     } catch (e) {
       err(`  (stats write failed, non-fatal: ${(e as Error).message})\n`);
     }
@@ -11689,6 +11694,25 @@ program
     }
 
     const cwd = process.cwd();
+    // 0.5.0-beta.6 (Cipherwake 0.6.0 ask #5): persist model attribution
+    // so subsequent static sweeps in this agent loop can tag detector
+    // hits with the AI that produced them. Claude Code's PostToolUse
+    // doesn't directly pass the model name, but the env it spawns us
+    // in has enough signal (PINNED_HOOK_AI_MODEL when wired, or
+    // claude-code as the tool by virtue of running in that context).
+    // Stale entries (>30 min) decay back to "unspecified" automatically.
+    try {
+      const { recordEditContext, detectAiModel } = await import("./aiModel.js");
+      const detected = detectAiModel({ cwd });
+      // Default for the hook context: even when no model env, we know
+      // the TOOL is claude-code (we're running inside its PostToolUse).
+      recordEditContext(cwd, {
+        model: detected.model,
+        tool: detected.tool ?? "claude-code",
+        signal: detected.signal || "claude-code PostToolUse",
+      });
+    } catch { /* best-effort — never block the hook on attribution */ }
+
     const pinnedDir = join(cwd, opts.dir);
     if (!existsSync(pinnedDir)) {
       process.stdout.write(`pinned: ${opts.dir} doesn't exist — run \`pinned init\` to set up pins.\n`);
@@ -11842,7 +11866,54 @@ program
       // Hook MUST NEVER crash the agent. Swallow + emit nothing.
       void e;
     }
+
+    // 0.5.0-beta.6 (Cipherwake 0.6.0 ask #6): auto-populate REAL/FP.
+    // The user's complaint: REAL/FP/RATE in `pinned report` are
+    // always empty because the manual `pinned confirm` / `pinned
+    // dismiss` commands never get run. But the inferEventResolutions
+    // helper already exists in repo-stats — it transitions open
+    // events to "confirmed" when the source file has been edited
+    // since the event fired (agent noticed + fixed). The bug: it
+    // was documented as running on sweep, but nothing actually
+    // called it. Wire it here so the catch ledger populates
+    // automatically as the agent loop runs.
+    try {
+      await runInferEventResolutions(cwd);
+    } catch { /* best-effort — never block the hook */ }
   });
+
+// 0.5.0-beta.6 helper: walk open events in .pinned/repo-stats.json,
+// auto-confirm those whose source file has been edited since the
+// event fired, auto-dismiss those covered by a suppression. Pure
+// fs + git — no network. The catch ledger now populates from normal
+// use (sweep + hook-postedit) instead of needing a manual
+// `pinned confirm`.
+async function runInferEventResolutions(cwd: string): Promise<void> {
+  const { readRepoStats, writeRepoStats, inferEventResolutions } = await import("./repoStats.js");
+  const pinnedDir = join(cwd, ".pinned");
+  if (!existsSync(pinnedDir)) return;
+  const stats = readRepoStats(pinnedDir);
+  let suppressionCheck: ((detector: string, filePath: string, fingerprint: string) => boolean) = () => false;
+  try {
+    const sup = await import("./suppressions.js");
+    const store = sup.readStore(pinnedDir);
+    suppressionCheck = (detector, filePath, fingerprint) =>
+      sup.isSuppressed(store, detector, filePath, fingerprint);
+  } catch { /* suppressions module unavailable — treat nothing as suppressed */ }
+  const next = inferEventResolutions(stats, {
+    fileChangedSince: (filePath, sinceISO) => {
+      try {
+        const out = childSpawnSync("git", ["log", "-1", "--format=%aI", "--", filePath], { cwd, encoding: "utf8" }).stdout?.trim() ?? "";
+        if (!out) return false;
+        return new Date(out).getTime() > new Date(sinceISO).getTime();
+      } catch { return false; }
+    },
+    isSuppressed: suppressionCheck,
+  });
+  if (JSON.stringify(next) !== JSON.stringify(stats)) {
+    writeRepoStats(pinnedDir, next);
+  }
+}
 
 // 0.2.16+ BETA: opt-in Playwright installer. Per locked
 // [[full-stack-roadmap-2026-06-03]]: Playwright pulls hundreds of MB

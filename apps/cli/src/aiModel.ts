@@ -20,8 +20,46 @@
 // (tool) routing through Anthropic Sonnet 4 (model). We tag both
 // independently when known.
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+
+// 0.5.0-beta.6 (Cipherwake 0.6.0 ask #5): recent-edit-context file.
+// Persistent attribution from the last PostToolUse hook fire. Used
+// as a fallback BETWEEN BYOK and agent-rule-file heuristic so static
+// sweeps that run shortly after an agent edit get attributed to the
+// agent that produced them. Stale entries (>30 min) are ignored.
+const EDIT_CONTEXT_FILENAME = "last-edit-context.json";
+const EDIT_CONTEXT_TTL_MS = 30 * 60 * 1000; // 30 min
+
+type EditContext = {
+  model: string;
+  tool?: string;
+  signal: string;
+  recordedAt: string; // ISO timestamp
+};
+
+function editContextPath(cwd: string): string {
+  return join(cwd, ".pinned", EDIT_CONTEXT_FILENAME);
+}
+
+export function recordEditContext(cwd: string, ctx: Omit<EditContext, "recordedAt">): void {
+  const p = editContextPath(cwd);
+  try {
+    mkdirSync(join(cwd, ".pinned"), { recursive: true });
+    writeFileSync(p, JSON.stringify({ ...ctx, recordedAt: new Date().toISOString() }, null, 2) + "\n");
+  } catch { /* best-effort */ }
+}
+
+function readRecentEditContext(cwd: string, ttlMs: number): EditContext | null {
+  const p = editContextPath(cwd);
+  if (!existsSync(p)) return null;
+  let parsed: Partial<EditContext> = {};
+  try { parsed = JSON.parse(readFileSync(p, "utf8")); } catch { return null; }
+  if (!parsed.model || !parsed.recordedAt) return null;
+  const age = Date.now() - new Date(parsed.recordedAt).getTime();
+  if (!Number.isFinite(age) || age < 0 || age > ttlMs) return null;
+  return parsed as EditContext;
+}
 
 export type AiModelDetection = {
   // Best-guess model identity. Format: `<provider>:<family>:<version>`
@@ -106,6 +144,26 @@ export function detectAiModel(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = 
       signal: `PINNEDAI_BYOK=${env.PINNEDAI_BYOK}`,
     };
   }
+
+  // 0.5.0-beta.6 (Cipherwake 0.6.0 ask #5): recent edit-context file.
+  // hook-postedit writes .pinned/last-edit-context.json each time it
+  // fires (with the model passed by Claude Code's PostToolUse). When
+  // a static sweep runs SHORTLY AFTER an agent edit (the common case
+  // during dogfood) we want the sweep's hits attributed to the model
+  // that just produced them, not "unspecified-model". Stale entries
+  // (>30 min) fall through to heuristic — the agent loop is fast and
+  // a stale file means the user is doing something else.
+  try {
+    const fresh = readRecentEditContext(cwd, EDIT_CONTEXT_TTL_MS);
+    if (fresh) {
+      return {
+        model: fresh.model,
+        tool: fresh.tool,
+        confidence: "known",
+        signal: `.pinned/last-edit-context.json (${fresh.signal})`,
+      };
+    }
+  } catch { /* file missing or unreadable — fall through */ }
 
   // 4. HEURISTIC — agent-rule-file presence. Walk the priority list
   // and tag the first hit. This gives tool but not model.
