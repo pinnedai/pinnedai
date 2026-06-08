@@ -24,7 +24,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "postinstall": "node scripts/postinstall.cjs",
-    "prepublishOnly": "cp ../../README.md ./README.md"
+    "prepublishOnly": "cp ../../README.md ./README.md && pnpm exec vitest run src/failureModes.gate.test.ts --reporter=basic && pnpm exec vitest run --reporter=basic"
   },
   "keywords": [
     "ci",

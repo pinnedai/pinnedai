@@ -318,10 +318,10 @@ describe("[gate] uninstall --yes preserves .pinned/ durable history", () => {
 // GATE 5 — failure-hook stays silent on a clean test pass
 // ═══════════════════════════════════════════════════════════════════
 describe("[gate] hook-failure is silent when nothing is failing", () => {
-  it("with .last-status.json status=passing, hook-failure emits nothing user-facing", () => {
+  it("with .last-status.json status=green, hook-failure emits nothing user-facing", () => {
     mkdirSync(join(dir, "tests/pinned"), { recursive: true });
     writeFileSync(join(dir, "tests/pinned/.last-status.json"), JSON.stringify({
-      status: "passing",
+      status: "green",
       failingCount: 0,
       failingClaimIds: [],
       runAt: new Date().toISOString(),
@@ -335,6 +335,80 @@ describe("[gate] hook-failure is silent when nothing is failing", () => {
     // — but NEVER a "Pinned caught a regression" failure prompt.
     expect(r).not.toMatch(/Pinned caught a regression/);
   });
+
+  // Defense-in-depth: also check the failing-but-zero-count edge.
+  // `failureMessage()` is gated on `status === "failing" && failingCount > 0`.
+  // If failingCount is 0 even when status is "failing", silence is required.
+  it("status=failing but failingCount=0 → still silent (no real regressions)", () => {
+    mkdirSync(join(dir, "tests/pinned"), { recursive: true });
+    writeFileSync(join(dir, "tests/pinned/.last-status.json"), JSON.stringify({
+      status: "failing",
+      failingCount: 0,
+      failingClaimIds: [],
+      runAt: new Date().toISOString(),
+      catchHistory: [],
+    }));
+    writeFileSync(join(dir, "tests/pinned/.registry.json"), '{"version":1,"claims":[]}');
+    const r = execFileSync("node", [CLI, "hook-failure"], {
+      cwd: dir, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: 10_000,
+    });
+    expect(r).not.toMatch(/Pinned caught a regression/);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// GATE 7 — CHAINED end-to-end: dead PREVIEW_URL → vitest → status →
+// hook-failure stays silent. This is the contract from Cipherwake's
+// review: "make the hook silent on every unverifiable state." The
+// individual links (test SKIPs, hook reads status) are tested
+// elsewhere; this gate composes them end-to-end.
+// ═══════════════════════════════════════════════════════════════════
+describe("[gate] CHAINED: dead PREVIEW_URL → vitest SKIPs → hook-failure stays silent (no phantom regression)", () => {
+  it("end-to-end: dead server + page-renders pin → zero 'Pinned caught a regression' output from hook-failure", async () => {
+    setupHealthyNextRepo();
+    execFileSync("ln", ["-s", join(process.cwd(), "node_modules"), join(dir, "node_modules")]);
+    execFileSync("node", [
+      CLI, "generate",
+      "--pr-id", "chain",
+      "--description", "GET /about renders",
+      "--out-dir", "tests/pinned",
+      "--quiet",
+    ], { cwd: dir, encoding: "utf8" });
+
+    // Manually drive vitest with a dead PREVIEW_URL — the test should
+    // SKIP via ctx.skip() and produce a clean run. This simulates what
+    // `pinned test` does internally.
+    const vitestResult = await spawnAsync(VITEST_BIN, ["run", "--reporter=verbose", "tests/pinned"], {
+      cwd: dir,
+      env: { ...process.env, PREVIEW_URL: "http://127.0.0.1:1" },
+      timeoutMs: 30_000,
+    });
+
+    // The test should NOT have failed (RED). SKIP via ctx.skip is OK.
+    const out = vitestResult.stdout + vitestResult.stderr;
+    expect(out).not.toMatch(/× tests\/pinned\/.*page-renders/);
+
+    // Now manually create the .last-status.json that `pinned test`
+    // would have written. status MUST NOT be "failing" — the test
+    // skipped, no real regression. (In production, `pinned test`
+    // parses vitest output to set status. Here we assert the contract
+    // hook-failure honors: failingCount=0 → silent.)
+    writeFileSync(join(dir, "tests/pinned/.last-status.json"), JSON.stringify({
+      status: "green",
+      failingCount: 0,
+      failingClaimIds: [],
+      runAt: new Date().toISOString(),
+      catchHistory: [],
+    }));
+
+    // Now run hook-failure. It MUST be silent — no "Pinned caught a
+    // regression" message, no failure prompt.
+    const hookOut = execFileSync("node", [CLI, "hook-failure"], {
+      cwd: dir, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: 10_000,
+    });
+    expect(hookOut, "hook-failure must stay silent when only SKIP'd tests are recorded").not.toMatch(/Pinned caught a regression/);
+    expect(hookOut, "no failure prompt should leak").not.toMatch(/PINNED FAILURE/);
+  }, 60_000);
 });
 
 // ═══════════════════════════════════════════════════════════════════
